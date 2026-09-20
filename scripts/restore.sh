@@ -10,7 +10,8 @@ if manifest.get("format") != "agent-home-deployment" or manifest.get("version") 
     raise SystemExit("unsupported backup format")
 PY
 VOLUME="${AGENT_HOME_VOLUME:-agent-home-default-state}"
-podman volume inspect "$VOLUME" >/dev/null 2>&1 || podman volume create "$VOLUME" >/dev/null
-podman volume import "$VOLUME" "$BACKUP/state.tar"
+PODMAN="${PODMAN_COMMAND:-podman}"
+"$PODMAN" volume inspect "$VOLUME" >/dev/null 2>&1 || "$PODMAN" volume create "$VOLUME" >/dev/null
+"$PODMAN" volume import "$VOLUME" "$BACKUP/state.tar"
 [[ -f "$BACKUP/gateway.sqlite" ]] && mkdir -p "$ROOT_DIR/runtime-state" && cp "$BACKUP/gateway.sqlite" "$ROOT_DIR/runtime-state/gateway.sqlite"
 [[ -f "$BACKUP/plugin-data.tar.gz" ]] && tar -xzf "$BACKUP/plugin-data.tar.gz" -C "$ROOT_DIR/runtime-state"

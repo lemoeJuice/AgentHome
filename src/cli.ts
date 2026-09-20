@@ -15,6 +15,7 @@ import { secretFromConfig } from "./config.js";
 async function main(): Promise<void> {
   const command = process.argv[2] ?? "help";
   if (command === "bootstrap") { await bootstrapFromStdin(process.env.AGENT_HOME_STATE ?? "/state"); return; }
+  if (command === "hold") { await holdProcess(); return; }
   if (command === "help") { process.stdout.write("agent-home gateway|runtime|control stream|control ping|bootstrap|doctor|status\n"); return; }
   let config: Awaited<ReturnType<typeof loadConfig>>;
   try { config = await loadConfig(); } catch (error) {
@@ -84,6 +85,13 @@ async function waitForSignal(stop: () => Promise<void>): Promise<void> {
     let stopping = false;
     const handler = () => { if (stopping) return; stopping = true; void stop().finally(resolve); };
     process.once("SIGINT", handler); process.once("SIGTERM", handler);
+  });
+}
+
+async function holdProcess(): Promise<void> {
+  await new Promise<void>((resolve) => {
+    const stop = () => { process.off("SIGINT", stop); process.off("SIGTERM", stop); resolve(); };
+    process.once("SIGINT", stop); process.once("SIGTERM", stop);
   });
 }
 

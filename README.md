@@ -13,12 +13,14 @@ pnpm install
 ./scripts/start.sh
 ```
 
-`setup.sh` requires Node 22.5+, npm, and rootless Podman. It creates the named state volume and builds the image. Secrets are supplied through environment variables or the container bootstrap stdin command, never process arguments.
+`setup.sh` requires Node 22.5+, pnpm or npm, and rootless Podman. It creates the named state volume, builds the image, starts a bootstrap-held container, and installs the official Pi CLI into it through `podman exec`. `init-container.sh` sends bootstrap JSON through stdin and starts Runtime after configuration is valid. Secrets are supplied through environment variables or a bootstrap stdin file, never process arguments.
 
 Useful commands:
 
 ```bash
 ./scripts/build.sh
+./scripts/init-container.sh
+./scripts/install-pi.sh
 ./scripts/start.sh
 ./scripts/stop.sh
 ./scripts/restart.sh
@@ -49,9 +51,11 @@ Direct plugin commands bypass Main. Agent outbound messages use the in-container
 
 ## External Integrations
 
-The production OneBot adapter uses forward WebSocket events and HTTP actions (`send_msg`, `get_msg`, `get_group_msg_history`, `get_file`, and `get_login_info`). Pi is isolated in `src/runtime/pi.ts` and uses its real CLI print/session interface. Live verification requires a configured SnowLuma endpoint/token, a Pi installation, and rootless Podman.
+The production OneBot adapter uses forward WebSocket events and SnowLuma HTTP action paths (`send_group_msg`, `send_private_msg`, `get_msg`, `get_group_msg_history`, `get_file`, and `get_login_info`). Pi is isolated in `src/runtime/pi.ts` and uses its real CLI print/session interface. Live verification requires a configured SnowLuma endpoint/token, a Pi installation, and rootless Podman.
 
 Small artifacts are transferred through OneBot's `base64://` file reference. Larger files require `AGENT_ARTIFACT_PUBLIC_BASE_URL` pointing to a scoped, short-lived upload gateway reachable by SnowLuma. No unrestricted Agent Home filesystem URL is exposed.
+
+Gateway MCP is loopback-only by default and exposes no actions unless `GATEWAY_MCP_ALLOWED_ACTIONS` is set. If `GATEWAY_MCP_HOST` is changed to a non-loopback address, set `GATEWAY_MCP_TOKEN`; the server refuses an unauthenticated non-loopback bind.
 
 ## Tests
 
