@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { SqliteStore, migrate } from "../src/db.js";
 import { runtimeMigrations } from "../src/schema.js";
 import { MemoryService } from "../src/runtime/memory.js";
-import { authorizeMemory, attenuateTask, attenuateWorker } from "../src/auth.js";
+import { authorizeMemory, attenuateTask, attenuateWorker, deriveCapabilities } from "../src/auth.js";
 import { messageKey, namespaceKey } from "../src/shared/ids.js";
 import { NOT_IMPLEMENTED } from "../src/shared/types.js";
 
@@ -32,4 +32,28 @@ test("capability attenuation cannot expand a parent", () => {
   assert.deepEqual(task.memory.allowedScopes, []);
   assert.deepEqual(worker.projects, []);
   assert.deepEqual(worker.memory.allowedScopes, []);
+});
+
+test("derived private conversation scopes do not fall back to a group scope", () => {
+  const conversation = { platform: "qq", accountId: "a", kind: "private" as const, platformConversationId: "guest", threadId: null };
+  const guest = deriveCapabilities({ platform: "qq", accountId: "a", userId: "guest", trust: "GUEST", conversationId: "conv" }, conversation, { platform: "qq", accountId: "a", userId: "owner" }, "conv");
+  const owner = deriveCapabilities({ platform: "qq", accountId: "a", userId: "owner", trust: "OWNER", conversationId: "conv" }, conversation, { platform: "qq", accountId: "a", userId: "owner" }, "conv");
+  assert.deepEqual(guest.memory.allowedScopes, ["global_agent", "user:guest"]);
+  assert.ok(owner.memory.allowedScopes.includes("owner_private"));
+  assert.ok(!guest.memory.allowedScopes.some((scope) => scope.startsWith("group:")));
+});
+
+test("memory facts preserve temporal supersession and portable export", () => {
+  const firstDb = new SqliteStore(":memory:"); migrate(firstDb, runtimeMigrations);
+  const first = new MemoryService(firstDb);
+  const access = { requesterId: "owner", trust: "OWNER" as const, allowedScopes: ["global_agent"] as const };
+  const oldFact = first.rememberFact({ access, scope: "global_agent", subject: "user", predicate: "language", object: "en", confidence: 0.8, validFrom: "2026-01-01T00:00:00.000Z" });
+  const newFact = first.rememberFact({ access, scope: "global_agent", subject: "user", predicate: "language", object: "zh-CN", confidence: 0.99, validFrom: "2026-02-01T00:00:00.000Z" });
+  assert.equal(firstDb.get<{ status: string; valid_to: string }>("SELECT status,valid_to FROM memory_facts WHERE id=?", oldFact.id)?.status, "superseded");
+  assert.equal(first.getMemory(newFact.id, access)?.type, "fact");
+  const exported = first.exportMemory(access);
+  const secondDb = new SqliteStore(":memory:"); migrate(secondDb, runtimeMigrations);
+  const imported = new MemoryService(secondDb).importMemory(exported);
+  assert.ok(imported.imported >= 2);
+  firstDb.close(); secondDb.close();
 });

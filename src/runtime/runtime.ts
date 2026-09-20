@@ -135,28 +135,40 @@ export class RuntimeApp {
         return;
       }
     }
-    const text = String(payload.text ?? "").trim();
+    const inboundArtifacts: string[] = [];
+    const attachments = Array.isArray(payload.attachments) ? payload.attachments : [];
+    for (const attachment of attachments) {
+      try {
+        const transfer = await this.qq.fetchAttachment(attachment as import("../shared/types.js").ChatAttachmentRef);
+        const artifact = await this.artifacts.ingestAttachment({ ...transfer, conversationId: conversation.id, maxBytes: this.config.runtime.maxArtifactBytes });
+        inboundArtifacts.push(artifact.ref.artifactId);
+      } catch (error) { this.log.warn("Inbound attachment was not materialized", { error: String(error), conversationId: conversation.id }); }
+    }
+    const text = String(payload.text ?? "").trim() || (inboundArtifacts.length ? "用户发送了附件，请检查并处理。" : "");
     if (!text) return;
     const requester = { platform: event.source.platform, accountId: event.source.accountId, userId: event.trustedIdentity?.userId ?? "unknown", trust: conversation.trust, conversationId: conversation.id };
     const caps = deriveCapabilities(requester, conversation.address, this.config.owner, conversation.id);
     const active = this.tasks.listTasks(conversation.id).filter((task) => ["CREATED", "QUEUED", "RUNNING", "WAITING_USER", "INTERRUPTED"].includes(task.status));
     const activeTask = active.length === 1 ? active[0] : undefined;
     if (activeTask && /做到哪|进度|别做了|停掉|停止|取消/.test(text)) {
-      if (/别做了|停掉|停止|取消/.test(text)) await this.tasks.requestCancel(activeTask.id);
+       if (/别做了|停掉|停止|取消/.test(text)) await this.tasks.requestCancel(activeTask.id, caps.tasks);
       else await this.sendText(conversation.address, `任务 ${activeTask.id.slice(-8)} 当前状态：${activeTask.status}。\n${this.tasks.getProgress(activeTask.id).slice(0, 3).join("\n") || "暂无新的进展。"}`, event.message?.ref);
       return;
     }
     if (activeTask && this.shouldFollowUp(text)) { await this.tasks.addFollowUp(activeTask.id, text, { conversationId: conversation.id, message: event.message?.ref as PlatformMessageRef }); return; }
     if (this.shouldDelegate(text) && caps.tasks.canCreate) {
-      const task = this.tasks.createTask({ title: text.slice(0, 80), goal: text, requester: { platform: requester.platform, accountId: requester.accountId, userId: requester.userId, ...(event.trustedIdentity?.principalId ? { principalId: event.trustedIdentity.principalId } : {}) }, trust: caps.tasks.canCreate ? "OWNER" : "GUEST", originConversationId: conversation.id, notificationConversationId: conversation.id, parentCapabilities: caps });
-      await this.tasks.createWorker({ taskId: task.id, objective: text, workspaceAccess: "WRITE", workspaceId: "default" });
+      const goal = inboundArtifacts.length ? `${text}\nInbound Artifact IDs: ${inboundArtifacts.join(", ")}` : text;
+      const task = this.tasks.createTask({ title: text.slice(0, 80), goal, requester: { platform: requester.platform, accountId: requester.accountId, userId: requester.userId, ...(event.trustedIdentity?.principalId ? { principalId: event.trustedIdentity.principalId } : {}) }, trust: caps.tasks.canCreate ? "OWNER" : "GUEST", originConversationId: conversation.id, notificationConversationId: conversation.id, parentCapabilities: caps });
+      await this.tasks.createWorker({ taskId: task.id, objective: goal, workspaceAccess: "WRITE", workspaceId: "default" });
       await this.sendText(conversation.address, `已创建任务 ${task.id.slice(-8)}，Worker 开始处理；需要确认时我会在这里询问。`, event.message?.ref);
       return;
     }
-    await this.mainTurn(conversation.id, conversation.address, event, text, payload, caps);
+    await this.mainTurn(conversation.id, conversation.address, event, text, { ...payload, ...(inboundArtifacts.length ? { artifactRefs: inboundArtifacts } : {}) }, caps);
   }
 
   private async mainTurn(conversationId: string, address: ConversationAddress, event: ControllerEventEnvelope, text: string, payload: Record<string, unknown>, caps: ReturnType<typeof deriveCapabilities>): Promise<import("../shared/types.js").SendResult> {
+    const sendAuthorization = authorizeSend(caps, conversationId);
+    if (!sendAuthorization.allowed) throw new Error(`SEND_DENIED:${sendAuthorization.reason}`);
     let session = this.db.get<{ main_session_id: string | null; main_session_path: string | null }>("SELECT main_session_id,main_session_path FROM conversations WHERE conversation_id=?", conversationId);
     if (!session?.main_session_path || !session.main_session_id) {
       const path = join(this.config.paths.stateRoot, "home", ".pi", "main", `${conversationId.replaceAll("\u001f", "_")}.jsonl`);
@@ -187,6 +199,7 @@ export class RuntimeApp {
 
   private async controlCommand(conversationId: string, event: ControllerEventEnvelope, command: string, args: string[]): Promise<void> {
     const conversation = this.getConversation(conversationId);
+    const caps = deriveCapabilities({ platform: event.source.platform, accountId: event.source.accountId, userId: event.trustedIdentity?.userId ?? "unknown", trust: conversation.trust, conversationId }, conversation.address, this.config.owner, conversationId);
     if (command === "help") { await this.sendText(conversation.address, "/status /tasks /stop /new /usage /help\n自然语言消息会交给 Main。", event.message?.ref); return; }
     if (command === "new") {
       const path = join(this.config.paths.stateRoot, "home", ".pi", "main", `${conversationId.replaceAll("\u001f", "_")}-${Date.now()}.jsonl`);
@@ -201,7 +214,8 @@ export class RuntimeApp {
       const requested = args[0];
       const selected = requested ? tasks.find((task) => task.id === requested || task.id.endsWith(requested)) : tasks.filter((task) => ["CREATED", "QUEUED", "RUNNING", "WAITING_USER", "INTERRUPTED"].includes(task.status));
       if (!selected || Array.isArray(selected)) { await this.sendText(conversation.address, "请使用 /stop <task-id> 指定要停止的任务。", event.message?.ref); return; }
-      await this.tasks.requestCancel(selected.id); await this.sendText(conversation.address, `任务 ${selected.id.slice(-8)} 已确认取消。`, event.message?.ref); return;
+       if (!caps.tasks.canCancel) { await this.sendText(conversation.address, "当前身份没有取消任务的权限。", event.message?.ref); return; }
+       await this.tasks.requestCancel(selected.id, caps.tasks); await this.sendText(conversation.address, `任务 ${selected.id.slice(-8)} 已确认取消。`, event.message?.ref); return;
     }
     if (command === "usage") { await this.sendText(conversation.address, `Pi command: ${this.config.runtime.piCommand}\nSnowLuma API: ${this.config.snowluma.apiEndpoint}`, event.message?.ref); return; }
     await this.sendText(conversation.address, `未知控制命令 /${command}。`, event.message?.ref);

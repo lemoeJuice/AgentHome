@@ -3,8 +3,8 @@ import type { CapabilitySet, ConversationAddress, MemoryScope, RequesterContext,
 export function deriveCapabilities(requester: RequesterContext, conversation: ConversationAddress, owner: { platform: string; accountId: string; userId: string }, conversationId: string): CapabilitySet {
   const isOwner = requester.platform === owner.platform && requester.accountId === owner.accountId && requester.userId === owner.userId;
   const trust: Trust = isOwner ? "OWNER" : "GUEST";
-  const baseScopes: MemoryScope[] = ["global_agent", `group:${conversationId}`];
-  if (trust === "OWNER" && conversation.kind === "private") baseScopes.push("owner_private", `user:${requester.principalId ?? requester.userId}`);
+  const baseScopes: MemoryScope[] = ["global_agent", conversation.kind === "group" ? `group:${conversationId}` : `user:${requester.principalId ?? requester.userId}`];
+  if (trust === "OWNER" && conversation.kind === "private") baseScopes.push("owner_private");
   const canCreate = trust === "OWNER";
   return {
     memory: { allowedScopes: baseScopes },

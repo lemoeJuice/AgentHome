@@ -8,46 +8,64 @@ export class GatewayMcpServer {
   private readonly actions: AgentActionRegistry;
   private readonly port: number;
   private readonly logger: Logger;
-  constructor(actions: AgentActionRegistry, port: number, logger: Logger) { this.actions = actions; this.port = port; this.logger = logger; }
+  private readonly host: string;
+  private readonly token: string | undefined;
+  private readonly allowedActions: Set<string>;
+  private readonly workerToken: string | undefined;
+  private readonly workerTaskId: string | undefined;
+  constructor(actions: AgentActionRegistry, port: number, logger: Logger, options: { host?: string; token?: string; workerToken?: string; workerTaskId?: string; allowedActions?: string[] } = {}) {
+    this.actions = actions; this.port = port; this.logger = logger; this.host = options.host ?? "127.0.0.1"; this.token = options.token; this.workerToken = options.workerToken; this.workerTaskId = options.workerTaskId; this.allowedActions = new Set(options.allowedActions ?? []);
+  }
 
   async start(): Promise<void> {
+    if (this.host !== "127.0.0.1" && this.host !== "::1" && !this.token && !this.workerToken) throw new Error("MCP_TOKEN_REQUIRED_FOR_NON_LOOPBACK");
+    if (this.allowedActions.size > 0 && !this.token && !this.workerToken) throw new Error("MCP_TOKEN_REQUIRED_WHEN_ACTIONS_EXPOSED");
     this.server = createServer((request, response) => { void this.handle(request, response); });
-    await new Promise<void>((resolve, reject) => { this.server?.once("error", reject); this.server?.listen(this.port, "127.0.0.1", resolve); });
-    this.logger.info("Gateway MCP ready", { port: this.port });
+    await new Promise<void>((resolve, reject) => { this.server?.once("error", reject); this.server?.listen(this.port, this.host, resolve); });
+    this.logger.info("Gateway MCP ready", { host: this.host, port: this.port, exposedActions: [...this.allowedActions] });
   }
 
   async stop(): Promise<void> { await new Promise<void>((resolve) => this.server?.close(() => resolve()) ?? resolve()); }
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     if (request.method !== "POST" || request.url !== "/mcp") { response.statusCode = 404; response.end(); return; }
+    const caller = this.authenticate(request.headers.authorization);
+    if (!caller) { writeJson(response, { error: "MCP_UNAUTHORIZED" }, 401); return; }
     try {
       const body = await readBody(request);
       const rpc = JSON.parse(body) as { id?: string | number; method?: string; params?: Record<string, unknown> };
-      const result = await this.dispatch(rpc.method ?? "", rpc.params ?? {});
+      const result = await this.dispatch(rpc.method ?? "", rpc.params ?? {}, caller);
       writeJson(response, { jsonrpc: "2.0", id: rpc.id ?? null, result });
     } catch (error) { writeJson(response, { jsonrpc: "2.0", id: null, error: { code: -32000, message: String(error) } }, 500); }
   }
 
-  private async dispatch(method: string, params: Record<string, unknown>): Promise<JsonValue> {
-    if (method === "list_actions") return this.actions.list() as never;
+  private async dispatch(method: string, params: Record<string, unknown>, caller: { caller: "MAIN" | "WORKER"; requesterId: string }): Promise<JsonValue> {
+    if (method === "list_actions") return this.actions.list().filter((action) => this.allowedActions.has(action.name)) as never;
     if (method === "search_actions") {
       const query = String(params.query ?? "").toLowerCase();
-      return this.actions.list().filter((action) => `${action.name} ${action.description}`.toLowerCase().includes(query)) as never;
+      return this.actions.list().filter((action) => this.allowedActions.has(action.name) && `${action.name} ${action.description}`.toLowerCase().includes(query)) as never;
     }
     if (method === "get_action") {
       const action = this.actions.get(String(params.name ?? ""));
-      if (!action) throw new Error("ACTION_NOT_FOUND");
+      if (!action || !this.allowedActions.has(action.definition.name)) throw new Error("ACTION_NOT_FOUND");
       return action.definition as never;
     }
     if (method === "invoke_action") {
       const action = this.actions.get(String(params.name ?? ""));
       if (!action) throw new Error("ACTION_NOT_FOUND");
-      const authorization = params.authorization as { allowedActions?: string[] } | undefined;
-      if (!authorization?.allowedActions?.includes(action.definition.name)) throw new Error("ACTION_DENIED");
-      const caller = params.caller === "WORKER" ? "WORKER" : "MAIN";
-      return await action.handler((params.input ?? null) as JsonValue, { caller, requesterId: String(params.requesterId ?? "unknown"), ...(params.taskId ? { taskId: String(params.taskId) } : {}) });
+       if (!this.allowedActions.has(action.definition.name)) throw new Error("ACTION_DENIED");
+       const taskId = caller.caller === "WORKER" && this.workerTaskId && params.taskId === this.workerTaskId ? this.workerTaskId : undefined;
+       return await action.handler((params.input ?? null) as JsonValue, { caller: caller.caller, requesterId: caller.requesterId, ...(taskId ? { taskId } : {}) });
     }
     throw new Error("METHOD_NOT_FOUND");
+  }
+
+  private authenticate(header: string | undefined): { caller: "MAIN" | "WORKER"; requesterId: string } | undefined {
+    const presented = header?.startsWith("Bearer ") ? header.slice("Bearer ".length) : undefined;
+    if (this.workerToken && presented === this.workerToken) return { caller: "WORKER", requesterId: "mcp:worker" };
+    if (this.token && presented === this.token) return { caller: "MAIN", requesterId: "mcp:main" };
+    if (!this.token && !this.workerToken && this.allowedActions.size === 0) return { caller: "MAIN", requesterId: "mcp:none" };
+    return undefined;
   }
 }
 

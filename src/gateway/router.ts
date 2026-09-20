@@ -5,6 +5,14 @@ import type { Logger } from "../shared/logger.js";
 import { GatewayState } from "./state.js";
 import { CommandRegistry, type CommandContext, type CommandResult, AgentActionRegistry } from "./registry.js";
 
+function commandAllowed(permission: string, event: ChatEvent, owner: AppConfig["owner"]): boolean {
+  if (!permission) return false;
+  if (permission === "owner" || permission === "admin" || permission.startsWith("owner.")) {
+    return event.sender.platform === owner.platform && event.sender.accountId === owner.accountId && event.sender.userId === owner.userId;
+  }
+  return permission === "user" || permission === "public" || permission.startsWith("command.");
+}
+
 export interface AgentEventController {
   deliver(event: ControllerEventEnvelope): Promise<void>;
 }
@@ -53,6 +61,10 @@ export class Router {
     const route = this.commands.resolve(name);
     if (!route) {
       await this.adapter.sendMessage(event.conversation, { text: `未知命令 /${name}。发送 /help 查看可用命令。`, replyTo: event.message.ref });
+      return;
+    }
+    if (!commandAllowed(route.definition.permission, event, this.config.owner)) {
+      await this.adapter.sendMessage(event.conversation, { text: "当前身份没有执行此命令的权限。", replyTo: event.message.ref });
       return;
     }
     const invocationId = newId("cmd");

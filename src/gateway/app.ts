@@ -24,7 +24,7 @@ export class GatewayApp {
     this.state = new GatewayState(config.paths.gatewayState);
     this.adapter = new QQChatPlatformAdapter(config, this.log);
     this.controller = new PodmanController(config, this.state, this.log);
-    this.mcp = new GatewayMcpServer(this.actions, Number(process.env.GATEWAY_MCP_PORT ?? 8787), this.log);
+    this.mcp = new GatewayMcpServer(this.actions, Number(process.env.GATEWAY_MCP_PORT ?? 8787), this.log, { host: process.env.GATEWAY_MCP_HOST ?? "127.0.0.1", token: process.env.GATEWAY_MCP_TOKEN, workerToken: process.env.GATEWAY_MCP_WORKER_TOKEN, workerTaskId: process.env.GATEWAY_MCP_WORKER_TASK_ID, allowedActions: (process.env.GATEWAY_MCP_ALLOWED_ACTIONS ?? "").split(",").map((item) => item.trim()).filter(Boolean) });
   }
 
   async start(): Promise<void> {

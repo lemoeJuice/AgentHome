@@ -66,6 +66,31 @@ export class MemoryService {
     return { id, type: "explicit", scope: input.scope, content: input.content, provenance };
   }
 
+  rememberFact(input: { access: MemoryAccessContext; scope: MemoryScope; subject: string; predicate: string; object: JsonValue; confidence?: number; validFrom?: string; provenance?: string[] }): MemoryRecord {
+    this.assertScope(input.access, input.scope);
+    const timestamp = nowIso();
+    const provenance = input.provenance ?? [];
+    const objectJson = JSON.stringify(input.object);
+    const existing = this.db.get<{ id: string; object_json: string; provenance_json: string; confidence: number }>("SELECT id,object_json,provenance_json,confidence FROM memory_facts WHERE scope=? AND subject=? AND predicate=? AND status='active' ORDER BY updated_at DESC LIMIT 1", input.scope, input.subject, input.predicate);
+    let id: string;
+    let returnedProvenance = provenance;
+    this.db.transaction(() => {
+      if (existing && existing.object_json === objectJson) {
+        id = existing.id;
+        const merged = [...new Set([...(JSON.parse(existing.provenance_json) as string[]), ...provenance])];
+        returnedProvenance = merged;
+        this.db.run("UPDATE memory_facts SET confidence=?,provenance_json=?,updated_at=? WHERE id=?", Math.max(existing.confidence, input.confidence ?? 0.5), JSON.stringify(merged), timestamp, id);
+      } else {
+        if (existing) this.db.run("UPDATE memory_facts SET status='superseded',valid_to=?,updated_at=? WHERE id=?", input.validFrom ?? timestamp, timestamp, existing.id);
+        id = newId("fact");
+        this.db.run("INSERT INTO memory_facts(id,scope,subject,predicate,object_json,confidence,valid_from,status,provenance_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", id, input.scope, input.subject, input.predicate, objectJson, Math.max(0, Math.min(1, input.confidence ?? 0.5)), input.validFrom ?? timestamp, "active", JSON.stringify(provenance), timestamp, timestamp);
+      }
+      this.index(id, "fact", input.scope, `${input.subject} ${input.predicate} ${objectJson}`);
+      this.refreshProfiles(input.access);
+    });
+    return { id: id!, type: "fact", scope: input.scope, content: `${input.subject} ${input.predicate} ${objectJson}`, provenance: returnedProvenance };
+  }
+
   retrieve(input: { text: string; access: MemoryAccessContext; types?: Array<"fact" | "episode" | "explicit" | "episodic" | "raw">; limit?: number }): { items: MemoryRecord[]; core: string[] } {
     const scopes = this.authorizedScopes(input.access);
     if (scopes.length === 0) return { items: [], core: [] };
@@ -102,6 +127,8 @@ export class MemoryService {
     if (explicit) { this.assertScope(access, explicit.scope); return { id, type: "explicit", scope: explicit.scope, content: explicit.content, provenance: JSON.parse(explicit.provenance_json) as string[] }; }
     const episode = this.db.get<{ id: string; scope: MemoryScope; content: string; occurred_at: string }>("SELECT id,scope,content,occurred_at FROM memory_episodes WHERE id=?", id);
     if (episode) { this.assertScope(access, episode.scope); return { id, type: "episode", scope: episode.scope, content: episode.content, occurredAt: episode.occurred_at }; }
+    const fact = this.db.get<{ id: string; scope: MemoryScope; subject: string; predicate: string; object_json: string; provenance_json: string }>("SELECT id,scope,subject,predicate,object_json,provenance_json FROM memory_facts WHERE id=?", id);
+    if (fact) { this.assertScope(access, fact.scope); return { id, type: "fact", scope: fact.scope, content: `${fact.subject} ${fact.predicate} ${fact.object_json}`, provenance: JSON.parse(fact.provenance_json) as string[] }; }
     return null;
   }
 
@@ -110,7 +137,8 @@ export class MemoryService {
     if (!record) return { deleted: false };
     this.db.transaction(() => {
       if (record.type === "explicit") this.db.run("DELETE FROM memory_explicit WHERE id=?", input.id);
-      else this.db.run("DELETE FROM memory_episodes WHERE id=?", input.id);
+      else if (record.type === "episode") this.db.run("DELETE FROM memory_episodes WHERE id=?", input.id);
+      else if (record.type === "fact") this.db.run("DELETE FROM memory_facts WHERE id=?", input.id);
       this.db.run("DELETE FROM memory_fts WHERE record_id=?", input.id);
       if (record.type === "episode") this.db.run("DELETE FROM memory_inbox WHERE episode_id=?", input.id);
     });
