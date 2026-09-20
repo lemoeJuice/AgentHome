@@ -5,6 +5,7 @@ Agent Home is a durable QQ-connected Agent runtime built around Rootless Podman,
 ## Quick Start
 
 ```bash
+mkdir -p config
 cp config.example.json config/agent-home.json
 # edit owner.userId and SnowLuma endpoints
 pnpm install
