@@ -17,6 +17,7 @@ export interface PiHarness {
   steer(session: PiSession, prompt: string, options?: { cwd?: string; timeoutMs?: number }): Promise<string>;
   abort(session: PiSession): Promise<boolean>;
   inspect(session: PiSession): Promise<"available" | "missing" | "unknown">;
+  processId?(session: PiSession): number | undefined;
 }
 
 export class PiCliHarness implements PiHarness {
@@ -62,6 +63,8 @@ export class PiCliHarness implements PiHarness {
   async inspect(session: PiSession): Promise<"available" | "missing" | "unknown"> {
     return (await this.resumeSession(session)) ? "available" : "missing";
   }
+
+  processId(session: PiSession): number | undefined { return this.active.get(session.sessionId)?.pid; }
 
   private async run(session: PiSession, prompt: string, options: { cwd?: string; timeoutMs?: number; taskId?: string; workerId?: string }): Promise<string> {
     const args = ["--print", "--session", session.sessionPath, prompt];

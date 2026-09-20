@@ -187,6 +187,7 @@ export interface WorkerExecutionRecord {
   harnessSessionId?: string;
   workspaceId?: string;
   workspaceAccess?: "READ" | "WRITE";
+  capabilities?: CapabilitySet;
   processId?: number;
   startedAt?: string;
   updatedAt: string;

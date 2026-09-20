@@ -35,6 +35,8 @@ test("question and answer are durable before worker steer", async () => {
   const caps = { memory: { allowedScopes: ["global_agent"] }, projects: [{ projectId: "*", access: "WRITE" as const }], qq: { readConversations: ["c"], sendConversations: ["c"] }, plugins: { allowedActions: [] }, artifacts: { publishTaskIds: [], allowedDestinations: ["c"] }, tasks: { canCreate: true, visibleTaskIds: [], canCancel: true, canFollowUp: true } };
   const task = tasks.createTask({ title: "test", goal: "ask", requester: { platform: "qq", accountId: "a", userId: "u" }, trust: "OWNER", originConversationId: "c", notificationConversationId: "c", parentCapabilities: caps });
   const worker = await tasks.createWorker({ taskId: task.id, objective: "ask", workspaceId: "project", workspaceAccess: "READ" });
+  assert.deepEqual(worker.capabilities?.memory.allowedScopes, ["global_agent"]);
+  assert.equal(db.get<{ capabilities_json: string }>("SELECT capabilities_json FROM worker_executions WHERE id=?", worker.id)?.capabilities_json !== undefined, true);
   await new Promise((resolve) => setTimeout(resolve, 20));
   const question = db.get<{ id: string; status: string }>("SELECT id,status FROM pending_questions WHERE worker_id=?", worker.id);
   assert.equal(question?.status, "OPEN");

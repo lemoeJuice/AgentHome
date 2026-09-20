@@ -110,6 +110,19 @@ export const runtimeMigrations = [
       CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(record_id UNINDEXED, record_type UNINDEXED, scope UNINDEXED, content);
     `,
   },
+  {
+    version: 2,
+    sql: `
+      ALTER TABLE artifacts ADD COLUMN source_conversation_id TEXT;
+      CREATE INDEX IF NOT EXISTS idx_artifacts_conversation ON artifacts(source_conversation_id, status);
+    `,
+  },
+  {
+    version: 3,
+    sql: `
+      ALTER TABLE worker_executions ADD COLUMN capabilities_json TEXT;
+    `,
+  },
 ];
 
 export function ensureRuntimeSchema(store: SqliteStore): void {

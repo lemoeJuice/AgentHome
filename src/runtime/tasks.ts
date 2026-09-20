@@ -51,10 +51,18 @@ export class TaskService {
     const status: WorkerStatus = input.workspaceAccess === "WRITE" && input.workspaceId && !this.tryAcquireLock(input.workspaceId, workerId) ? "PENDING" : "STARTING";
     const timestamp = nowIso();
     const worker: WorkerExecutionRecord = { id: workerId, taskId: input.taskId, objective: input.objective, status, harness: "pi", ...(input.workspaceId ? { workspaceId: input.workspaceId } : {}), ...(input.workspaceAccess ? { workspaceAccess: input.workspaceAccess } : {}), updatedAt: timestamp };
-    // Capability attenuation is intentionally computed and validated at the service boundary.
-    attenuateWorker(task.capabilities, input.requestedCapabilities ?? {});
+    const requestedCapabilities = input.requestedCapabilities ?? {
+      memory: { allowedScopes: task.capabilities.memory.allowedScopes },
+      projects: input.workspaceId && input.workspaceAccess ? [{ projectId: input.workspaceId, access: input.workspaceAccess }] : [],
+      qq: { readConversations: [], sendConversations: [] },
+      plugins: { allowedActions: [] },
+      artifacts: { publishTaskIds: [input.taskId], allowedDestinations: [] },
+      tasks: { canCreate: false, visibleTaskIds: [], canCancel: false, canFollowUp: false },
+    };
+    const capabilities = attenuateWorker(task.capabilities, requestedCapabilities);
+    worker.capabilities = capabilities;
     this.db.transaction(() => {
-      this.db.run("INSERT INTO worker_executions(id,task_id,objective,status,harness,workspace_id,workspace_access,updated_at) VALUES (?,?,?,?,?,?,?,?)", workerId, input.taskId, input.objective, status, "pi", input.workspaceId ?? null, input.workspaceAccess ?? null, timestamp);
+      this.db.run("INSERT INTO worker_executions(id,task_id,objective,status,harness,workspace_id,workspace_access,capabilities_json,updated_at) VALUES (?,?,?,?,?,?,?,?,?)", workerId, input.taskId, input.objective, status, "pi", input.workspaceId ?? null, input.workspaceAccess ?? null, JSON.stringify(capabilities), timestamp);
       this.event(input.taskId, "WORKER_CREATED", workerId, { status });
       this.db.run("UPDATE tasks SET status=?,updated_at=? WHERE id=? AND status IN ('CREATED','QUEUED')", status === "PENDING" ? "QUEUED" : "RUNNING", timestamp, input.taskId);
     });
@@ -89,7 +97,15 @@ export class TaskService {
       "If blocked by missing user information, return JSON exactly: {\"type\":\"question\",\"question\":\"...\"}.",
     ].join("\n");
     try {
-      const output = await this.pi.send(session, prompt, { cwd: projectPath, timeoutMs: this.config.runtime.piTimeoutMs, taskId: task.id, workerId: worker.id });
+      const outputPromise = this.pi.send(session, prompt, { cwd: projectPath, timeoutMs: this.config.runtime.piTimeoutMs, taskId: task.id, workerId: worker.id });
+      const processId = this.pi.processId?.(session);
+      if (processId) {
+        this.db.transaction(() => {
+          this.db.run("UPDATE worker_executions SET process_id=?,updated_at=? WHERE id=?", processId, nowIso(), worker.id);
+          this.db.run("INSERT OR REPLACE INTO owned_processes(id,task_id,worker_id,pid,process_group_id,command_summary,started_at) VALUES (?,?,?,?,?,?,?)", `process-${worker.id}`, task.id, worker.id, processId, processId, "pi --print --session", nowIso());
+        });
+      }
+      const output = await outputPromise;
       const question = this.parseQuestion(output);
       if (question) await this.askParent(worker.id, question);
       else await this.finishWorker(worker.id, { outcome: "COMPLETED", summary: output || "Worker completed without a textual summary." });
@@ -165,7 +181,8 @@ export class TaskService {
     }
   }
 
-  async requestCancel(taskId: string): Promise<void> {
+  async requestCancel(taskId: string, actor?: Pick<CapabilitySet["tasks"], "canCancel">): Promise<void> {
+    if (actor && !actor.canCancel) throw new Error("TASK_CANCEL_DENIED");
     const task = this.getTask(taskId);
     if (!task.capabilities.tasks.canCancel) throw new Error("TASK_CANCEL_DENIED");
     this.db.transaction(() => this.event(taskId, "CANCEL_REQUESTED"));
@@ -181,6 +198,7 @@ export class TaskService {
       for (const worker of workers) {
         this.db.run("UPDATE worker_executions SET status='CANCELLED',finished_at=?,updated_at=? WHERE id=?", timestamp, timestamp, worker.id);
         if (worker.workspace_id) this.db.run("DELETE FROM project_locks WHERE project_id=? AND owner_worker_id=?", worker.workspace_id, worker.id);
+        this.db.run("DELETE FROM owned_processes WHERE worker_id=?", worker.id);
         this.db.run("UPDATE pending_questions SET status='CLOSED',closed_at=? WHERE worker_id=? AND status='OPEN'", timestamp, worker.id);
         this.event(taskId, "WORKER_CANCELLED", worker.id);
       }
@@ -196,6 +214,7 @@ export class TaskService {
     this.db.transaction(() => {
       this.db.run("UPDATE worker_executions SET status=?,finished_at=?,updated_at=? WHERE id=?", status, timestamp, timestamp, workerId);
       if (worker.workspaceId) this.db.run("DELETE FROM project_locks WHERE project_id=? AND owner_worker_id=?", worker.workspaceId, workerId);
+      this.db.run("DELETE FROM owned_processes WHERE worker_id=?", workerId);
       this.event(worker.taskId, "WORKER_COMPLETED", workerId, { outcome: result.outcome, summary: result.summary, artifacts: result.artifacts ?? [] });
       const remaining = Number(this.db.get<{ count: number }>("SELECT count(*) AS count FROM worker_executions WHERE task_id=? AND status IN ('PENDING','STARTING','RUNNING','WAITING_USER','STOPPING')", worker.taskId)?.count ?? 0);
       if (remaining === 0) {
@@ -210,12 +229,27 @@ export class TaskService {
     await this.emit({ type: "TASK_RESULT", taskId: task.id, workerId, payload: { ...result } });
   }
 
+  async finishTask(taskId: string, result: { outcome: "COMPLETED" | "PARTIAL" | "FAILED"; summary: string; artifacts?: string[] }, workerId?: string): Promise<void> {
+    if (workerId) { await this.finishWorker(workerId, result); return; }
+    const task = this.getTask(taskId);
+    const active = Number(this.db.get<{ count: number }>("SELECT count(*) AS count FROM worker_executions WHERE task_id=? AND status IN ('PENDING','STARTING','RUNNING','WAITING_USER','STOPPING')", taskId)?.count ?? 0);
+    if (active > 0) throw new Error("TASK_WORKERS_STILL_ACTIVE");
+    const timestamp = nowIso();
+    const status: TaskStatus = result.outcome === "COMPLETED" ? "COMPLETED" : result.outcome === "PARTIAL" ? "PARTIAL" : "FAILED";
+    this.db.transaction(() => {
+      this.db.run("UPDATE tasks SET status=?,completed_at=?,updated_at=? WHERE id=? AND status NOT IN ('COMPLETED','PARTIAL','FAILED','CANCELLED')", status, timestamp, timestamp, taskId);
+      this.event(taskId, "TASK_FINISHED", undefined, { ...result });
+    });
+    await this.emit({ type: "TASK_RESULT", taskId, payload: { ...result } });
+  }
+
   async failWorker(workerId: string, error: string): Promise<void> {
     const worker = this.getWorker(workerId);
     const timestamp = nowIso();
     this.db.transaction(() => {
       this.db.run("UPDATE worker_executions SET status='FAILED',finished_at=?,updated_at=? WHERE id=?", timestamp, timestamp, workerId);
       if (worker.workspaceId) this.db.run("DELETE FROM project_locks WHERE project_id=? AND owner_worker_id=?", worker.workspaceId, workerId);
+      this.db.run("DELETE FROM owned_processes WHERE worker_id=?", workerId);
       this.event(worker.taskId, "WORKER_FAILED", workerId, { error: error.slice(0, 1000) });
       this.db.run("UPDATE tasks SET status='FAILED',completed_at=?,updated_at=? WHERE id=?", timestamp, timestamp, worker.taskId);
     });
@@ -225,15 +259,20 @@ export class TaskService {
   }
 
   recover(): void {
-    const active = this.db.all<{ id: string; task_id: string; workspace_id: string | null; harness_session_id: string | null; status: WorkerStatus }>("SELECT id,task_id,workspace_id,harness_session_id,status FROM worker_executions WHERE status IN ('STARTING','RUNNING','WAITING_USER','STOPPING')");
+    const active = this.db.all<{ id: string; task_id: string; workspace_id: string | null; harness_session_id: string | null; process_id: number | null; status: WorkerStatus }>("SELECT id,task_id,workspace_id,harness_session_id,process_id,status FROM worker_executions WHERE status IN ('STARTING','RUNNING','WAITING_USER','STOPPING')");
     for (const worker of active) {
       if (worker.status === "WAITING_USER") {
         if (worker.harness_session_id) this.activeSessions.set(worker.id, { sessionId: worker.harness_session_id, sessionPath: join(this.options.workerRoot, "sessions", `${worker.id}.jsonl`) });
         this.db.run("UPDATE tasks SET status='WAITING_USER',updated_at=? WHERE id=?", nowIso(), worker.task_id);
         continue;
       }
+      if (worker.process_id && this.processAlive(worker.process_id)) {
+        try { process.kill(-worker.process_id, "SIGTERM"); } catch { try { process.kill(worker.process_id, "SIGTERM"); } catch { /* process disappeared */ } }
+        this.recordException(worker.task_id, worker.id, "recovery", "ORPHAN_PROCESS", `terminated process ${worker.process_id}`);
+      }
       this.db.transaction(() => {
         this.db.run("UPDATE worker_executions SET status='INTERRUPTED',updated_at=? WHERE id=?", nowIso(), worker.id);
+        this.db.run("DELETE FROM owned_processes WHERE worker_id=?", worker.id);
         if (worker.workspace_id) this.db.run("DELETE FROM project_locks WHERE project_id=? AND owner_worker_id=?", worker.workspace_id, worker.id);
         this.event(worker.task_id, "WORKER_INTERRUPTED", worker.id, { reason: "runtime_restart" });
         this.db.run("UPDATE tasks SET status='INTERRUPTED',updated_at=? WHERE id=? AND status NOT IN ('COMPLETED','PARTIAL','FAILED','CANCELLED')", nowIso(), worker.task_id);
@@ -250,7 +289,11 @@ export class TaskService {
   getWorker(workerId: string): WorkerExecutionRecord {
     const row = this.db.get<Record<string, unknown>>("SELECT * FROM worker_executions WHERE id=?", workerId);
     if (!row) throw new Error("WORKER_NOT_FOUND");
-    return { id: row.id as string, taskId: row.task_id as string, objective: row.objective as string, status: row.status as WorkerStatus, harness: "pi", ...(row.harness_session_id ? { harnessSessionId: row.harness_session_id as string } : {}), ...(row.workspace_id ? { workspaceId: row.workspace_id as string } : {}), ...(row.workspace_access ? { workspaceAccess: row.workspace_access as "READ" | "WRITE" } : {}), ...(row.process_id ? { processId: row.process_id as number } : {}), ...(row.started_at ? { startedAt: row.started_at as string } : {}), updatedAt: row.updated_at as string, ...(row.finished_at ? { finishedAt: row.finished_at as string } : {}) };
+    let capabilities: CapabilitySet | undefined;
+    if (typeof row.capabilities_json === "string") {
+      try { capabilities = JSON.parse(row.capabilities_json) as CapabilitySet; } catch { this.log.warn("Worker capability snapshot is invalid", { workerId }); }
+    }
+    return { id: row.id as string, taskId: row.task_id as string, objective: row.objective as string, status: row.status as WorkerStatus, harness: "pi", ...(row.harness_session_id ? { harnessSessionId: row.harness_session_id as string } : {}), ...(row.workspace_id ? { workspaceId: row.workspace_id as string } : {}), ...(row.workspace_access ? { workspaceAccess: row.workspace_access as "READ" | "WRITE" } : {}), ...(capabilities ? { capabilities } : {}), ...(row.process_id ? { processId: row.process_id as number } : {}), ...(row.started_at ? { startedAt: row.started_at as string } : {}), updatedAt: row.updated_at as string, ...(row.finished_at ? { finishedAt: row.finished_at as string } : {}) };
   }
 
   listTasks(conversationId?: string): TaskRecord[] {
@@ -276,6 +319,10 @@ export class TaskService {
   }
 
   private hasLock(projectId: string, workerId: string): boolean { return Boolean(this.db.get("SELECT 1 AS found FROM project_locks WHERE project_id=? AND owner_worker_id=?", projectId, workerId)); }
+
+  private processAlive(pid: number): boolean {
+    try { process.kill(pid, 0); return true; } catch { return false; }
+  }
 
   private parseQuestion(output: string): string | null {
     try { const value = JSON.parse(output) as { type?: string; question?: string }; return value.type === "question" && value.question ? value.question : null; } catch { return null; }
