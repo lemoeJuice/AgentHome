@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+.agent-home/
+runtime-state/
+backups/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.log
+coverage/
+test/tmp/

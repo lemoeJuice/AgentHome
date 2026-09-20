@@ -1,0 +1,25 @@
+{
+  "name": "agent-home",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A durable QQ-connected Agent Home runtime",
+  "type": "module",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/cli.js start",
+    "gateway": "node dist/cli.js gateway",
+    "runtime": "node dist/cli.js runtime",
+    "dev": "node --experimental-strip-types --experimental-loader ./scripts/ts-loader.mjs src/cli.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test --experimental-strip-types --experimental-loader ./scripts/ts-loader.mjs test/**/*.test.ts",
+    "lint": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}
