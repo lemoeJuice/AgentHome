@@ -1,8 +1,14 @@
 import type { AppConfig } from "../config.js";
 import type { ArtifactService } from "../runtime/artifacts.js";
 import type { Logger } from "../shared/logger.js";
-import type { ArtifactRef, ChatEvent, ConversationAddress, HistoryQuery, OutgoingMessage, PlatformMessageRef, SendResult } from "../shared/types.js";
+import type { ArtifactRef, ArtifactTransfer, ChatAttachmentRef, ChatEvent, ConversationAddress, HistoryQuery, OutgoingMessage, PlatformMessageRef, SendResult } from "../shared/types.js";
 import { OneBotClient } from "./onebot.js";
+
+function integerValue(value: string, field: string): number {
+  const numeric = Number(value);
+  if (!Number.isSafeInteger(numeric) || numeric < 1) throw new Error(`ONEBOT_INTEGER_REQUIRED:${field}`);
+  return numeric;
+}
 
 export class SnowLumaQQCapability {
   private readonly client: OneBotClient;
@@ -27,7 +33,9 @@ export class SnowLumaQQCapability {
         segments.push({ type: attachment.type, data: { file: url } });
       } else throw new Error("ARTIFACT_REFERENCE_REQUIRED");
     }
-    const result = await this.client.action<{ message_id?: string }>("send_msg", target.kind === "group" ? { group_id: target.platformConversationId, message: segments as never } : { user_id: target.platformConversationId, message: segments as never });
+    const result = target.kind === "group"
+      ? await this.client.action<{ message_id?: string | number }>("send_group_msg", { group_id: integerValue(target.platformConversationId, "group_id"), message: segments as never })
+      : await this.client.action<{ message_id?: string | number }>("send_private_msg", { user_id: integerValue(target.platformConversationId, "user_id"), message: segments as never });
     const messageId = String(result.message_id ?? `outbound-${Date.now()}`);
     return { message: { platform: "qq", accountId: target.accountId, platformConversationId: target.platformConversationId, threadId: target.threadId, messageId }, raw: result as never };
   }
@@ -35,13 +43,24 @@ export class SnowLumaQQCapability {
   async getMessage(ref: PlatformMessageRef): Promise<ChatEvent | null> {
     // The adapter's normalizer is deliberately kept on the host boundary. Runtime only
     // uses this method for a lazy lookup when the platform response is needed.
-    const raw = await this.client.action<Record<string, unknown>>("get_msg", { message_id: ref.messageId });
+    const raw = await this.client.action<Record<string, unknown>>("get_msg", { message_id: integerValue(ref.messageId, "message_id") });
     return raw as never;
   }
 
   async getHistory(query: HistoryQuery): Promise<ChatEvent[]> {
-    const raw = await this.client.action<unknown[]>("get_group_msg_history", { group_id: query.conversation.platformConversationId, count: query.limit ?? 20 });
-    return raw as ChatEvent[];
+    const params: Record<string, string | number> = { group_id: integerValue(query.conversation.platformConversationId, "group_id"), count: query.limit ?? 20 };
+    if (query.beforeMessageId) params.message_id = integerValue(query.beforeMessageId, "message_id");
+    const raw = await this.client.action<{ messages?: unknown[] }>("get_group_msg_history", params);
+    return (raw.messages ?? []) as ChatEvent[];
+  }
+
+  async fetchAttachment(attachment: ChatAttachmentRef): Promise<ArtifactTransfer> {
+    if (!attachment.id) throw new Error("ATTACHMENT_REFERENCE_MISSING");
+    const result = await this.client.action<{ url?: string; file_size?: number }>("get_file", { file_id: attachment.id });
+    if (!result.url) throw new Error("ATTACHMENT_URL_UNAVAILABLE");
+    const response = await fetch(result.url);
+    if (!response.ok || !response.body) throw new Error(`ATTACHMENT_DOWNLOAD_FAILED:${response.status}`);
+    return { filename: attachment.filename ?? attachment.id, ...(attachment.mime ? { mime: attachment.mime } : {}), ...(result.file_size ? { size: result.file_size } : {}), stream: response.body as unknown as AsyncIterable<Uint8Array> };
   }
 
   private async remoteArtifactUrl(ref: ArtifactRef): Promise<string> {

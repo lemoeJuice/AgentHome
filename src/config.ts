@@ -38,8 +38,8 @@ const defaults: AppConfig = {
   },
   snowluma: {
     accountId: "default",
-    endpoint: "ws://127.0.0.1:6700",
-    apiEndpoint: "http://127.0.0.1:5700",
+    endpoint: "ws://127.0.0.1:3001",
+    apiEndpoint: "http://127.0.0.1:3000",
     accessTokenEnv: "SNOWLUMA_ACCESS_TOKEN",
     reverseWebSocketPath: "/onebot/v11/ws",
     reconnectMs: 2000,

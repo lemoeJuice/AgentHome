@@ -11,13 +11,26 @@ export interface OneBotClientOptions {
 
 type OneBotEvent = Record<string, unknown>;
 
+type OneBotEnvelope<T> = {
+  status?: unknown;
+  retcode?: unknown;
+  data?: T;
+  message?: unknown;
+  wording?: unknown;
+};
+
+function actionUrl(endpoint: string, action: string): URL {
+  if (!/^[A-Za-z0-9_]+$/.test(action)) throw new Error(`ONEBOT_ACTION_INVALID:${action}`);
+  const base = endpoint.endsWith("/") ? endpoint : `${endpoint}/`;
+  return new URL(action, base);
+}
+
 export class OneBotClient {
   private readonly options: OneBotClientOptions;
   private socket: WebSocket | undefined;
   private stopped = false;
   private connecting = false;
   private eventHandler: ((event: OneBotEvent) => Promise<void>) | undefined;
-  private sequence = 0;
   private readonly log: Logger;
 
   constructor(options: OneBotClientOptions, logger: Logger) {
@@ -44,15 +57,18 @@ export class OneBotClient {
     try {
       const headers: Record<string, string> = { "content-type": "application/json" };
       if (this.options.accessToken) headers.authorization = `Bearer ${this.options.accessToken}`;
-      const response = await fetch(this.options.apiEndpoint, {
+      const response = await fetch(actionUrl(this.options.apiEndpoint, action), {
         method: "POST",
         headers,
-        body: JSON.stringify({ action, params, echo: `${Date.now()}-${++this.sequence}` }),
+        body: JSON.stringify(params),
         signal: controller.signal,
       });
       if (!response.ok) throw new Error(`ONEBOT_HTTP_${response.status}`);
-      const body = await response.json() as { status?: string; retcode?: number; data?: T; message?: string };
-      if (body.status === "failed" || (body.retcode !== undefined && body.retcode !== 0)) throw new Error(`ONEBOT_ACTION_FAILED:${action}:${body.message ?? body.retcode ?? "unknown"}`);
+      const body = await response.json() as OneBotEnvelope<T>;
+      if (body.status !== "ok" || body.retcode !== 0) {
+        const detail = typeof body.wording === "string" ? body.wording : typeof body.message === "string" ? body.message : String(body.retcode ?? "invalid_envelope");
+        throw new Error(`ONEBOT_ACTION_FAILED:${action}:${detail}`);
+      }
       return body.data as T;
     } finally {
       clearTimeout(timeout);

@@ -3,10 +3,16 @@ import { Logger } from "../shared/logger.js";
 import { NOT_IMPLEMENTED, type ChatAttachmentRef, type ChatEvent, type ChatPlatformAdapter, type ConversationAddress, type HistoryQuery, type OutgoingMessage, type PlatformMessageRef, type SendResult, type ArtifactTransfer } from "../shared/types.js";
 import { OneBotClient } from "./onebot.js";
 
-type Segment = { type: string; data?: Record<string, string> } | string;
+type Segment = { type: string; data?: Record<string, unknown> } | string;
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" || typeof value === "number" ? String(value) : undefined;
+}
+
+function integerValue(value: string | number | undefined, field: string): number {
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (!Number.isSafeInteger(numeric) || numeric < 1) throw new Error(`ONEBOT_INTEGER_REQUIRED:${field}`);
+  return numeric;
 }
 
 function parseSegments(message: unknown): { text: string | null; mentionsBot: boolean; replyTo: PlatformMessageRef | null; attachments: ChatAttachmentRef[] } {
@@ -18,11 +24,11 @@ function parseSegments(message: unknown): { text: string | null; mentionsBot: bo
   for (const segment of segments) {
     if (typeof segment === "string") { textParts.push(segment); continue; }
     const data = segment.data ?? {};
-    if (segment.type === "text") textParts.push(data.text ?? "");
-    if (segment.type === "at") { mentionsBot ||= data.qq === "all" || Boolean(data.qq); textParts.push(data.qq === "all" ? "@all" : `@${data.qq ?? ""}`); }
-    if (segment.type === "reply" && data.id) replyTo = { platform: "qq", accountId: "", platformConversationId: "", threadId: null, messageId: data.id };
-    if (segment.type === "image") attachments.push({ type: "image", id: data.file, url: data.url, raw: data as never });
-    if (segment.type === "file") attachments.push({ type: "file", id: data.file, url: data.url, filename: data.name, raw: data as never });
+    if (segment.type === "text") { const text = stringValue(data.text); if (text) textParts.push(text); }
+    if (segment.type === "at") { const qq = stringValue(data.qq); mentionsBot ||= qq === "all" || Boolean(qq); textParts.push(qq === "all" ? "@all" : `@${qq ?? ""}`); }
+    if (segment.type === "reply" && data.id !== undefined) { const id = stringValue(data.id); if (id) replyTo = { platform: "qq", accountId: "", platformConversationId: "", threadId: null, messageId: id }; }
+    if (segment.type === "image") attachments.push({ type: "image", ...(stringValue(data.file) ? { id: stringValue(data.file) } : {}), ...(stringValue(data.url) ? { url: stringValue(data.url) } : {}), raw: data as never });
+    if (segment.type === "file") attachments.push({ type: "file", ...(stringValue(data.file) ? { id: stringValue(data.file) } : {}), ...(stringValue(data.url) ? { url: stringValue(data.url) } : {}), ...(stringValue(data.name) ? { filename: stringValue(data.name) } : {}), raw: data as never });
     if (segment.type !== "text" && segment.type !== "at" && segment.type !== "reply" && segment.type !== "image" && segment.type !== "file") attachments.push({ type: "unknown", raw: data as never });
   }
   const text = textParts.join("").trim();
@@ -67,29 +73,31 @@ export class QQChatPlatformAdapter implements ChatPlatformAdapter {
       if (!attachment.url) throw new Error("ARTIFACT_TRANSFER_REQUIRED: QQ adapter only accepts a remote upload URL");
       segments.push({ type: attachment.type, data: { file: attachment.url } });
     }
-    const params: Record<string, string | number | Array<{ type: string; data: Record<string, string> }>> = target.kind === "group"
-      ? { group_id: target.platformConversationId, message: segments }
-      : { user_id: target.platformConversationId, message: segments };
-    const result = await this.client.action<{ message_id?: string }>("send_msg", params as never);
+    const params = target.kind === "group"
+      ? { group_id: integerValue(target.platformConversationId, "group_id"), message: segments }
+      : { user_id: integerValue(target.platformConversationId, "user_id"), message: segments };
+    const result = await this.client.action<{ message_id?: string | number }>(target.kind === "group" ? "send_group_msg" : "send_private_msg", params as never);
     const messageId = stringValue(result.message_id) ?? `unknown-${Date.now()}`;
     return { message: { platform: "qq", accountId: target.accountId, platformConversationId: target.platformConversationId, threadId: target.threadId, messageId }, raw: result as never };
   }
 
   async getMessage(ref: PlatformMessageRef): Promise<ChatEvent | null> {
-    const raw = await this.client.action<Record<string, unknown>>("get_msg", { message_id: ref.messageId });
+    const raw = await this.client.action<Record<string, unknown>>("get_msg", { message_id: integerValue(ref.messageId, "message_id") });
     return this.normalize({ ...raw, post_type: "message", message_type: raw.message_type ?? (ref.platformConversationId ? "group" : "private"), user_id: raw.user_id ?? "unknown", message_id: ref.messageId, group_id: raw.group_id ?? (ref.platformConversationId || undefined) });
   }
 
   async getRecentMessages(query: HistoryQuery): Promise<ChatEvent[]> {
     if (query.conversation.kind !== "group") return [];
-    const raw = await this.client.action<unknown[]>("get_group_msg_history", { group_id: query.conversation.platformConversationId, count: query.limit ?? 20, message_seq: query.beforeMessageId ?? "" });
-    return raw.map((item) => this.normalize({ ...(item as Record<string, unknown>), post_type: "message", message_type: "group", group_id: query.conversation.platformConversationId })).filter((event): event is ChatEvent => event !== null);
+    const params: Record<string, string | number> = { group_id: integerValue(query.conversation.platformConversationId, "group_id"), count: query.limit ?? 20 };
+    if (query.beforeMessageId) params.message_id = integerValue(query.beforeMessageId, "message_id");
+    const raw = await this.client.action<{ messages?: unknown[] }>("get_group_msg_history", params);
+    return (raw.messages ?? []).map((item) => this.normalize({ ...(item as Record<string, unknown>), post_type: "message", message_type: "group", group_id: query.conversation.platformConversationId })).filter((event): event is ChatEvent => event !== null);
   }
 
   async fetchAttachment(attachment: ChatAttachmentRef): Promise<ArtifactTransfer> {
     const fileId = attachment.id;
     if (!fileId) throw new Error("ATTACHMENT_REFERENCE_MISSING");
-    const result = await this.client.action<{ url?: string; file?: string; file_size?: number }>("get_file", { file: fileId });
+    const result = await this.client.action<{ url?: string; file?: string; file_size?: number }>("get_file", { file_id: fileId });
     const remoteUrl = result.url;
     if (!remoteUrl) throw new Error("ATTACHMENT_URL_UNAVAILABLE");
     const response = await fetch(remoteUrl);
