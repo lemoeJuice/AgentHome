@@ -17,6 +17,11 @@ command -v "$PODMAN" >/dev/null || { printf '%s\n' "missing dependency: $PODMAN"
 "$PODMAN" volume inspect "$VOLUME" >/dev/null 2>&1 || "$PODMAN" volume create "$VOLUME" >/dev/null
 "$PODMAN" network inspect "$NETWORK" >/dev/null 2>&1 || "$PODMAN" network create "$NETWORK" >/dev/null
 
+if "$PODMAN" container exists "$CONTAINER" && [[ "$($PODMAN container inspect -f '{{.Config.Image}}' "$CONTAINER")" != "$IMAGE" ]]; then
+  printf 'replacing existing Agent Home container with image %s\n' "$IMAGE"
+  "$PODMAN" rm -f "$CONTAINER" >/dev/null
+fi
+
 if "$PODMAN" container exists "$CONTAINER"; then
   privileged="$($PODMAN container inspect -f '{{.HostConfig.Privileged}}' "$CONTAINER")"
   pid_mode="$($PODMAN container inspect -f '{{.HostConfig.PidMode}}' "$CONTAINER")"
