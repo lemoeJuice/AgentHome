@@ -140,6 +140,7 @@ if [[ -f "$BACKUP/deployment-secrets.tar.gz" ]]; then
 fi
 if [[ -f "$BACKUP/deployment-config.json" ]]; then mkdir -p "$(dirname "$CONFIG_PATH")"; cp "$BACKUP/deployment-config.json" "$CONFIG_PATH"; chmod 600 "$CONFIG_PATH"; fi
 if [[ -f "$BACKUP/owner.json" ]]; then mkdir -p "$(dirname "$OWNER_CONFIG_PATH")"; cp "$BACKUP/owner.json" "$OWNER_CONFIG_PATH"; chmod 600 "$OWNER_CONFIG_PATH"; fi
+if [[ -f "$BACKUP/snowluma.env" ]]; then mkdir -p "$ROOT_DIR/config"; cp "$BACKUP/snowluma.env" "$ROOT_DIR/config/snowluma.env"; chmod 600 "$ROOT_DIR/config/snowluma.env"; fi
 for snowluma_volume in "${SNOWLUMA_VOLUMES[@]}"; do
   if [[ -f "$BACKUP/$snowluma_volume.tar" ]]; then
     "$PODMAN" volume inspect "$snowluma_volume" >/dev/null 2>&1 || "$PODMAN" volume create "$snowluma_volume" >/dev/null

@@ -28,6 +28,23 @@ AGENT_HOME_CONTAINER="${AGENT_HOME_CONTAINER:-agent-home-default}"
 export AGENT_HOME_IMAGE AGENT_HOME_BASE_IMAGE AGENT_HOME_VOLUME AGENT_HOME_NETWORK AGENT_HOME_CONTAINER
 export AGENT_HOME_HOST_SECRET_ROOT="${AGENT_HOME_HOST_SECRET_ROOT:-$ROOT_DIR/.agent-home}"
 
+SNOWLUMA_CONFIG_FILE="${SNOWLUMA_CONFIG_FILE:-$ROOT_DIR/config/snowluma.env}"
+if [[ ! -e "$SNOWLUMA_CONFIG_FILE" && -f "$ROOT_DIR/config/snowluma.env.example" ]]; then
+  cp "$ROOT_DIR/config/snowluma.env.example" "$SNOWLUMA_CONFIG_FILE"
+  chmod 600 "$SNOWLUMA_CONFIG_FILE"
+fi
+if [[ -r "$SNOWLUMA_CONFIG_FILE" ]]; then
+  while IFS='=' read -r config_key config_value; do
+    config_value="${config_value%$'\r'}"
+    [[ -z "$config_key" || "$config_key" == \#* ]] && continue
+    case "$config_key" in
+      SNOWLUMA_SERVICE_BIND_ADDRESS|SNOWLUMA_UI_BIND_ADDRESS|SNOWLUMA_HTTP_PORT|SNOWLUMA_WS_PORT|SNOWLUMA_WEBUI_PORT|SNOWLUMA_NOVNC_PORT|SNOWLUMA_ACCEPT_EULA|SNOWLUMA_ACCEPT_PRIVACY)
+        [[ -v "$config_key" ]] || printf -v "$config_key" '%s' "$config_value"
+        ;;
+    esac
+  done < "$SNOWLUMA_CONFIG_FILE"
+fi
+
 SNOWLUMA_IMAGE="docker.io/motricseven7/snowluma:latest"
 SNOWLUMA_ACCESS_TOKEN_FILE="${SNOWLUMA_ACCESS_TOKEN_FILE:-$ROOT_DIR/.agent-home/snowluma-access-token}"
 if [[ -s "$SNOWLUMA_ACCESS_TOKEN_FILE" ]]; then
@@ -55,16 +72,27 @@ if [[ -s "$ROOT_DIR/.agent-home/mcp-control-token" ]]; then
 fi
 SNOWLUMA_CONTAINER="${SNOWLUMA_CONTAINER:-snowluma}"
 SNOWLUMA_NETWORK="$AGENT_HOME_NETWORK"
-SNOWLUMA_BIND_ADDRESS="${SNOWLUMA_BIND_ADDRESS:-0.0.0.0}"
+SNOWLUMA_SERVICE_BIND_ADDRESS="${SNOWLUMA_SERVICE_BIND_ADDRESS:-127.0.0.1}"
+SNOWLUMA_UI_BIND_ADDRESS="${SNOWLUMA_UI_BIND_ADDRESS:-0.0.0.0}"
 SNOWLUMA_HTTP_PORT="${SNOWLUMA_HTTP_PORT:-3000}"
 SNOWLUMA_WS_PORT="${SNOWLUMA_WS_PORT:-3001}"
 SNOWLUMA_WEBUI_PORT="${SNOWLUMA_WEBUI_PORT:-5100}"
 SNOWLUMA_NOVNC_PORT="${SNOWLUMA_NOVNC_PORT:-6081}"
-if [[ ! "$SNOWLUMA_BIND_ADDRESS" =~ ^[A-Za-z0-9.:-]+$ ]]; then
-  printf '%s\n' "unsafe SnowLuma bind address: $SNOWLUMA_BIND_ADDRESS" >&2
-  return 2 2>/dev/null || exit 2
-fi
-export SNOWLUMA_CONTAINER SNOWLUMA_NETWORK SNOWLUMA_BIND_ADDRESS SNOWLUMA_HTTP_PORT SNOWLUMA_WS_PORT SNOWLUMA_WEBUI_PORT SNOWLUMA_NOVNC_PORT
+SNOWLUMA_ACCEPT_EULA="${SNOWLUMA_ACCEPT_EULA:-1}"
+SNOWLUMA_ACCEPT_PRIVACY="${SNOWLUMA_ACCEPT_PRIVACY:-1}"
+for snowluma_bind_address in "$SNOWLUMA_SERVICE_BIND_ADDRESS" "$SNOWLUMA_UI_BIND_ADDRESS"; do
+  if [[ ! "$snowluma_bind_address" =~ ^[A-Za-z0-9.:-]+$ ]]; then
+    printf '%s\n' "unsafe SnowLuma bind address: $snowluma_bind_address" >&2
+    return 2 2>/dev/null || exit 2
+  fi
+done
+for snowluma_consent in "$SNOWLUMA_ACCEPT_EULA" "$SNOWLUMA_ACCEPT_PRIVACY"; do
+  case "$snowluma_consent" in
+    0|1|true|false) ;;
+    *) printf '%s\n' 'SnowLuma consent settings must be 0, 1, true, or false' >&2; return 2 2>/dev/null || exit 2 ;;
+  esac
+done
+export SNOWLUMA_CONFIG_FILE SNOWLUMA_CONTAINER SNOWLUMA_NETWORK SNOWLUMA_SERVICE_BIND_ADDRESS SNOWLUMA_UI_BIND_ADDRESS SNOWLUMA_HTTP_PORT SNOWLUMA_WS_PORT SNOWLUMA_WEBUI_PORT SNOWLUMA_NOVNC_PORT SNOWLUMA_ACCEPT_EULA SNOWLUMA_ACCEPT_PRIVACY
 
 for topology_name in "$AGENT_HOME_VOLUME" "$AGENT_HOME_NETWORK" "$AGENT_HOME_CONTAINER"; do
   if [[ ! "$topology_name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$ ]]; then

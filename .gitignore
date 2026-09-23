@@ -2,6 +2,7 @@ node_modules/
 dist/
 config/agent-home.json
 config/owner.json
+config/snowluma.env
 .agent-home/
 runtime-state/
 backups/
