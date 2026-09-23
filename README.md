@@ -11,7 +11,7 @@ pnpm install
 ./scripts/start.sh
 ```
 
-`configure-podman-snowluma.sh` detects a usable local rootless Podman installation and automatically installs Podman with `pacman`, `apt-get`, `dnf`, `yum`, `zypper`, or `apk` when needed. It then uses the fixed `docker.io/motricseven7/snowluma:latest` image, creates persistent QQ volumes, and starts the SnowLuma container. Open the printed noVNC URL on `127.0.0.1:6081` to scan the QQ login QR code, then press Enter. It never asks for a Podman path or a SnowLuma access token, and refuses to claim success unless the local rootless engine is reachable.
+`configure-podman-snowluma.sh` detects a usable local rootless Podman installation and automatically installs Podman with `pacman`, `apt-get`, `dnf`, `yum`, `zypper`, or `apk` when needed. It then uses the fixed `docker.io/motricseven7/snowluma:latest` image, creates persistent QQ volumes, and starts the SnowLuma container. SnowLuma ports bind to `0.0.0.0` by default so a remote browser can reach noVNC on port `6081` and the WebUI on port `5100`; set `SNOWLUMA_BIND_ADDRESS=127.0.0.1` to restrict them to the host. Open the printed URL to scan the QQ login QR code, then press Enter. It never asks for a Podman path or a SnowLuma access token, and refuses to claim success unless the local rootless engine is reachable.
 
 The configure flow is safe to rerun: existing Agent Home and SnowLuma images, containers, dependencies, volumes, and runtime bootstrap are reused. Set `AGENT_HOME_REBUILD_IMAGE=1`, `SNOWLUMA_REFRESH_IMAGE=1`, `AGENT_HOME_REFRESH_DEPS=1`, or `AGENT_HOME_REBOOTSTRAP=1` only when an explicit refresh is needed. `scripts/retry-setup-podman.sh` retries the Podman image/build phase up to 100 times by default.
 
