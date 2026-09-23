@@ -60,8 +60,8 @@ export interface OutgoingMessage {
   attachments?: Array<{
     type: "image" | "file";
     artifact?: ArtifactRef;
-    url?: string;
     filename?: string;
+    url?: string;
   }>;
 }
 
@@ -138,7 +138,7 @@ export interface CapabilitySet {
   projects: Array<{ projectId: string; access: "READ" | "WRITE" }>;
   qq: { readConversations: string[]; sendConversations: string[] };
   plugins: { allowedActions: string[] };
-  artifacts: { publishTaskIds: string[]; allowedDestinations: string[] };
+  artifacts: { readableArtifactAuthorities: string[]; publishTaskIds: string[]; allowedDestinations: string[] };
   tasks: { canCreate: boolean; visibleTaskIds: string[]; canCancel: boolean; canFollowUp: boolean };
 }
 
@@ -187,6 +187,7 @@ export interface WorkerExecutionRecord {
   harnessSessionId?: string;
   workspaceId?: string;
   workspaceAccess?: "READ" | "WRITE";
+  artifactRefs?: ArtifactRef[];
   capabilities?: CapabilitySet;
   processId?: number;
   startedAt?: string;

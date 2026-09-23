@@ -5,6 +5,7 @@ export interface OneBotClientOptions {
   websocketEndpoint: string;
   apiEndpoint: string;
   accessToken?: string;
+  websocketAccessToken?: string;
   reconnectMs: number;
   requestTimeoutMs: number;
 }
@@ -25,12 +26,21 @@ function actionUrl(endpoint: string, action: string): URL {
   return new URL(action, base);
 }
 
+export function resolveWebSocketEndpoint(endpoint: string, configuredPath: string): string {
+  const url = new URL(endpoint);
+  const path = configuredPath.startsWith("/") ? configuredPath : `/${configuredPath}`;
+  if (url.pathname !== "/" && url.pathname !== "" && url.pathname !== path) throw new Error("ONEBOT_WS_PATH_CONFLICT");
+  url.pathname = path;
+  return url.toString();
+}
+
 export class OneBotClient {
   private readonly options: OneBotClientOptions;
   private socket: WebSocket | undefined;
   private stopped = false;
   private connecting = false;
   private eventHandler: ((event: OneBotEvent) => Promise<void>) | undefined;
+  private connectedHandler: (() => Promise<void>) | undefined;
   private readonly log: Logger;
 
   constructor(options: OneBotClientOptions, logger: Logger) {
@@ -38,8 +48,9 @@ export class OneBotClient {
     this.log = logger.child("onebot");
   }
 
-  async start(onEvent: (event: OneBotEvent) => Promise<void>): Promise<void> {
+  async start(onEvent: (event: OneBotEvent) => Promise<void>, onConnected?: () => Promise<void>): Promise<void> {
     this.eventHandler = onEvent;
+    this.connectedHandler = onConnected;
     this.stopped = false;
     void this.connect();
   }
@@ -55,11 +66,12 @@ export class OneBotClient {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.options.requestTimeoutMs);
     try {
-      const headers: Record<string, string> = { "content-type": "application/json" };
-      if (this.options.accessToken) headers.authorization = `Bearer ${this.options.accessToken}`;
       const response = await fetch(actionUrl(this.options.apiEndpoint, action), {
         method: "POST",
-        headers,
+        headers: {
+          "content-type": "application/json",
+          ...(this.options.accessToken ? { authorization: `Bearer ${this.options.accessToken}` } : {}),
+        },
         body: JSON.stringify(params),
         signal: controller.signal,
       });
@@ -80,12 +92,13 @@ export class OneBotClient {
     this.connecting = true;
     try {
       const url = new URL(this.options.websocketEndpoint);
-      if (this.options.accessToken) url.searchParams.set("access_token", this.options.accessToken);
+      const websocketAccessToken = this.options.websocketAccessToken ?? this.options.accessToken;
+      if (websocketAccessToken) url.searchParams.set("access_token", websocketAccessToken);
       const socket = new WebSocket(url);
       this.socket = socket;
       await new Promise<void>((resolve, reject) => {
         let settled = false;
-        socket.addEventListener("open", () => { settled = true; this.log.info("OneBot WebSocket connected"); resolve(); });
+        socket.addEventListener("open", () => { settled = true; this.log.info("OneBot WebSocket connected"); void this.connectedHandler?.().catch((error) => this.log.warn("OneBot connection hook failed", { error: String(error) })); resolve(); });
         socket.addEventListener("error", () => { if (!settled) reject(new Error("ONEBOT_WS_CONNECT_FAILED")); });
       });
       socket.addEventListener("message", (event) => { void this.handleMessage(String(event.data)); });

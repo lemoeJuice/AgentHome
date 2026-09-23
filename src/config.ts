@@ -1,17 +1,16 @@
-import { readFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { readFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 import type { LogLevel } from "./shared/logger.js";
 
 export interface AppConfig {
   instanceId: string;
-  owner: { platform: string; accountId: string; userId: string };
+  owner?: { platform: string; accountId: string; userId: string };
   paths: { gatewayState: string; pluginData: string; backupDir: string; stateRoot: string; runtimeSocket: string };
   snowluma: {
     accountId: string;
     endpoint: string;
     apiEndpoint: string;
-    accessTokenEnv: string;
     reverseWebSocketPath: string;
     reconnectMs: number;
     requestTimeoutMs: number;
@@ -20,15 +19,15 @@ export interface AppConfig {
     global: { commandRequireMention: boolean; naturalLanguageMode: "observe_all" | "explicit_wake" };
     qq: { commandRequireMention: boolean; naturalLanguageMode: "observe_all" | "explicit_wake" };
     conversationOverrides: Record<string, Partial<{ commandRequireMention: boolean; naturalLanguageMode: "observe_all" | "explicit_wake" }>>;
+    accountOverrides?: Record<string, Partial<{ commandRequireMention: boolean; naturalLanguageMode: "observe_all" | "explicit_wake" }>>;
   };
-  runtime: { maxInFlight: number; maxWorkers: number; maxArtifactBytes: number; piCommand: string; piTimeoutMs: number };
-  plugins: { enabled: string[] };
+  runtime: { maxInFlight: number; maxWorkers: number; maxWorkersTotal: number; maxWorkersPerProject: number; maxWorkersPerRequester: number; maxTasks: number; maxArtifactBytes: number; piCommand: string; piTimeoutMs: number; workerSandboxCommand: string; piProvider: string; piModel: string; piAgentDir: string };
+  plugins: { enabled: string[]; allowedActions?: string[] };
   logging: { level: LogLevel };
 }
 
 const defaults: AppConfig = {
   instanceId: "default",
-  owner: { platform: "qq", accountId: "default", userId: "" },
   paths: {
     gatewayState: "./runtime-state/gateway.sqlite",
     pluginData: "./runtime-state/plugin-data",
@@ -40,7 +39,6 @@ const defaults: AppConfig = {
     accountId: "default",
     endpoint: "ws://127.0.0.1:3001",
     apiEndpoint: "http://127.0.0.1:3000",
-    accessTokenEnv: "SNOWLUMA_ACCESS_TOKEN",
     reverseWebSocketPath: "/onebot/v11/ws",
     reconnectMs: 2000,
     requestTimeoutMs: 15000,
@@ -49,13 +47,15 @@ const defaults: AppConfig = {
     global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" },
     qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" },
     conversationOverrides: {},
+    accountOverrides: {},
   },
-  runtime: { maxInFlight: 16, maxWorkers: 2, maxArtifactBytes: 50 * 1024 * 1024, piCommand: "pi", piTimeoutMs: 60 * 60 * 1000 },
-  plugins: { enabled: [] },
+  runtime: { maxInFlight: 16, maxWorkers: 2, maxWorkersTotal: 8, maxWorkersPerProject: 2, maxWorkersPerRequester: 4, maxTasks: 32, maxArtifactBytes: 50 * 1024 * 1024, piCommand: "pi", piTimeoutMs: 60 * 60 * 1000, workerSandboxCommand: "bwrap", piProvider: "openai-codex", piModel: "gpt-5.5", piAgentDir: "/state/home/.pi/agent" },
+  plugins: { enabled: [], allowedActions: [] },
   logging: { level: "info" },
 };
 
 function merge<T>(base: T, value: Partial<T>): T {
+  if (Array.isArray(base) || Array.isArray(value)) return (value ?? base) as T;
   if (typeof base !== "object" || base === null || typeof value !== "object" || value === null) return (value ?? base) as T;
   const output = { ...(base as Record<string, unknown>) };
   for (const [key, incoming] of Object.entries(value as Record<string, unknown>)) {
@@ -68,9 +68,11 @@ function merge<T>(base: T, value: Partial<T>): T {
 }
 
 export async function loadConfig(path = process.env.AGENT_HOME_CONFIG ?? "./config/agent-home.json"): Promise<AppConfig> {
+  const configPath = resolve(path);
+  const configDirectory = dirname(configPath);
   let fileConfig: Partial<AppConfig> = {};
   try {
-    fileConfig = JSON.parse(await readFile(resolve(path), "utf8")) as Partial<AppConfig>;
+    fileConfig = JSON.parse(await readFile(configPath, "utf8")) as Partial<AppConfig>;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     const stateRoot = process.env.AGENT_HOME_STATE ?? "/state";
@@ -79,28 +81,54 @@ export async function loadConfig(path = process.env.AGENT_HOME_CONFIG ?? "./conf
       fileConfig = { ...bootstrap, paths: { ...defaults.paths, stateRoot } };
     } catch { /* doctor will report the missing configuration below */ }
   }
+  const ownerPath = resolve(process.env.AGENT_HOME_OWNER_CONFIG ?? `${configDirectory}/owner.json`);
+  try {
+    const owner = JSON.parse(await readFile(ownerPath, "utf8")) as Partial<NonNullable<AppConfig["owner"]>>;
+    if (owner.platform && owner.accountId && owner.userId && !owner.userId.startsWith("REPLACE_")) {
+      fileConfig = { ...fileConfig, owner: { platform: owner.platform, accountId: owner.accountId, userId: owner.userId } };
+    } else if (fileConfig.owner && (!fileConfig.owner.platform || !fileConfig.owner.accountId || !fileConfig.owner.userId || fileConfig.owner.userId.startsWith("REPLACE_"))) {
+      const { owner: _ignoredOwner, ...withoutOwner } = fileConfig;
+      fileConfig = withoutOwner;
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
   const config = merge(defaults, fileConfig);
-  const configDirectory = resolve(path, "..");
   for (const key of ["gatewayState", "pluginData", "backupDir"] as const) {
     if (!config.paths[key].startsWith("/")) config.paths[key] = resolve(configDirectory, config.paths[key]);
   }
   if (process.env.PI_COMMAND) config.runtime.piCommand = process.env.PI_COMMAND;
+  if (process.env.AGENT_HOME_WORKER_SANDBOX) config.runtime.workerSandboxCommand = process.env.AGENT_HOME_WORKER_SANDBOX;
   if (process.env.AGENT_HOME_LOG_LEVEL) config.logging.level = process.env.AGENT_HOME_LOG_LEVEL as LogLevel;
   validateConfig(config);
   return config;
 }
 
 export function validateConfig(config: AppConfig): void {
-  const required = [config.instanceId, config.owner.platform, config.owner.accountId, config.snowluma.endpoint, config.snowluma.apiEndpoint];
-  if (required.some((value) => !value)) throw new Error("CONFIG_MISSING: instance, owner and SnowLuma endpoints are required");
-  if (!config.owner.userId || config.owner.userId.startsWith("REPLACE_")) throw new Error("CONFIG_MISSING: owner.userId is not configured");
+  const required = [config.instanceId, config.snowluma.endpoint, config.snowluma.apiEndpoint];
+  if (required.some((value) => !value)) throw new Error("CONFIG_MISSING: instance and SnowLuma endpoints are required");
   if (!Number.isInteger(config.runtime.maxInFlight) || config.runtime.maxInFlight < 1) throw new Error("CONFIG_INVALID: runtime.maxInFlight");
   if (!Number.isInteger(config.runtime.maxWorkers) || config.runtime.maxWorkers < 1) throw new Error("CONFIG_INVALID: runtime.maxWorkers");
+  for (const key of ["maxWorkersTotal", "maxWorkersPerProject", "maxWorkersPerRequester", "maxTasks"] as const) if (!Number.isInteger(config.runtime[key]) || config.runtime[key] < 1) throw new Error(`CONFIG_INVALID: runtime.${key}`);
   if (config.chat.qq.naturalLanguageMode !== "observe_all" && config.chat.qq.naturalLanguageMode !== "explicit_wake") throw new Error("CONFIG_INVALID: naturalLanguageMode");
 }
 
-export function secretFromConfig(config: AppConfig): string | undefined {
-  const environment = process.env[config.snowluma.accessTokenEnv];
-  if (environment) return environment;
-  try { return readFileSync(resolve(config.paths.stateRoot, "secrets/snowluma-access-token"), "utf8").trim() || undefined; } catch { return undefined; }
+export function snowlumaAccessToken(config: AppConfig): string | undefined {
+  return readSnowLumaSecret(config, "snowluma-access-token");
+}
+
+export function snowlumaWebSocketAccessToken(config: AppConfig): string | undefined {
+  return readSnowLumaSecret(config, "snowluma-websocket-access-token") ?? snowlumaAccessToken(config);
+}
+
+function readSnowLumaSecret(config: AppConfig, name: string): string | undefined {
+  const paths = [join(config.paths.stateRoot, "secrets", name)];
+  if (process.env.AGENT_HOME_HOST_SECRET_ROOT) paths.push(join(process.env.AGENT_HOME_HOST_SECRET_ROOT, name));
+  for (const path of paths) {
+    try {
+      const value = readFileSync(path, "utf8").trim();
+      if (value) return value;
+    } catch { /* Try the next private deployment path. */ }
+  }
+  return undefined;
 }

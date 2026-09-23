@@ -42,6 +42,8 @@ export class SqliteStore {
     }
   }
 
+  checkpoint(): void { this.db.exec("PRAGMA wal_checkpoint(TRUNCATE)"); }
+
   close(): void { this.db.close(); }
 }
 

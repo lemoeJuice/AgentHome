@@ -123,6 +123,144 @@ export const runtimeMigrations = [
       ALTER TABLE worker_executions ADD COLUMN capabilities_json TEXT;
     `,
   },
+  {
+    version: 4,
+    sql: `
+      ALTER TABLE owned_processes ADD COLUMN pid_start_time TEXT;
+    `,
+  },
+  {
+    version: 5,
+    sql: `
+      CREATE TABLE IF NOT EXISTS memory_tombstones (
+        id TEXT PRIMARY KEY, record_type TEXT NOT NULL, scope TEXT NOT NULL, deleted_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_memory_tombstones_scope ON memory_tombstones(scope, deleted_at);
+    `,
+  },
+  {
+    version: 6,
+    sql: `
+      ALTER TABLE artifacts ADD COLUMN source_requester_id TEXT;
+      ALTER TABLE artifacts ADD COLUMN source_event_id TEXT;
+    `,
+  },
+  {
+    version: 7,
+    sql: `
+      CREATE TABLE IF NOT EXISTS runtime_outbound_intents (
+        id TEXT PRIMARY KEY, kind TEXT NOT NULL, related_id TEXT, conversation_id TEXT NOT NULL,
+        target_json TEXT NOT NULL, message_json TEXT NOT NULL, capabilities_json TEXT NOT NULL,
+        status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, result_json TEXT, last_error TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_runtime_outbound_status ON runtime_outbound_intents(status, created_at);
+    `,
+  },
+  {
+    version: 8,
+    sql: `
+      CREATE TABLE IF NOT EXISTS main_turn_queue (
+        id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, job_json TEXT NOT NULL,
+        status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, error TEXT,
+        created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_main_turn_queue_pending ON main_turn_queue(status, conversation_id, created_at);
+    `,
+  },
+  {
+    version: 9,
+    sql: `
+      ALTER TABLE runtime_outbound_intents ADD COLUMN lease_until TEXT;
+      ALTER TABLE runtime_outbound_intents ADD COLUMN last_attempt_at TEXT;
+      ALTER TABLE runtime_outbound_intents ADD COLUMN ack_at TEXT;
+    `,
+  },
+  {
+    version: 10,
+    sql: `
+      ALTER TABLE worker_executions ADD COLUMN artifact_refs_json TEXT;
+    `,
+  },
+  {
+    version: 11,
+    sql: `
+      ALTER TABLE worker_executions ADD COLUMN mcp_binding_token TEXT;
+    `,
+  },
+  {
+    version: 12,
+    sql: `
+      ALTER TABLE main_turn_queue ADD COLUMN source_event_id TEXT;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_main_turn_queue_source_event ON main_turn_queue(source_event_id) WHERE source_event_id IS NOT NULL;
+      CREATE TABLE IF NOT EXISTS task_event_outbox (
+        task_event_id TEXT PRIMARY KEY REFERENCES task_events(id), task_id TEXT NOT NULL,
+        event_type TEXT NOT NULL, question_id TEXT, payload_json TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('PENDING','ENQUEUED','DELIVERED')),
+        attempts INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, delivered_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_task_event_outbox_status ON task_event_outbox(status, created_at);
+    `,
+  },
+  {
+    version: 13,
+    sql: `
+      ALTER TABLE task_mailbox ADD COLUMN worker_id TEXT;
+      ALTER TABLE task_mailbox ADD COLUMN question_id TEXT;
+      ALTER TABLE task_mailbox ADD COLUMN consumed_at TEXT;
+      CREATE INDEX IF NOT EXISTS idx_mailbox_worker_status ON task_mailbox(worker_id, status, created_at);
+    `,
+  },
+  {
+    version: 14,
+    sql: `
+      ALTER TABLE worker_executions ADD COLUMN harness_session_path TEXT;
+    `,
+  },
+  {
+    version: 15,
+    sql: `
+      ALTER TABLE memory_inbox ADD COLUMN next_attempt_at TEXT;
+      ALTER TABLE memory_inbox ADD COLUMN last_error TEXT;
+      CREATE INDEX IF NOT EXISTS idx_memory_inbox_ready ON memory_inbox(status, next_attempt_at, created_at);
+      CREATE TABLE IF NOT EXISTS memory_index_queue (
+        id TEXT PRIMARY KEY, record_id TEXT NOT NULL, record_type TEXT NOT NULL, scope TEXT NOT NULL,
+        operation TEXT NOT NULL CHECK(operation IN ('UPSERT','DELETE')), content TEXT,
+        status TEXT NOT NULL CHECK(status IN ('pending','processing','done','failed')),
+        retries INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT, last_error TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_memory_index_queue_ready ON memory_index_queue(status, next_attempt_at, created_at);
+    `,
+  },
+  {
+    version: 16,
+    sql: `
+      CREATE TABLE IF NOT EXISTS memory_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      INSERT OR IGNORE INTO memory_meta(key,value) VALUES ('schema_version','1');
+      ALTER TABLE memory_tombstones ADD COLUMN mode TEXT NOT NULL DEFAULT 'delete';
+    `,
+  },
+  {
+    version: 17,
+    sql: `
+      ALTER TABLE artifacts ADD COLUMN retention_class TEXT NOT NULL DEFAULT 'task-lifetime';
+      ALTER TABLE artifacts ADD COLUMN owner_invocation_id TEXT;
+      ALTER TABLE artifacts ADD COLUMN owner_plugin_id TEXT;
+    `,
+  },
+  {
+    version: 18,
+    sql: `
+      CREATE TABLE IF NOT EXISTS authorization_audit_events (
+        id TEXT PRIMARY KEY, operation TEXT NOT NULL, decision TEXT NOT NULL,
+        reason TEXT, resource TEXT, requester_id TEXT, task_id TEXT,
+        conversation_id TEXT, metadata_json TEXT, created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_authorization_audit_created ON authorization_audit_events(created_at);
+      CREATE INDEX IF NOT EXISTS idx_authorization_audit_resource ON authorization_audit_events(resource, operation);
+    `,
+  },
 ];
 
 export function ensureRuntimeSchema(store: SqliteStore): void {
