@@ -12,7 +12,7 @@ export interface CommandContext {
 
 export interface CommandResult {
   text?: string;
-  artifacts?: Array<{ ref: { authority: "agent-home" | "bot-gateway"; artifactId: string }; filename: string; mime?: string; size: number; url?: string }>;
+  artifacts?: Array<{ ref: { authority: "agent-home" | "bot-gateway"; artifactId: string }; filename: string; mime?: string; size: number; path?: string }>;
   context?: { type: string; summary: string; resultRef?: string };
 }
 
@@ -48,9 +48,11 @@ export interface AgentActionDefinition {
 }
 
 export interface AgentActionContext {
+  invocationId: string;
   caller: "MAIN" | "WORKER";
   requesterId: string;
   taskId?: string;
+  workerId?: string;
 }
 
 export type AgentActionHandler = (input: JsonValue, context: AgentActionContext) => Promise<JsonValue>;
