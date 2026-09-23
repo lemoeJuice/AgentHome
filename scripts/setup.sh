@@ -3,22 +3,74 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
+source "$ROOT_DIR/scripts/lib.sh"
 
 command -v node >/dev/null || { printf '%s\n' 'missing dependency: node >= 22.5' >&2; exit 2; }
 node -e 'const [major, minor] = process.versions.node.split(".").map(Number); if (major < 22 || (major === 22 && minor < 5)) process.exit(1)' || { printf '%s\n' 'node >= 22.5 is required' >&2; exit 2; }
 if command -v pnpm >/dev/null; then PACKAGE_MANAGER=pnpm; elif command -v npm >/dev/null; then PACKAGE_MANAGER=npm; else printf '%s\n' 'missing dependency: pnpm or npm' >&2; exit 2; fi
-PODMAN="${PODMAN_COMMAND:-podman}"
-command -v "$PODMAN" >/dev/null || { printf '%s\n' 'missing dependency: rootless podman' >&2; exit 2; }
-"$PODMAN" info --format '{{.Host.Security.Rootless}}' | grep -q true || { printf '%s\n' 'podman is not running rootless' >&2; exit 2; }
-
 mkdir -p config runtime-state/plugin-data backups
-if [[ ! -e config/agent-home.json ]]; then cp config.example.json config/agent-home.json; chmod 600 config/agent-home.json; printf '%s\n' 'created config/agent-home.json; set owner.userId and SnowLuma endpoints before starting' >&2; fi
+mkdir -p .agent-home
+CONFIG_PATH="${AGENT_HOME_CONFIG:-$ROOT_DIR/config/agent-home.json}"
+if [[ "$CONFIG_PATH" != /* ]]; then CONFIG_PATH="$ROOT_DIR/$CONFIG_PATH"; fi
+OWNER_CONFIG_PATH="${AGENT_HOME_OWNER_CONFIG:-$(dirname "$CONFIG_PATH")/owner.json}"
+if [[ "$OWNER_CONFIG_PATH" != /* ]]; then OWNER_CONFIG_PATH="$ROOT_DIR/$OWNER_CONFIG_PATH"; fi
+case "$CONFIG_PATH" in "$ROOT_DIR"/*) ;; *) printf '%s\n' 'AGENT_HOME_CONFIG must be inside the project directory' >&2; exit 2 ;; esac
+case "$OWNER_CONFIG_PATH" in "$ROOT_DIR"/*) ;; *) printf '%s\n' 'AGENT_HOME_OWNER_CONFIG must be inside the project directory' >&2; exit 2 ;; esac
+mkdir -p "$(dirname "$CONFIG_PATH")"
+if [[ ! -e "$OWNER_CONFIG_PATH" ]]; then
+  mkdir -p "$(dirname "$OWNER_CONFIG_PATH")"
+  cp "$ROOT_DIR/config/owner.example.json" "$OWNER_CONFIG_PATH"
+  chmod 600 "$OWNER_CONFIG_PATH"
+  printf 'created optional Bot Owner config template: %s\n' "$OWNER_CONFIG_PATH" >&2
+fi
+OWNER_CONFIG_PATH="$OWNER_CONFIG_PATH" node --input-type=module -e 'import fs from "node:fs"; const owner=JSON.parse(fs.readFileSync(process.env.OWNER_CONFIG_PATH,"utf8")); const configured=owner.userId && !owner.userId.startsWith("REPLACE_"); if (configured && (!owner.platform || !owner.accountId)) process.exit(1);' || { printf 'invalid Bot Owner config: %s\n' "$OWNER_CONFIG_PATH" >&2; exit 2; }
+if [[ ! -s .agent-home/control-token ]]; then
+  node --input-type=module -e 'import crypto from "node:crypto"; process.stdout.write(crypto.randomBytes(32).toString("hex")+"\n")' >.agent-home/control-token
+  chmod 600 .agent-home/control-token
+fi
+export AGENT_HOME_CONTROL_TOKEN="$(<.agent-home/control-token)"
+if [[ ! -s .agent-home/artifact-transfer-secret ]]; then
+  node --input-type=module -e 'import crypto from "node:crypto"; process.stdout.write(crypto.randomBytes(32).toString("hex")+"\n")' >.agent-home/artifact-transfer-secret
+  chmod 600 .agent-home/artifact-transfer-secret
+fi
+export AGENT_ARTIFACT_TRANSFER_SECRET="$(<.agent-home/artifact-transfer-secret)"
+if [[ ! -s .agent-home/gateway-artifact-transfer-secret ]]; then
+  node --input-type=module -e 'import crypto from "node:crypto"; process.stdout.write(crypto.randomBytes(32).toString("hex")+"\n")' >.agent-home/gateway-artifact-transfer-secret
+  chmod 600 .agent-home/gateway-artifact-transfer-secret
+fi
+export GATEWAY_ARTIFACT_TRANSFER_SECRET="$(<.agent-home/gateway-artifact-transfer-secret)"
+if [[ ! -s .agent-home/mcp-main-token ]]; then
+  node --input-type=module -e 'import crypto from "node:crypto"; process.stdout.write(crypto.randomBytes(32).toString("hex")+"\n")' >.agent-home/mcp-main-token
+  chmod 600 .agent-home/mcp-main-token
+fi
+if [[ ! -e .agent-home/mcp-worker-bindings.json ]]; then
+  printf '%s\n' '{}' >.agent-home/mcp-worker-bindings.json
+  chmod 600 .agent-home/mcp-worker-bindings.json
+fi
+if [[ ! -s .agent-home/mcp-control-token ]]; then
+  node --input-type=module -e 'import crypto from "node:crypto"; process.stdout.write(crypto.randomBytes(32).toString("hex")+"\n")' >.agent-home/mcp-control-token
+  chmod 600 .agent-home/mcp-control-token
+fi
+export GATEWAY_MCP_TOKEN="$(<.agent-home/mcp-main-token)"
+export GATEWAY_MCP_CONTROL_TOKEN="$(<.agent-home/mcp-control-token)"
+if [[ ! -e "$CONFIG_PATH" ]]; then cp "$ROOT_DIR/config.example.json" "$CONFIG_PATH"; chmod 600 "$CONFIG_PATH"; printf '%s\n' "created $CONFIG_PATH; set SnowLuma endpoints before starting" >&2; fi
 
-if [[ "$PACKAGE_MANAGER" == pnpm ]]; then pnpm install --frozen-lockfile; else npm install; fi
+if [[ "${AGENT_HOME_REFRESH_DEPS:-0}" == 1 || ! -d node_modules ]]; then
+  if [[ "$PACKAGE_MANAGER" == pnpm ]]; then
+    if [[ -f pnpm-lock.yaml ]]; then pnpm install --frozen-lockfile; else pnpm install; fi
+  else
+    npm install
+  fi
+else
+  printf '%s\n' 'reusing existing host dependencies (set AGENT_HOME_REFRESH_DEPS=1 to reinstall)'
+fi
 "$PACKAGE_MANAGER" run build
-"$PODMAN" volume inspect "${AGENT_HOME_VOLUME:-agent-home-default-state}" >/dev/null 2>&1 || "$PODMAN" volume create "${AGENT_HOME_VOLUME:-agent-home-default-state}" >/dev/null
-"$PODMAN" build --tag "${AGENT_HOME_IMAGE:-agent-home:latest}" --file Containerfile .
-AGENT_HOME_CONTAINER="${AGENT_HOME_CONTAINER:-agent-home-default}" AGENT_HOME_IMAGE="${AGENT_HOME_IMAGE:-agent-home:latest}" AGENT_HOME_VOLUME="${AGENT_HOME_VOLUME:-agent-home-default-state}" scripts/init-container.sh
-if [[ "${AGENT_HOME_INSTALL_PI:-1}" != 0 ]]; then AGENT_HOME_CONTAINER="${AGENT_HOME_CONTAINER:-agent-home-default}" scripts/install-pi.sh; fi
-"$PACKAGE_MANAGER" run doctor || true
-printf '%s\n' 'setup complete; configure credentials and run scripts/start.sh'
+scripts/setup-podman.sh
+scripts/setup-snowluma.sh
+bash scripts/init-container.sh
+if [[ "${AGENT_HOME_INSTALL_PI:-1}" != 0 ]]; then bash scripts/install-pi.sh; fi
+if ! "$PACKAGE_MANAGER" run doctor; then
+  printf '%s\n' 'setup did not pass doctor checks; the deployment is not reported as healthy' >&2
+  exit 1
+fi
+printf '%s\n' 'setup complete; run scripts/start.sh to start the host gateway'
