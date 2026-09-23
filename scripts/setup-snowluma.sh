@@ -9,12 +9,15 @@ PODMAN="$PODMAN_COMMAND"
 NETWORK="$SNOWLUMA_NETWORK"
 CONTAINER="$SNOWLUMA_CONTAINER"
 IMAGE="$SNOWLUMA_IMAGE"
-BIND_ADDRESS="$SNOWLUMA_BIND_ADDRESS"
+SERVICE_BIND_ADDRESS="$SNOWLUMA_SERVICE_BIND_ADDRESS"
+UI_BIND_ADDRESS="$SNOWLUMA_UI_BIND_ADDRESS"
 HTTP_PORT="$SNOWLUMA_HTTP_PORT"
 WS_PORT="$SNOWLUMA_WS_PORT"
 WEBUI_PORT="$SNOWLUMA_WEBUI_PORT"
 WEBUI_CONTAINER_PORT="${SNOWLUMA_WEBUI_CONTAINER_PORT:-5099}"
 NOVNC_PORT="$SNOWLUMA_NOVNC_PORT"
+ACCEPT_EULA="$SNOWLUMA_ACCEPT_EULA"
+ACCEPT_PRIVACY="$SNOWLUMA_ACCEPT_PRIVACY"
 NOFILE_ULIMIT="${SNOWLUMA_NOFILE_ULIMIT:-65536:524288}"
 CONFIG_PATH="${AGENT_HOME_CONFIG:-$ROOT_DIR/config/agent-home.json}"
 OWNER_CONFIG_PATH="${AGENT_HOME_OWNER_CONFIG:-}"
@@ -69,14 +72,15 @@ done
 if "$PODMAN" container exists "$CONTAINER"; then
   existing_image="$($PODMAN container inspect -f '{{.Config.Image}}' "$CONTAINER")"
   existing_ports="$($PODMAN container inspect -f '{{json .HostConfig.PortBindings}}' "$CONTAINER")"
+  existing_env="$($PODMAN container inspect -f '{{json .Config.Env}}' "$CONTAINER")"
   expected_ports_match=false
-  EXISTING_PORTS="$existing_ports" BIND_ADDRESS="$BIND_ADDRESS" HTTP_PORT="$HTTP_PORT" WS_PORT="$WS_PORT" WEBUI_PORT="$WEBUI_PORT" WEBUI_CONTAINER_PORT="$WEBUI_CONTAINER_PORT" NOVNC_PORT="$NOVNC_PORT" node --input-type=module -e '
+  EXISTING_PORTS="$existing_ports" SERVICE_BIND_ADDRESS="$SERVICE_BIND_ADDRESS" UI_BIND_ADDRESS="$UI_BIND_ADDRESS" HTTP_PORT="$HTTP_PORT" WS_PORT="$WS_PORT" WEBUI_PORT="$WEBUI_PORT" WEBUI_CONTAINER_PORT="$WEBUI_CONTAINER_PORT" NOVNC_PORT="$NOVNC_PORT" node --input-type=module -e '
     const existing = JSON.parse(process.env.EXISTING_PORTS || "null");
     const expected = new Map([
-      ["3000/tcp", [process.env.BIND_ADDRESS, process.env.HTTP_PORT]],
-      ["3001/tcp", [process.env.BIND_ADDRESS, process.env.WS_PORT]],
-      [`${process.env.WEBUI_CONTAINER_PORT}/tcp`, [process.env.BIND_ADDRESS, process.env.WEBUI_PORT]],
-      ["6081/tcp", [process.env.BIND_ADDRESS, process.env.NOVNC_PORT]],
+      ["3000/tcp", [process.env.SERVICE_BIND_ADDRESS, process.env.HTTP_PORT]],
+      ["3001/tcp", [process.env.SERVICE_BIND_ADDRESS, process.env.WS_PORT]],
+      [`${process.env.WEBUI_CONTAINER_PORT}/tcp`, [process.env.UI_BIND_ADDRESS, process.env.WEBUI_PORT]],
+      ["6081/tcp", [process.env.UI_BIND_ADDRESS, process.env.NOVNC_PORT]],
     ]);
     if (!existing || Object.keys(existing).length !== expected.size) process.exit(1);
     for (const [containerPort, [hostIp, hostPort]] of expected) {
@@ -84,7 +88,14 @@ if "$PODMAN" container exists "$CONTAINER"; then
       if (!Array.isArray(bindings) || bindings.length !== 1 || bindings[0].HostIp !== hostIp || bindings[0].HostPort !== hostPort) process.exit(1);
     }
   ' && expected_ports_match=true
-  if [[ "$existing_image" != "$IMAGE" || "$expected_ports_match" != true ]]; then
+  expected_env_match=false
+  EXISTING_ENV="$existing_env" ACCEPT_EULA="$ACCEPT_EULA" ACCEPT_PRIVACY="$ACCEPT_PRIVACY" node --input-type=module -e '
+    const existing = JSON.parse(process.env.EXISTING_ENV || "[]");
+    for (const [name, value] of [["SNOWLUMA_ACCEPT_EULA", process.env.ACCEPT_EULA], ["SNOWLUMA_ACCEPT_PRIVACY", process.env.ACCEPT_PRIVACY]]) {
+      if (!existing.includes(`${name}=${value}`)) process.exit(1);
+    }
+  ' && expected_env_match=true
+  if [[ "$existing_image" != "$IMAGE" || "$expected_ports_match" != true || "$expected_env_match" != true ]]; then
     "$PODMAN" rm -f "$CONTAINER" >/dev/null
   fi
 fi
@@ -96,12 +107,14 @@ if ! "$PODMAN" container exists "$CONTAINER"; then
     --security-opt seccomp=unconfined
     --env SNOWLUMA_WEBUI_HOST=0.0.0.0
     --env "SNOWLUMA_WEBUI_PORT=$WEBUI_CONTAINER_PORT"
+    --env "SNOWLUMA_ACCEPT_EULA=$ACCEPT_EULA"
+    --env "SNOWLUMA_ACCEPT_PRIVACY=$ACCEPT_PRIVACY"
     --env 'SNOWLUMA_QQ_FLAGS=--disable-gpu --disable-software-rasterizer --disable-gpu-compositing'
     --env TZ=Asia/Shanghai
-    --publish "${BIND_ADDRESS}:${NOVNC_PORT}:6081"
-    --publish "${BIND_ADDRESS}:${WEBUI_PORT}:${WEBUI_CONTAINER_PORT}"
-    --publish "${BIND_ADDRESS}:${HTTP_PORT}:3000"
-    --publish "${BIND_ADDRESS}:${WS_PORT}:3001"
+    --publish "${UI_BIND_ADDRESS}:${NOVNC_PORT}:6081"
+    --publish "${UI_BIND_ADDRESS}:${WEBUI_PORT}:${WEBUI_CONTAINER_PORT}"
+    --publish "${SERVICE_BIND_ADDRESS}:${HTTP_PORT}:3000"
+    --publish "${SERVICE_BIND_ADDRESS}:${WS_PORT}:3001"
     --volume 'snowluma-gateway-data:/app/data:Z,U'
     --volume 'snowluma-client-config:/app/.config:Z,U'
     --volume 'snowluma-client-data:/app/.local/share:Z,U'
@@ -132,12 +145,13 @@ NODE
 
 printf '%s\n' "SnowLuma image: $IMAGE"
 printf '%s\n' "SnowLuma container: $CONTAINER"
-printf '%s\n' "SnowLuma bind address: $BIND_ADDRESS"
-DISPLAY_HOST="$BIND_ADDRESS"
+printf '%s\n' "SnowLuma service bind address: $SERVICE_BIND_ADDRESS"
+printf '%s\n' "SnowLuma UI bind address: $UI_BIND_ADDRESS"
+DISPLAY_HOST="$UI_BIND_ADDRESS"
 if [[ "$DISPLAY_HOST" == 0.0.0.0 || "$DISPLAY_HOST" == :: ]]; then DISPLAY_HOST='<host-ip>'; fi
 printf '%s\n' "Scan QQ at noVNC: http://${DISPLAY_HOST}:${NOVNC_PORT}/"
 printf '%s\n' "SnowLuma WebUI: http://${DISPLAY_HOST}:${WEBUI_PORT}/"
-printf '%s\n' "OneBot endpoints: HTTP=${BIND_ADDRESS}:${HTTP_PORT} WS=${BIND_ADDRESS}:${WS_PORT}"
+printf '%s\n' "OneBot endpoints: HTTP=${SERVICE_BIND_ADDRESS}:${HTTP_PORT} WS=${SERVICE_BIND_ADDRESS}:${WS_PORT}"
 printf '%s\n' 'SnowLuma uses its persistent QQ volumes and QR login; OneBot tokens are kept in ignored local secret files.'
 if [[ "$container_changed" == true || "${SNOWLUMA_QR_PROMPT:-0}" == 1 ]] && [[ -t 0 ]]; then
   read -r -p '完成 noVNC 扫码登录后按 Enter 继续 Agent Home 配置...'

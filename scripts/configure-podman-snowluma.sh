@@ -31,5 +31,4 @@ source "$ROOT_DIR/scripts/lib.sh"
 ROOTLESS="$($PODMAN_COMMAND info --format '{{.Host.Security.Rootless}}')" || fail 'portable Podman is not usable by the current user'
 [[ "$ROOTLESS" == true ]] || fail 'portable Podman must run rootless; do not run this setup through sudo'
 scripts/setup.sh
-printf '%s\n' 'Podman and SnowLuma container configuration completed; scan QQ through the printed noVNC URL if it is not already logged in.'
-printf '%s\n' 'Start the host gateway with: scripts/start.sh'
+printf '%s\n' 'Podman, SnowLuma, Agent Home, and the host gateway are running; scan QQ through the printed noVNC URL if it is not already logged in.'

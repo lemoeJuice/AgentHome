@@ -73,4 +73,5 @@ if ! "$PACKAGE_MANAGER" run doctor; then
   printf '%s\n' 'setup did not pass doctor checks; the deployment is not reported as healthy' >&2
   exit 1
 fi
-printf '%s\n' 'setup complete; run scripts/start.sh to start the host gateway'
+bash "$ROOT_DIR/scripts/start.sh"
+printf '%s\n' 'setup complete; Agent Home and the host gateway are running'
