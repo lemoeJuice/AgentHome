@@ -17,7 +17,7 @@ test("Controller uses a durable outbox and reconnects the exec stream", async ()
   await writeFile(podman, `#!/usr/bin/env bash
 set -euo pipefail
 if [[ "\${1:-}" == inspect ]]; then
-  if [[ "$*" == *"{{json .}}"* ]]; then printf '%s\\n' '{"HostConfig":{"Privileged":false,"PidMode":"","NetworkMode":"bridge"},"Mounts":[{"Type":"volume","Name":"volume","Source":"volume","Destination":"/state"}],"NetworkSettings":{"Networks":{"agent-home-net":{}}}}'
+  if [[ "$*" == *"{{json .}}"* ]]; then printf '%s\\n' '{"HostConfig":{"Privileged":false,"PidMode":"","NetworkMode":"bridge","Binds":["volume:/state:Z,U"]},"Mounts":[{"Type":"volume","Name":"volume","Source":"volume","Destination":"/state"}],"NetworkSettings":{"Networks":{"agent-home-net":{}}}}'
   else printf 'true\\n'; fi
   exit 0
 fi

@@ -241,7 +241,11 @@ export class PodmanController implements AgentEventController {
     if (hostConfig.PidMode === "host") throw new Error("CONTAINER_HOST_PID_FORBIDDEN");
     if (hostConfig.NetworkMode === "host") throw new Error("CONTAINER_HOST_NETWORK_FORBIDDEN");
     const mounts = inspected.Mounts ?? [];
-    if (hostConfig.Binds?.length || mounts.length !== 1 || mounts[0]?.Type !== "volume" || mounts[0]?.Destination !== "/state") throw new Error("CONTAINER_MOUNT_TOPOLOGY_FORBIDDEN");
+    const unsafeBinds = (hostConfig.Binds ?? []).some((bind) => {
+      const [source, destination] = bind.split(":", 2);
+      return source !== this.volume || destination !== "/state";
+    });
+    if (unsafeBinds || mounts.length !== 1 || mounts[0]?.Type !== "volume" || mounts[0]?.Destination !== "/state") throw new Error("CONTAINER_MOUNT_TOPOLOGY_FORBIDDEN");
     if (mounts[0]?.Name !== this.volume && mounts[0]?.Source !== this.volume) throw new Error("CONTAINER_STATE_VOLUME_MISMATCH");
     const networkNames = Object.keys(inspected.NetworkSettings?.Networks ?? {});
     if (networkNames.length !== 1 || networkNames[0] !== this.network) throw new Error("CONTAINER_NETWORK_TOPOLOGY_FORBIDDEN");
