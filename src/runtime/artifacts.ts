@@ -127,13 +127,14 @@ export class ArtifactService {
     this.db.run("UPDATE artifacts SET owner_task_id=? WHERE id=? AND owner_task_id IS NULL", input.taskId, ref.artifactId);
   }
 
-  authorizeRead(ref: ArtifactRef, input: { conversationId?: string; requesterId?: string; taskId?: string; readCapability: ArtifactReadCapability }): ArtifactMetadata & { path: string } {
+  authorizeRead(ref: ArtifactRef, input: { conversationId?: string; requesterId?: string; taskId?: string; sourceEventId?: string; readCapability: ArtifactReadCapability }): ArtifactMetadata & { path: string } {
     const artifact = this.get(ref);
     if (!input.readCapability.readableArtifactAuthorities.includes(ref.authority)) { this.audit("artifact.read", "DENY", "ARTIFACT_READ_DENIED", ref.artifactId, input.requesterId, input.taskId); throw new Error("ARTIFACT_READ_DENIED"); }
     if (artifact.status !== "AVAILABLE" && artifact.status !== "PUBLISHED") throw new Error("ARTIFACT_NOT_READABLE");
     this.assertNotExpired(artifact);
     if (artifact.ownerTaskId && input.taskId !== artifact.ownerTaskId) throw new Error("ARTIFACT_TASK_READ_DENIED");
     if (artifact.sourceConversationId && input.conversationId !== artifact.sourceConversationId) throw new Error("ARTIFACT_CONVERSATION_READ_DENIED");
+    if (artifact.sourceEventId && !artifact.ownerTaskId && input.sourceEventId !== artifact.sourceEventId) throw new Error("ARTIFACT_EVENT_BIND_DENIED");
     if (artifact.sourceRequesterId && input.requesterId !== artifact.sourceRequesterId && !artifact.ownerTaskId) throw new Error("ARTIFACT_REQUESTER_READ_DENIED");
     return artifact;
   }
@@ -148,7 +149,7 @@ export class ArtifactService {
     return artifact;
   }
 
-  async openAuthorized(ref: ArtifactRef, input: { conversationId?: string; requesterId?: string; taskId?: string; readCapability: ArtifactReadCapability }): Promise<{ metadata: ArtifactMetadata; stream: AsyncIterable<Uint8Array> }> {
+  async openAuthorized(ref: ArtifactRef, input: { conversationId?: string; requesterId?: string; taskId?: string; sourceEventId?: string; readCapability: ArtifactReadCapability }): Promise<{ metadata: ArtifactMetadata; stream: AsyncIterable<Uint8Array> }> {
     const artifact = this.authorizeRead(ref, input);
     if (await realpath(artifact.path) !== artifact.path) throw new Error("ARTIFACT_PATH_CHANGED");
     await access(artifact.path);

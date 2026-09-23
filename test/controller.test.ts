@@ -17,7 +17,7 @@ test("Controller uses a durable outbox and reconnects the exec stream", async ()
   await writeFile(podman, `#!/usr/bin/env bash
 set -euo pipefail
 if [[ "\${1:-}" == inspect ]]; then
-  if [[ "$*" == *"{{json .}}"* ]]; then printf '%s\\n' '{"HostConfig":{"Privileged":false,"PidMode":"","NetworkMode":"bridge"},"Mounts":[{"Type":"volume","Source":"volume","Destination":"/state"}]}'
+  if [[ "$*" == *"{{json .}}"* ]]; then printf '%s\\n' '{"HostConfig":{"Privileged":false,"PidMode":"","NetworkMode":"bridge"},"Mounts":[{"Type":"volume","Name":"volume","Source":"volume","Destination":"/state"}],"NetworkSettings":{"Networks":{"agent-home-net":{}}}}'
   else printf 'true\\n'; fi
   exit 0
 fi
@@ -61,7 +61,7 @@ test("Controller rejects unsafe topology on an existing container", async () => 
   await writeFile(podman, `#!/usr/bin/env bash
 set -euo pipefail
 if [[ "\${1:-}" == inspect ]]; then
-  if [[ "$*" == *"{{json .}}"* ]]; then printf '%s\\n' '{"HostConfig":{"Privileged":true,"PidMode":"","NetworkMode":"bridge"},"Mounts":[]}'
+  if [[ "$*" == *"{{json .}}"* ]]; then printf '%s\\n' '{"HostConfig":{"Privileged":true,"PidMode":"","NetworkMode":"bridge"},"Mounts":[],"NetworkSettings":{"Networks":{"agent-home-net":{}}}}'
   else printf 'true\\n'; fi
   exit 0
 fi
@@ -71,6 +71,26 @@ fi
   const state = new GatewayState(config.paths.gatewayState);
   const controller = new PodmanController(config, state, logger, { podmanCommand: podman, containerName: "container", image: "image", volume: "volume" });
   await assert.rejects(controller.start(), /CONTAINER_PRIVILEGED_FORBIDDEN/);
+  state.close();
+  await rm(root, { recursive: true, force: true });
+});
+
+test("Controller rejects an existing container with the wrong state volume or network", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-home-controller-volume-network-"));
+  const podman = join(root, "podman");
+  await writeFile(podman, `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "\${1:-}" == inspect ]]; then
+  if [[ "$*" == *"{{json .}}"* ]]; then printf '%s\\n' '{"HostConfig":{"Privileged":false,"PidMode":"","NetworkMode":"bridge"},"Mounts":[{"Type":"volume","Name":"wrong-volume","Source":"wrong-volume","Destination":"/state"}],"NetworkSettings":{"Networks":{"wrong-network":{}}}}'
+  else printf 'true\\n'; fi
+  exit 0
+fi
+`, { mode: 0o700 });
+  await chmod(podman, 0o700);
+  const config = { instanceId: "topology-mismatch", paths: { gatewayState: join(root, "gateway.sqlite"), pluginData: root, backupDir: root, stateRoot: root, runtimeSocket: join(root, "socket") }, snowluma: { accountId: "a", endpoint: "ws://localhost", apiEndpoint: "http://localhost", reverseWebSocketPath: "/ws", reconnectMs: 10, requestTimeoutMs: 10 }, runtime: { maxInFlight: 2, maxWorkers: 1, maxArtifactBytes: 1000, piCommand: "pi", piTimeoutMs: 1000 }, plugins: { enabled: [] }, logging: { level: "error" as const } } as AppConfig;
+  const state = new GatewayState(config.paths.gatewayState);
+  const controller = new PodmanController(config, state, logger, { podmanCommand: podman, containerName: "container", image: "image", volume: "volume" });
+  await assert.rejects(controller.start(), /CONTAINER_STATE_VOLUME_MISMATCH|CONTAINER_NETWORK_TOPOLOGY_FORBIDDEN/);
   state.close();
   await rm(root, { recursive: true, force: true });
 });

@@ -42,9 +42,18 @@
     "piModel": "gpt-5.5",
     "piAgentDir": "/state/home/.pi/agent"
   },
+  "memory": {
+    "rawEpisodeDays": 30,
+    "keepExplicitForever": true,
+    "keepProvenanceForActiveFacts": true,
+    "maxPromptBytes": 24576
+  },
   "plugins": {
     "enabled": ["./dist/plugins/echo.js"],
-    "allowedActions": []
+    "allowedActions": [],
+    "allowedPermissions": [],
+    "guestAllowedActions": [],
+    "guestAllowedPermissions": []
   },
   "logging": {
     "level": "info"

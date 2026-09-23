@@ -36,11 +36,12 @@ test("artifact publication validates realpath and separates publish from read", 
   await assert.rejects(() => service.registerLocalArtifact({ path: outside, taskId: "task-2", allowedRoots: [root], capability, maxBytes: 100 }), /ARTIFACT_PUBLISH_DENIED/);
   const inbound = await service.ingestAttachment({ stream: (async function* () { yield new Uint8Array([1, 2, 3]); })(), filename: "inbound.bin", conversationId: "conversation-1", requesterId: "user-1", eventId: "event-1", maxBytes: 100 });
   assert.throws(() => service.authorizeRead(inbound.ref, { conversationId: "conversation-1", requesterId: "user-1", readCapability: { readableArtifactAuthorities: [] } }), /ARTIFACT_READ_DENIED/);
-  assert.equal(service.authorizeRead(inbound.ref, { conversationId: "conversation-1", requesterId: "user-1", readCapability }).sourceRequesterId, "user-1");
-  const opened = await service.openAuthorized(inbound.ref, { conversationId: "conversation-1", requesterId: "user-1", readCapability });
+   assert.throws(() => service.authorizeRead(inbound.ref, { conversationId: "conversation-1", requesterId: "user-1", sourceEventId: "event-2", readCapability }), /ARTIFACT_EVENT_BIND_DENIED/);
+   assert.equal(service.authorizeRead(inbound.ref, { conversationId: "conversation-1", requesterId: "user-1", sourceEventId: "event-1", readCapability }).sourceRequesterId, "user-1");
+   const opened = await service.openAuthorized(inbound.ref, { conversationId: "conversation-1", requesterId: "user-1", sourceEventId: "event-1", readCapability });
   const chunks: Uint8Array[] = []; for await (const chunk of opened.stream) chunks.push(chunk);
   assert.deepEqual([...Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)))], [1, 2, 3]);
-  const staged = await service.materializeForRead(inbound.ref, { conversationId: "conversation-1", requesterId: "user-1", readCapability }, project);
+   const staged = await service.materializeForRead(inbound.ref, { conversationId: "conversation-1", requesterId: "user-1", sourceEventId: "event-1", readCapability }, project);
   assert.equal(await readFile(staged.path, "utf8"), "\x01\x02\x03");
   assert.match(staged.path, /inbound-artifacts/);
   assert.throws(() => service.authorizeRead(inbound.ref, { conversationId: "conversation-2", requesterId: "user-2", readCapability }), /ARTIFACT_CONVERSATION_READ_DENIED/);

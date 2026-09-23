@@ -82,6 +82,20 @@ test("SnowLuma MCP client speaks stdio JSON-RPC and unwraps OneBot envelopes", a
   }
 });
 
+test("Gateway MCP enforces permission scopes independently from action names", async () => {
+  const actions = new AgentActionRegistry();
+  actions.register({ name: "same-action", description: "write", permission: "project.write", inputSchema: { type: "object" }, pluginId: "test" }, async () => ({ ok: true }));
+  const server = new GatewayMcpServer(actions, 0, new Logger("test", "error"), { host: "127.0.0.1", token: "main-token", allowedActions: ["same-action"], allowedPermissions: ["project.read"] });
+  await server.start();
+  try {
+    const client = new GatewayMcpClient({ endpoint: `http://127.0.0.1:${server.getPort()}/mcp`, token: "main-token", caller: "MAIN" });
+    assert.deepEqual(await client.listActions(), []);
+    await assert.rejects(client.invokeAction("same-action", {}), /ACTION_DENIED/);
+  } finally {
+    await server.stop();
+  }
+});
+
 test("Gateway Agent Actions have an invocation identity and timeout boundary", async () => {
   const actions = new AgentActionRegistry();
   actions.register({ name: "slow.action", description: "slow", permission: "slow.action", inputSchema: { type: "object" }, pluginId: "test" }, async (_input, context) => {

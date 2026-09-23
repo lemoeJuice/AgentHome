@@ -9,6 +9,7 @@ export interface RuntimeToolContext {
   trust: Trust;
   address: ConversationAddress;
   capabilities: CapabilitySet;
+  eventId?: string;
   message?: PlatformMessageRef;
   replyTo?: PlatformMessageRef;
   attachments?: ChatAttachmentRef[];

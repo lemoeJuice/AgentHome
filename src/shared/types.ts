@@ -137,7 +137,7 @@ export interface CapabilitySet {
   memory: { allowedScopes: MemoryScope[] };
   projects: Array<{ projectId: string; access: "READ" | "WRITE" }>;
   qq: { readConversations: string[]; sendConversations: string[] };
-  plugins: { allowedActions: string[] };
+  plugins: { allowedActions: string[]; allowedPermissions?: string[] };
   artifacts: { readableArtifactAuthorities: string[]; publishTaskIds: string[]; allowedDestinations: string[] };
   tasks: { canCreate: boolean; visibleTaskIds: string[]; canCancel: boolean; canFollowUp: boolean };
 }

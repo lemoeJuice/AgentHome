@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { SqliteStore, migrate } from "../src/db.js";
 import { runtimeMigrations } from "../src/schema.js";
 import { MemoryService } from "../src/runtime/memory.js";
-import { authorizeMemory, attenuateTask, attenuateWorker, CapabilityRequestDeniedError, deriveCapabilities } from "../src/auth.js";
+import { authorizeMemory, attenuateTask, attenuateWorker, capabilityWithin, CapabilityRequestDeniedError, deriveCapabilities } from "../src/auth.js";
 import { messageKey, namespaceKey } from "../src/shared/ids.js";
 import { NOT_IMPLEMENTED } from "../src/shared/types.js";
 
@@ -77,6 +77,22 @@ test("capability attenuation rejects out-of-range requests with structured decis
     (error: unknown) => error instanceof CapabilityRequestDeniedError
       && error.decision.resource === "tasks.canCreate",
   );
+});
+
+test("plugin permission scopes attenuate independently from action names", () => {
+  const parent = {
+    memory: { allowedScopes: ["global_agent"] as const }, projects: [],
+    qq: { readConversations: ["conversation"], sendConversations: ["conversation"] },
+    plugins: { allowedActions: ["project.read", "project.write"] },
+    artifacts: { readableArtifactAuthorities: [], publishTaskIds: [], allowedDestinations: ["conversation"] },
+    tasks: { canCreate: true, visibleTaskIds: [], canCancel: true, canFollowUp: true },
+  };
+  const child = attenuateTask(parent, { plugins: { allowedActions: ["project.write"], allowedPermissions: ["project.read"] } }, "task-1");
+  assert.deepEqual(child.plugins.allowedActions, ["project.write"]);
+  assert.deepEqual(child.plugins.allowedPermissions, ["project.read"]);
+  assert.equal(capabilityWithin(child, parent), true);
+  assert.equal(capabilityWithin(parent, { ...parent, plugins: { ...parent.plugins, allowedPermissions: ["project.read"] } }), false);
+  assert.throws(() => attenuateTask({ ...parent, plugins: { ...parent.plugins, allowedPermissions: ["project.read"] } }, { plugins: { allowedPermissions: ["project.write"] } }, "task-2"), /PRIVILEGE_ESCALATION_DENIED/);
 });
 
 test("derived private conversation scopes do not fall back to a group scope", () => {
@@ -246,5 +262,30 @@ test("memory episode adapters preserve source types and task-event idempotency",
   const system = memory.ingestSystemEpisode({ access: { requesterId: "system", trust: "OWNER", allowedScopes: ["global_agent"] }, scope: "global_agent", sourceId: "system-1", content: "system event", occurredAt: new Date().toISOString() });
   assert.deepEqual([task, document, manual, system].map((episode) => episode.source.type), ["task", "document", "manual", "system_event"]);
   assert.throws(() => memory.ingestSystemEpisode({ access: owner, scope: "global_agent", sourceId: "forged", content: "forged", occurredAt: new Date().toISOString() }), /MEMORY_SYSTEM_INGEST_DENIED/);
+  db.close();
+});
+
+test("memory retention removes old raw episodes but preserves fact provenance and explicit memories", () => {
+  const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
+  const memory = new MemoryService(db, undefined, { rawEpisodeDays: 30, keepExplicitForever: true });
+  const access = { requesterId: "owner", trust: "OWNER" as const, allowedScopes: ["global_agent"] as const };
+  const protectedEpisode = memory.ingestEpisode({ access, episode: { scope: "global_agent", source: { type: "test", sourceId: "protected" }, content: "protected raw", occurredAt: "2026-01-01T00:00:00.000Z", trust: "owner" } });
+  const removableEpisode = memory.ingestEpisode({ access, episode: { scope: "global_agent", source: { type: "test", sourceId: "removable" }, content: "removable raw", occurredAt: "2026-01-01T00:00:00.000Z", trust: "owner" } });
+  db.run("UPDATE memory_inbox SET status='done' WHERE episode_id IN (?,?)", protectedEpisode.id, removableEpisode.id);
+  memory.rememberFact({ access, scope: "global_agent", subject: "deployment", predicate: "environment", object: "staging", provenance: [protectedEpisode.id] });
+  const explicit = memory.remember({ access, scope: "global_agent", content: "keep this explicit memory", provenance: [protectedEpisode.id] });
+  assert.equal(memory.cleanupRetention(new Date("2026-03-01T00:00:00.000Z")), 1);
+  assert.ok(db.get("SELECT 1 FROM memory_episodes WHERE id=?", protectedEpisode.id));
+  assert.equal(db.get("SELECT 1 FROM memory_episodes WHERE id=?", removableEpisode.id), undefined);
+  assert.ok(memory.getMemory(explicit.id, access));
+  db.close();
+});
+
+test("memory prompt context enforces a UTF-8 byte budget", () => {
+  const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
+  const memory = new MemoryService(db);
+  const context = memory.promptContext({ core: ["核心记忆内容"], items: [{ id: "item", type: "episode", scope: "global_agent", content: "additional memory" }] }, 12);
+  const bytes = Buffer.byteLength([...context.core, ...context.items.map((item) => item.content)].join(""), "utf8");
+  assert.ok(bytes <= 12);
   db.close();
 });

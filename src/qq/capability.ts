@@ -1,4 +1,4 @@
-import { mkdir, unlink } from "node:fs/promises";
+import { mkdir, realpath, stat, unlink } from "node:fs/promises";
 import { createWriteStream, createReadStream } from "node:fs";
 import { once } from "node:events";
 import { basename, join, relative, resolve } from "node:path";
@@ -75,7 +75,7 @@ export class SnowLumaQQCapability {
     if (!attachment.id) throw new Error("ATTACHMENT_REFERENCE_MISSING");
     const result = await this.mcp.invokeAction<{ file_path?: string; file_size?: number }>("download_file_stream", { file_id: attachment.id });
     if (!result.file_path) throw new Error("ATTACHMENT_PATH_UNAVAILABLE");
-    const filePath = this.authorizedStreamPath(result.file_path);
+    const filePath = await this.authorizedStreamPath(result.file_path);
     return { filename: attachment.filename ?? attachment.id ?? "attachment", ...(attachment.mime ? { mime: attachment.mime } : {}), ...(result.file_size !== undefined ? { size: result.file_size } : {}), stream: this.readAndRemove(filePath) };
   }
 
@@ -113,9 +113,17 @@ export class SnowLumaQQCapability {
     if (authorization.target && (authorization.target.platform !== target.platform || authorization.target.accountId !== target.accountId || authorization.target.kind !== target.kind || authorization.target.platformConversationId !== target.platformConversationId || JSON.stringify(authorization.target.threadId) !== JSON.stringify(target.threadId))) throw new Error("QQ_READ_TARGET_MISMATCH");
   }
 
-  private authorizedStreamPath(filePath: string): string {
-    const root = resolve(this.mcpStreamDir);
-    const candidate = resolve(filePath);
+  private async authorizedStreamPath(filePath: string): Promise<string> {
+    let root: string;
+    let candidate: string;
+    try {
+      root = await realpath(this.mcpStreamDir);
+      candidate = await realpath(resolve(filePath));
+      if (!(await stat(candidate)).isFile()) throw new Error("ATTACHMENT_PATH_DENIED");
+    } catch (error) {
+      if (error instanceof Error && error.message === "ATTACHMENT_PATH_DENIED") throw error;
+      throw new Error("ATTACHMENT_PATH_DENIED");
+    }
     const child = relative(root, candidate);
     if (!child || child === ".." || child.startsWith("../") || child.startsWith("..\\")) throw new Error("ATTACHMENT_PATH_DENIED");
     return candidate;

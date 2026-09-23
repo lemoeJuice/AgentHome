@@ -12,6 +12,7 @@ export interface WorkerMcpBinding {
   taskId: string;
   workerId: string;
   allowedActions: string[];
+  allowedPermissions?: string[];
 }
 
 export interface McpActionDefinition {
@@ -44,7 +45,7 @@ export class GatewayMcpClient {
 
   registerWorkerBinding(binding: WorkerMcpBinding): Promise<{ registered: true }> {
     if (this.options.caller !== "CONTROL") throw new Error("MCP_CONTROL_REQUIRED");
-    return this.request("register_worker_binding", { token: binding.token, taskId: binding.taskId, workerId: binding.workerId, allowedActions: binding.allowedActions });
+    return this.request("register_worker_binding", { token: binding.token, taskId: binding.taskId, workerId: binding.workerId, allowedActions: binding.allowedActions, ...(binding.allowedPermissions !== undefined ? { allowedPermissions: binding.allowedPermissions } : {}) });
   }
 
   unregisterWorkerBinding(token: string): Promise<{ removed: boolean }> {

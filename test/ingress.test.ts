@@ -165,7 +165,7 @@ test("Main lazy QQ tools enforce the current conversation read capability", asyn
   const capabilities = {
     memory: { allowedScopes: ["global_agent"] }, projects: [], qq: { readConversations: [conversation.id], sendConversations: [conversation.id] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: ["agent-home"], publishTaskIds: [], allowedDestinations: [conversation.id] }, tasks: { canCreate: true, visibleTaskIds: [], canCancel: true, canFollowUp: true },
   } as CapabilitySet;
-  const context = { conversationId: conversation.id, requesterId: "owner", requester: { platform: "qq", accountId: "a", userId: "owner" }, trust: "OWNER", address, capabilities, message: ref, replyTo: { ...ref, messageId: "7" } };
+   const context = { conversationId: conversation.id, requesterId: "owner", requester: { platform: "qq", accountId: "a", userId: "owner" }, trust: "OWNER", address, capabilities, eventId: "artifact-event", message: ref, replyTo: { ...ref, messageId: "7" } };
   try {
     const artifact = await runtime.artifacts.ingestAttachment({ stream: (async function* () { yield Buffer.from("authorized artifact"); })(), filename: "note.txt", mime: "text/plain", conversationId: conversation.id, requesterId: "owner", eventId: "artifact-event", maxBytes: 1000 });
     assert.deepEqual(await internals.handleMainTool("get_message", { ref }, context), { ref, payload: { text: "authorized" } });

@@ -97,13 +97,14 @@ export class TaskService {
       memory: { allowedScopes: task.capabilities.memory.allowedScopes },
       projects: workspaceId && input.workspaceAccess ? [{ projectId: workspaceId, access: input.workspaceAccess }] : [],
       qq: { readConversations: [], sendConversations: [] },
-      plugins: { allowedActions: task.capabilities.plugins.allowedActions },
+      plugins: { allowedActions: task.capabilities.plugins.allowedActions, ...(task.capabilities.plugins.allowedPermissions !== undefined ? { allowedPermissions: task.capabilities.plugins.allowedPermissions } : {}) },
       artifacts: { readableArtifactAuthorities: task.capabilities.artifacts.readableArtifactAuthorities, publishTaskIds: [input.taskId], allowedDestinations: [] },
       tasks: { canCreate: false, visibleTaskIds: [], canCancel: false, canFollowUp: false },
     };
     let capabilities: CapabilitySet;
     try { capabilities = attenuateWorker(task.capabilities, requestedCapabilities); }
     catch (error) { this.audit("worker.create", "DENY", error instanceof Error ? error.message : String(error), task.id, task.requester.userId, task.id); throw error; }
+    for (const ref of input.artifactRefs ?? []) this.artifacts.bindToTask(ref, { taskId: task.id, conversationId: task.originConversationId, requesterId: task.requester.userId });
     const lockRequired = input.workspaceAccess === "WRITE" && Boolean(workspaceId);
     const lockAcquired = lockRequired && this.tryAcquireLock(workspaceId as string, workerId);
     const status: WorkerStatus = lockRequired && !lockAcquired ? "PENDING" : "STARTING";
@@ -643,7 +644,7 @@ export class TaskService {
     const existing = this.db.get<{ mcp_binding_token: string | null }>("SELECT mcp_binding_token FROM worker_executions WHERE id=?", workerId)?.mcp_binding_token;
     const token = existing ?? randomBytes(32).toString("hex");
     if (!existing) this.db.run("UPDATE worker_executions SET mcp_binding_token=?,updated_at=? WHERE id=?", token, nowIso(), workerId);
-    await this.options.mcpControl.registerWorkerBinding({ token, taskId: worker.taskId, workerId, allowedActions: worker.capabilities?.plugins.allowedActions ?? [] });
+    await this.options.mcpControl.registerWorkerBinding({ token, taskId: worker.taskId, workerId, allowedActions: worker.capabilities?.plugins.allowedActions ?? [], ...(worker.capabilities?.plugins.allowedPermissions !== undefined ? { allowedPermissions: worker.capabilities.plugins.allowedPermissions } : {}) });
     return token;
   }
 
@@ -887,6 +888,6 @@ export class TaskService {
     if (!this.config.owner) return undefined;
     const row = this.db.get<{ platform: string; account_id: string; kind: "private" | "group"; platform_conversation_id: string; thread_id_json: string }>("SELECT platform,account_id,kind,platform_conversation_id,thread_id_json FROM conversations WHERE conversation_id=?", input.originConversationId);
     if (!row) return undefined;
-    return deriveCapabilities({ ...input.requester, trust: input.trust, conversationId: input.originConversationId }, { platform: row.platform, accountId: row.account_id, kind: row.kind, platformConversationId: row.platform_conversation_id, threadId: JSON.parse(row.thread_id_json) }, this.config.owner, input.originConversationId);
+    return deriveCapabilities({ ...input.requester, trust: input.trust, conversationId: input.originConversationId }, { platform: row.platform, accountId: row.account_id, kind: row.kind, platformConversationId: row.platform_conversation_id, threadId: JSON.parse(row.thread_id_json) }, this.config.owner, input.originConversationId, this.config.plugins);
   }
 }
