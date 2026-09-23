@@ -233,7 +233,7 @@ export class PodmanController implements AgentEventController {
 
   private async validateContainerTopology(): Promise<void> {
     const result = await execFileAsync(this.podman, ["inspect", "-f", "{{json .}}", this.containerName]);
-    let inspected: { HostConfig?: { Privileged?: boolean; PidMode?: string; NetworkMode?: string; Binds?: string[]; PortBindings?: Record<string, unknown> | null }; Mounts?: Array<{ Type?: string; Source?: string; Destination?: string }>; NetworkSettings?: { Ports?: Record<string, unknown> | null } };
+    let inspected: { HostConfig?: { Privileged?: boolean; PidMode?: string; NetworkMode?: string; Binds?: string[]; PortBindings?: Record<string, unknown> | null }; Mounts?: Array<{ Type?: string; Name?: string; Source?: string; Destination?: string }>; NetworkSettings?: { Ports?: Record<string, unknown> | null; Networks?: Record<string, unknown> } };
     try { inspected = JSON.parse(result.stdout) as typeof inspected; }
     catch { throw new Error("CONTAINER_TOPOLOGY_INSPECT_INVALID"); }
     const hostConfig = inspected.HostConfig ?? {};
@@ -242,6 +242,9 @@ export class PodmanController implements AgentEventController {
     if (hostConfig.NetworkMode === "host") throw new Error("CONTAINER_HOST_NETWORK_FORBIDDEN");
     const mounts = inspected.Mounts ?? [];
     if (hostConfig.Binds?.length || mounts.length !== 1 || mounts[0]?.Type !== "volume" || mounts[0]?.Destination !== "/state") throw new Error("CONTAINER_MOUNT_TOPOLOGY_FORBIDDEN");
+    if (mounts[0]?.Name !== this.volume && mounts[0]?.Source !== this.volume) throw new Error("CONTAINER_STATE_VOLUME_MISMATCH");
+    const networkNames = Object.keys(inspected.NetworkSettings?.Networks ?? {});
+    if (networkNames.length !== 1 || networkNames[0] !== this.network) throw new Error("CONTAINER_NETWORK_TOPOLOGY_FORBIDDEN");
     const hasEntries = (value: Record<string, unknown> | null | undefined): boolean => Boolean(value && Object.keys(value).length > 0);
     if (hasEntries(hostConfig.PortBindings) || hasEntries(inspected.NetworkSettings?.Ports)) throw new Error("CONTAINER_PUBLISHED_PORT_FORBIDDEN");
     for (const mount of mounts) {

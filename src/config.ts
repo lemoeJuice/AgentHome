@@ -22,7 +22,8 @@ export interface AppConfig {
     accountOverrides?: Record<string, Partial<{ commandRequireMention: boolean; naturalLanguageMode: "observe_all" | "explicit_wake" }>>;
   };
   runtime: { maxInFlight: number; maxWorkers: number; maxWorkersTotal: number; maxWorkersPerProject: number; maxWorkersPerRequester: number; maxTasks: number; maxArtifactBytes: number; piCommand: string; piTimeoutMs: number; workerSandboxCommand: string; piProvider: string; piModel: string; piAgentDir: string };
-  plugins: { enabled: string[]; allowedActions?: string[] };
+  memory: { rawEpisodeDays: number | null; keepExplicitForever: boolean; keepProvenanceForActiveFacts: boolean; maxPromptBytes: number };
+  plugins: { enabled: string[]; allowedActions?: string[]; allowedPermissions?: string[]; guestAllowedActions?: string[]; guestAllowedPermissions?: string[] };
   logging: { level: LogLevel };
 }
 
@@ -50,7 +51,8 @@ const defaults: AppConfig = {
     accountOverrides: {},
   },
   runtime: { maxInFlight: 16, maxWorkers: 2, maxWorkersTotal: 8, maxWorkersPerProject: 2, maxWorkersPerRequester: 4, maxTasks: 32, maxArtifactBytes: 50 * 1024 * 1024, piCommand: "pi", piTimeoutMs: 60 * 60 * 1000, workerSandboxCommand: "bwrap", piProvider: "openai-codex", piModel: "gpt-5.5", piAgentDir: "/state/home/.pi/agent" },
-  plugins: { enabled: [], allowedActions: [] },
+  memory: { rawEpisodeDays: 30, keepExplicitForever: true, keepProvenanceForActiveFacts: true, maxPromptBytes: 24 * 1024 },
+  plugins: { enabled: [], allowedActions: [], allowedPermissions: [], guestAllowedActions: [], guestAllowedPermissions: [] },
   logging: { level: "info" },
 };
 
@@ -110,6 +112,9 @@ export function validateConfig(config: AppConfig): void {
   if (!Number.isInteger(config.runtime.maxInFlight) || config.runtime.maxInFlight < 1) throw new Error("CONFIG_INVALID: runtime.maxInFlight");
   if (!Number.isInteger(config.runtime.maxWorkers) || config.runtime.maxWorkers < 1) throw new Error("CONFIG_INVALID: runtime.maxWorkers");
   for (const key of ["maxWorkersTotal", "maxWorkersPerProject", "maxWorkersPerRequester", "maxTasks"] as const) if (!Number.isInteger(config.runtime[key]) || config.runtime[key] < 1) throw new Error(`CONFIG_INVALID: runtime.${key}`);
+  if (config.memory.rawEpisodeDays !== null && (!Number.isInteger(config.memory.rawEpisodeDays) || config.memory.rawEpisodeDays < 1)) throw new Error("CONFIG_INVALID: memory.rawEpisodeDays");
+  if (typeof config.memory.keepExplicitForever !== "boolean" || typeof config.memory.keepProvenanceForActiveFacts !== "boolean") throw new Error("CONFIG_INVALID: memory.retention");
+  if (!Number.isInteger(config.memory.maxPromptBytes) || config.memory.maxPromptBytes < 1024) throw new Error("CONFIG_INVALID: memory.maxPromptBytes");
   if (config.chat.qq.naturalLanguageMode !== "observe_all" && config.chat.qq.naturalLanguageMode !== "explicit_wake") throw new Error("CONFIG_INVALID: naturalLanguageMode");
 }
 

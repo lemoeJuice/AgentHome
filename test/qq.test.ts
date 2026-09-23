@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { OneBotClient, resolveWebSocketEndpoint } from "../src/qq/onebot.js";
 import { normalizeQQEvent, parseSegments, QQChatPlatformAdapter } from "../src/qq/adapter.js";
@@ -210,5 +210,40 @@ test("Agent QQ capability sends an authorized ArtifactRef", async () => {
   } finally {
     db.close();
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("SnowLuma attachment streams require a real regular file below the stream root", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".tmp-qq-stream-"));
+  const streamRoot = join(root, "snowluma", "mcp", "streams");
+  await mkdir(streamRoot, { recursive: true });
+  const safePath = join(streamRoot, "safe.bin");
+  const outsidePath = join(root, "outside.bin");
+  const linkPath = join(streamRoot, "escape.bin");
+  await writeFile(safePath, "safe");
+  await writeFile(outsidePath, "outside");
+  await symlink(outsidePath, linkPath);
+  const config = {
+    instanceId: "test", owner: { platform: "qq", accountId: "default", userId: "8" },
+    paths: { gatewayState: join(root, "gateway.sqlite"), pluginData: root, backupDir: root, stateRoot: root, runtimeSocket: join(root, "runtime.sock") },
+    snowluma: { accountId: "default", endpoint: "ws://127.0.0.1:1", apiEndpoint: "http://127.0.0.1:1", reverseWebSocketPath: "/", reconnectMs: 10, requestTimeoutMs: 1000 },
+    chat: { global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" as const }, qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" as const }, conversationOverrides: {} },
+    runtime: { maxInFlight: 2, maxWorkers: 1, maxArtifactBytes: 1000, piCommand: "pi", piTimeoutMs: 1000, workerSandboxCommand: "bwrap" },
+    plugins: { enabled: [] }, logging: { level: "error" as const },
+  } as AppConfig;
+  const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
+  try {
+    let requestedPath = safePath;
+    const capability = new SnowLumaQQCapability(config, new ArtifactService(db, root), logger, fakeMcp({ invokeAction: async <T>() => ({ file_path: requestedPath } as T) }));
+    const authorization = { conversationId: "conversation-1", capabilities: { memory: { allowedScopes: [] }, projects: [], qq: { readConversations: ["conversation-1"], sendConversations: [] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: [], publishTaskIds: [], allowedDestinations: [] }, tasks: { canCreate: false, visibleTaskIds: [], canCancel: false, canFollowUp: false } }, target: { platform: "qq" as const, accountId: "default", kind: "private" as const, platformConversationId: "8", threadId: null } };
+    const transfer = await capability.fetchAttachment({ type: "file", id: "safe" }, authorization);
+    const chunks: Uint8Array[] = []; for await (const chunk of transfer.stream) chunks.push(chunk);
+    assert.equal(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString(), "safe");
+    requestedPath = linkPath;
+    await assert.rejects(() => capability.fetchAttachment({ type: "file", id: "escape" }, authorization), /ATTACHMENT_PATH_DENIED/);
+    requestedPath = streamRoot;
+    await assert.rejects(() => capability.fetchAttachment({ type: "file", id: "directory" }, authorization), /ATTACHMENT_PATH_DENIED/);
+  } finally {
+    db.close(); await rm(root, { recursive: true, force: true });
   }
 });

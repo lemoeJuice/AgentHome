@@ -1,6 +1,13 @@
 import type { CapabilitySet, ConversationAddress, MemoryScope, RequesterContext, Trust } from "./shared/types.js";
 
-export function deriveCapabilities(requester: RequesterContext, conversation: ConversationAddress, owner: { platform: string; accountId: string; userId: string } | undefined, conversationId: string, policy: { allowedActions?: string[] } = {}): CapabilitySet {
+export interface PluginCapabilityPolicy {
+  allowedActions?: string[];
+  allowedPermissions?: string[];
+  guestAllowedActions?: string[];
+  guestAllowedPermissions?: string[];
+}
+
+export function deriveCapabilities(requester: RequesterContext, conversation: ConversationAddress, owner: { platform: string; accountId: string; userId: string } | undefined, conversationId: string, policy: PluginCapabilityPolicy = {}): CapabilitySet {
   const isOwnerIdentity = Boolean(owner && (
     (requester.platform === owner.platform && requester.accountId === owner.accountId && requester.userId === owner.userId)
     || requester.principalId === "principal:owner"
@@ -11,13 +18,15 @@ export function deriveCapabilities(requester: RequesterContext, conversation: Co
   const baseScopes: MemoryScope[] = ["global_agent", conversation.kind === "group" ? `group:${conversationId}` : `user:${principalScope}`];
   if (trust === "OWNER" && conversation.kind === "private") baseScopes.push("owner_private");
   const canCreate = trust === "OWNER" && conversation.kind === "private";
+  const allowedActions = trust === "OWNER" ? policy.allowedActions : policy.guestAllowedActions;
+  const allowedPermissions = trust === "OWNER" ? policy.allowedPermissions : policy.guestAllowedPermissions;
   return {
     memory: { allowedScopes: baseScopes },
     // Group Owner identity is trusted, but it must not turn a shared conversation
     // into an unrestricted project writer. Project scope must be selected separately.
     projects: trust === "OWNER" && conversation.kind === "private" ? [{ projectId: "*", access: "WRITE" }] : [],
     qq: { readConversations: [conversationId], sendConversations: [conversationId] },
-    plugins: { allowedActions: [...new Set(policy.allowedActions ?? [])] },
+    plugins: { allowedActions: [...new Set(allowedActions ?? [])], ...(allowedPermissions ? { allowedPermissions: [...new Set(allowedPermissions)] } : {}) },
     artifacts: { readableArtifactAuthorities: ["agent-home"], publishTaskIds: isOwner ? ["*"] : [], allowedDestinations: [conversationId] },
     tasks: { canCreate, visibleTaskIds: [], canCancel: trust === "OWNER", canFollowUp: true },
   };
@@ -45,11 +54,12 @@ export function validateCapabilitySet(value: unknown): CapabilitySet {
   const booleans = (candidate: Record<string, unknown>, names: string[]) => names.map((name) => { if (typeof candidate[name] !== "boolean") throw new Error("CAPABILITY_BOOLEAN_INVALID"); return Boolean(candidate[name]); });
   const bools = booleans(tasks, ["canCreate", "canCancel", "canFollowUp"]);
   const canCreate = bools[0] === true; const canCancel = bools[1] === true; const canFollowUp = bools[2] === true;
+  const allowedPermissions = plugins.allowedPermissions === undefined ? undefined : strings(plugins.allowedPermissions, "CAPABILITY_PLUGIN_INVALID");
   return {
     memory: { allowedScopes },
     projects: normalizedProjects,
     qq: { readConversations: conversations(qq.readConversations, "CAPABILITY_QQ_INVALID"), sendConversations: conversations(qq.sendConversations, "CAPABILITY_QQ_INVALID") },
-    plugins: { allowedActions: conversations(plugins.allowedActions, "CAPABILITY_PLUGIN_INVALID") },
+    plugins: { allowedActions: conversations(plugins.allowedActions, "CAPABILITY_PLUGIN_INVALID"), ...(allowedPermissions !== undefined ? { allowedPermissions } : {}) },
     artifacts: { readableArtifactAuthorities: conversations(artifacts.readableArtifactAuthorities ?? [], "CAPABILITY_ARTIFACT_INVALID"), publishTaskIds: conversations(artifacts.publishTaskIds, "CAPABILITY_ARTIFACT_INVALID"), allowedDestinations: conversations(artifacts.allowedDestinations, "CAPABILITY_ARTIFACT_INVALID") },
     tasks: { canCreate, visibleTaskIds: conversations(tasks.visibleTaskIds, "CAPABILITY_TASK_INVALID"), canCancel, canFollowUp },
   };
@@ -58,11 +68,17 @@ export function validateCapabilitySet(value: unknown): CapabilitySet {
 export function capabilityWithin(child: CapabilitySet, parent: CapabilitySet): boolean {
   const projectWithin = child.projects.every((item) => containsProject(parent, item.projectId, item.access));
   const listWithin = (childValues: string[], parentValues: string[], parentUnrestricted = false) => parentUnrestricted || parentValues.includes("*") || childValues.every((value) => parentValues.includes(value));
+  const childPermissions = child.plugins.allowedPermissions;
+  const parentPermissions = parent.plugins.allowedPermissions;
+  const permissionsWithin = parentPermissions === undefined
+    ? true
+    : childPermissions !== undefined && (parentPermissions.includes("*") || childPermissions.every((permission) => parentPermissions.includes(permission)));
   return child.memory.allowedScopes.every((scope) => parent.memory.allowedScopes.includes(scope))
     && projectWithin
     && listWithin(child.qq.readConversations, parent.qq.readConversations)
     && listWithin(child.qq.sendConversations, parent.qq.sendConversations)
     && listWithin(child.plugins.allowedActions, parent.plugins.allowedActions)
+    && permissionsWithin
     && listWithin(child.artifacts.readableArtifactAuthorities, parent.artifacts.readableArtifactAuthorities)
     && listWithin(child.artifacts.allowedDestinations, parent.artifacts.allowedDestinations)
     && listWithin(child.artifacts.publishTaskIds, parent.artifacts.publishTaskIds, parent.tasks.canCreate)
@@ -155,6 +171,12 @@ export function attenuateTask(parent: CapabilitySet, requested: Partial<Capabili
   const allowedActions = pluginRequest?.allowedActions === undefined
     ? []
     : requestedSubset(requestStrings(pluginRequest.allowedActions, operation, "plugins.allowedActions"), checkedParent.plugins.allowedActions, operation, "plugins.allowedActions");
+  const requestedPermissions = pluginRequest?.allowedPermissions;
+  const allowedPermissions = requestedPermissions === undefined
+    ? checkedParent.plugins.allowedPermissions
+    : checkedParent.plugins.allowedPermissions === undefined
+      ? requestStrings(requestedPermissions, operation, "plugins.allowedPermissions")
+      : requestedSubset(requestStrings(requestedPermissions, operation, "plugins.allowedPermissions"), checkedParent.plugins.allowedPermissions, operation, "plugins.allowedPermissions");
   const artifactRequest = requestObject(input.artifacts, operation, "artifacts");
   const readableArtifactAuthorities = artifactRequest?.readableArtifactAuthorities === undefined
     ? checkedParent.artifacts.readableArtifactAuthorities
@@ -185,7 +207,7 @@ export function attenuateTask(parent: CapabilitySet, requested: Partial<Capabili
   if (canFollowUp && !checkedParent.tasks.canFollowUp) denyCapabilityRequest(operation, "tasks.canFollowUp");
   return {
     memory: { allowedScopes: memory }, projects, qq: { readConversations, sendConversations },
-    plugins: { allowedActions },
+    plugins: { allowedActions, ...(allowedPermissions !== undefined ? { allowedPermissions } : {}) },
     artifacts: { readableArtifactAuthorities, publishTaskIds, allowedDestinations },
     tasks: { canCreate: false, visibleTaskIds, canCancel, canFollowUp },
   };
@@ -213,6 +235,12 @@ export function attenuateWorker(task: CapabilitySet, requested: Partial<Capabili
   const allowedActions = pluginRequest?.allowedActions === undefined
     ? []
     : requestedSubset(requestStrings(pluginRequest.allowedActions, operation, "plugins.allowedActions"), checkedTask.plugins.allowedActions, operation, "plugins.allowedActions");
+  const requestedPermissions = pluginRequest?.allowedPermissions;
+  const allowedPermissions = requestedPermissions === undefined
+    ? checkedTask.plugins.allowedPermissions
+    : checkedTask.plugins.allowedPermissions === undefined
+      ? requestStrings(requestedPermissions, operation, "plugins.allowedPermissions")
+      : requestedSubset(requestStrings(requestedPermissions, operation, "plugins.allowedPermissions"), checkedTask.plugins.allowedPermissions, operation, "plugins.allowedPermissions");
   const artifactRequest = requestObject(input.artifacts, operation, "artifacts");
   const readableArtifactAuthorities = artifactRequest?.readableArtifactAuthorities === undefined
     ? []
@@ -243,7 +271,7 @@ export function attenuateWorker(task: CapabilitySet, requested: Partial<Capabili
       readConversations,
       sendConversations,
     },
-    plugins: { allowedActions },
+    plugins: { allowedActions, ...(allowedPermissions !== undefined ? { allowedPermissions } : {}) },
     artifacts: {
       readableArtifactAuthorities,
       publishTaskIds,

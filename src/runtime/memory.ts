@@ -12,6 +12,13 @@ export interface MemoryAccessContext {
   conversationId?: string;
 }
 
+export interface MemoryRetentionPolicy {
+  rawEpisodeDays: number | null;
+  keepExplicitForever: boolean;
+  keepProvenanceForActiveFacts: boolean;
+  maxPromptBytes: number;
+}
+
 export interface MemoryEpisode {
   id: string;
   scope: MemoryScope;
@@ -68,12 +75,50 @@ const RETRY_DELAYS_MS = [1_000, 5_000, 30_000, 300_000, 900_000];
 export class MemoryService {
   private readonly db: SqliteStore;
   private readonly owner?: { platform: string; accountId: string; userId: string };
-  constructor(db: SqliteStore, owner?: { platform: string; accountId: string; userId: string }) { this.db = db; this.owner = owner; }
+  private readonly retention: MemoryRetentionPolicy;
+  constructor(db: SqliteStore, owner?: { platform: string; accountId: string; userId: string }, retention?: Partial<MemoryRetentionPolicy>) {
+    this.db = db;
+    this.owner = owner;
+    this.retention = { rawEpisodeDays: 30, keepExplicitForever: true, keepProvenanceForActiveFacts: true, maxPromptBytes: 24 * 1024, ...retention };
+  }
 
   recover(): void {
     const timestamp = nowIso();
     this.db.run("UPDATE memory_inbox SET status='pending',next_attempt_at=NULL,updated_at=? WHERE status='processing'", timestamp);
     this.db.run("UPDATE memory_index_queue SET status='pending',next_attempt_at=NULL,updated_at=? WHERE status='processing'", timestamp);
+  }
+
+  cleanupRetention(reference = new Date()): number {
+    if (this.retention.rawEpisodeDays === null) return 0;
+    const cutoff = new Date(reference.getTime() - this.retention.rawEpisodeDays * 24 * 60 * 60 * 1000).toISOString();
+    const protectedEpisodes = new Set<string>();
+    if (this.retention.keepProvenanceForActiveFacts) {
+      const rows = this.db.all<{ provenance_json: string }>("SELECT provenance_json FROM memory_facts WHERE status IN ('active','disputed')");
+      for (const row of rows) {
+        try { for (const id of JSON.parse(row.provenance_json) as unknown[]) if (typeof id === "string") protectedEpisodes.add(id); } catch { /* Ignore malformed legacy provenance during retention. */ }
+      }
+    }
+    let removed = 0;
+    this.db.transaction(() => {
+      const episodes = this.db.all<{ id: string }>("SELECT id FROM memory_episodes WHERE occurred_at<? AND id NOT IN (SELECT episode_id FROM memory_inbox WHERE status IN ('pending','processing'))", cutoff);
+      for (const episode of episodes) {
+        if (protectedEpisodes.has(episode.id)) continue;
+        this.db.run("DELETE FROM memory_fts WHERE record_id=?", episode.id);
+        this.db.run("DELETE FROM memory_index_queue WHERE record_id=?", episode.id);
+        this.db.run("DELETE FROM memory_inbox WHERE episode_id=?", episode.id);
+        this.db.run("DELETE FROM memory_episodes WHERE id=?", episode.id);
+        removed += 1;
+      }
+      if (!this.retention.keepExplicitForever) {
+        const explicit = this.db.all<{ id: string }>("SELECT id FROM memory_explicit WHERE created_at<?", cutoff);
+        for (const record of explicit) {
+          this.db.run("DELETE FROM memory_fts WHERE record_id=?", record.id);
+          this.db.run("DELETE FROM memory_explicit WHERE id=?", record.id);
+          removed += 1;
+        }
+      }
+    });
+    return removed;
   }
 
   ingestEpisode(input: { access: MemoryAccessContext; episode: Omit<MemoryEpisode, "id" | "ingestedAt"> }): MemoryEpisode {
@@ -187,6 +232,33 @@ export class MemoryService {
     if (!scopes.length) return [];
     const placeholders = scopes.map(() => "?").join(",");
     return this.db.all<{ content: string }>(`SELECT content FROM memory_profiles WHERE scope IN (${placeholders}) ORDER BY version DESC,generated_at DESC LIMIT ?`, ...scopes, maxItems).map((row) => row.content);
+  }
+
+  promptContext(input: { core: string[]; items: MemoryRecord[] }, maxBytes = this.retention.maxPromptBytes): { core: string[]; items: MemoryRecord[] } {
+    const budget = Math.max(1, maxBytes);
+    let used = 0;
+    const append = (value: string): string | undefined => {
+      const remaining = budget - used;
+      if (remaining <= 0) return undefined;
+      const text = truncateUtf8(value, remaining);
+      if (!text) return undefined;
+      used += Buffer.byteLength(text, "utf8");
+      return text;
+    };
+    const core: string[] = [];
+    for (const value of input.core) {
+      const bounded = append(value);
+      if (bounded) core.push(bounded);
+      if (used >= budget) return { core, items: [] };
+    }
+    const items: MemoryRecord[] = [];
+    for (const item of input.items) {
+      const content = append(item.content);
+      if (!content) break;
+      items.push({ ...item, content });
+      if (used >= budget) break;
+    }
+    return { core, items };
   }
 
   getMemory(id: string, access: MemoryAccessContext): MemoryRecord | null {
@@ -535,6 +607,21 @@ function sourceProvenance(sourceJson: string): string[] {
   } catch {
     return [];
   }
+}
+
+function truncateUtf8(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+  const suffix = maxBytes >= 3 ? "..." : "";
+  const limit = Math.max(0, maxBytes - Buffer.byteLength(suffix, "utf8"));
+  const characters = [...value];
+  let low = 0;
+  let high = characters.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (Buffer.byteLength(characters.slice(0, middle).join(""), "utf8") <= limit) low = middle;
+    else high = middle - 1;
+  }
+  return `${characters.slice(0, low).join("")}${suffix}`;
 }
 
 function retryAt(retries: number): string {

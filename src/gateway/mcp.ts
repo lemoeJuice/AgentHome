@@ -39,10 +39,11 @@ export class GatewayMcpServer {
   private readonly workerBindingsPath: string | undefined;
   private readonly controlToken: string | undefined;
   private readonly allowedPermissions: Set<string>;
+  private readonly mainPermissionsConfigured: boolean;
   private readonly actionTimeoutMs: number;
   private readonly audit: ((event: { operation: string; decision: "ALLOW" | "DENY"; reason?: string; resource: string; requesterId?: string; taskId?: string }) => void) | undefined;
   constructor(actions: AgentActionRegistry, port: number, logger: Logger, options: { host?: string; token?: string; controlToken?: string; workerBindings?: Record<string, WorkerBinding>; workerBindingsPath?: string; workerCapabilityResolver?: WorkerCapabilityResolver; allowedActions?: string[]; allowedPermissions?: string[]; actionTimeoutMs?: number; audit?: (event: { operation: string; decision: "ALLOW" | "DENY"; reason?: string; resource: string; requesterId?: string; taskId?: string }) => void } = {}) {
-    this.actions = actions; this.port = port; this.logger = logger; this.host = options.host ?? "0.0.0.0"; this.token = options.token; this.controlToken = options.controlToken; this.workerBindings = new Map(Object.entries(options.workerBindings ?? {}).map(([token, binding]) => [token, validateWorkerBinding(binding)])); this.workerBindingsPath = options.workerBindingsPath; this.workerCapabilityResolver = options.workerCapabilityResolver; this.allowedActions = new Set(options.allowedActions ?? []); this.allowedPermissions = new Set(options.allowedPermissions ?? []); this.actionTimeoutMs = Number.isSafeInteger(options.actionTimeoutMs) && (options.actionTimeoutMs as number) > 0 ? options.actionTimeoutMs as number : 30_000; this.audit = options.audit;
+    this.actions = actions; this.port = port; this.logger = logger; this.host = options.host ?? "0.0.0.0"; this.token = options.token; this.controlToken = options.controlToken; this.workerBindings = new Map(Object.entries(options.workerBindings ?? {}).map(([token, binding]) => [token, validateWorkerBinding(binding)])); this.workerBindingsPath = options.workerBindingsPath; this.workerCapabilityResolver = options.workerCapabilityResolver; this.allowedActions = new Set(options.allowedActions ?? []); this.allowedPermissions = new Set(options.allowedPermissions ?? []); this.mainPermissionsConfigured = options.allowedPermissions !== undefined; this.actionTimeoutMs = Number.isSafeInteger(options.actionTimeoutMs) && (options.actionTimeoutMs as number) > 0 ? options.actionTimeoutMs as number : 30_000; this.audit = options.audit;
   }
 
   async start(): Promise<void> {
@@ -100,7 +101,7 @@ export class GatewayMcpServer {
     }
     if (method === "register_worker_binding") {
       if (caller.caller !== "CONTROL") throw new Error("MCP_CONTROL_REQUIRED");
-      const binding = validateWorkerBinding({ taskId: params.taskId, workerId: params.workerId, allowedActions: params.allowedActions });
+      const binding = validateWorkerBinding({ taskId: params.taskId, workerId: params.workerId, allowedActions: params.allowedActions, ...(params.allowedPermissions !== undefined ? { allowedPermissions: params.allowedPermissions } : {}) });
       const token = typeof params.token === "string" && params.token ? params.token : "";
       if (!token || token === this.token || token === this.controlToken) throw new Error("MCP_WORKER_BINDING_INVALID");
       await this.saveWorkerBinding(token, binding);
@@ -114,9 +115,11 @@ export class GatewayMcpServer {
     }
     if (caller.caller === "CONTROL") throw new Error("MCP_CONTROL_METHOD_NOT_ALLOWED");
     const exposed = caller.caller === "WORKER" ? caller.allowedActions ?? new Set<string>() : this.allowedActions;
-    const permissions = caller.caller === "WORKER" ? caller.allowedPermissions ?? new Set<string>() : this.allowedPermissions;
+    const permissions = caller.caller === "WORKER" ? caller.allowedPermissions : this.allowedPermissions;
     const isExposed = async (name: string, permission: string) => {
-      if (!exposed.has(name) || (permissions.size !== 0 && !permissions.has(permission))) return false;
+      if (!(exposed.has(name) || exposed.has("*"))) return false;
+      if (caller.caller === "WORKER" && permissions !== undefined && !(permissions.has(permission) || permissions.has("*"))) return false;
+      if (caller.caller !== "WORKER" && this.mainPermissionsConfigured && !(this.allowedPermissions.has(permission) || this.allowedPermissions.has("*"))) return false;
       return true;
     };
     if (method === "list_actions") return (await this.filterActions(this.actions.list(), isExposed)) as never;
