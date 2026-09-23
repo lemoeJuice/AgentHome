@@ -6,19 +6,27 @@ import { runtimeMigrations } from "../schema.js";
 export async function bootstrapFromStdin(stateRoot: string): Promise<void> {
   let input = "";
   for await (const chunk of process.stdin) input += String(chunk);
-  const value = JSON.parse(input) as { format?: string; version?: number; instanceId?: string; owner?: { platform?: string; accountId?: string; userId?: string }; snowluma?: { endpoint?: string; apiEndpoint?: string; credential?: string } };
-  if (value.format !== "agent-home-bootstrap" || value.version !== 1 || !value.instanceId || !value.owner?.platform || !value.owner.userId || !value.snowluma?.endpoint) throw new Error("BOOTSTRAP_INVALID");
+  const value = JSON.parse(input) as { format?: string; version?: number; instanceId?: string; owner?: { platform?: string; accountId?: string; userId?: string }; snowluma?: { endpoint?: string; apiEndpoint?: string; reverseWebSocketPath?: string; credential?: unknown; websocketCredential?: unknown }; internal?: { controlToken?: unknown; mcpToken?: unknown; mcpControlToken?: unknown; artifactTransferSecret?: unknown }; plugins?: { allowedActions?: string[] } };
+  if (value.format !== "agent-home-bootstrap" || value.version !== 1 || !value.instanceId || !value.snowluma?.endpoint) throw new Error("BOOTSTRAP_INVALID");
+  const credential = value.snowluma.credential;
+  const websocketCredential = value.snowluma.websocketCredential;
+  if ((credential !== undefined && (typeof credential !== "string" || !credential)) || (websocketCredential !== undefined && (typeof websocketCredential !== "string" || !websocketCredential))) throw new Error("BOOTSTRAP_INVALID_CREDENTIAL");
+  const internalSecrets: Array<[string, unknown]> = [["control-token", value.internal?.controlToken], ["mcp-main-token", value.internal?.mcpToken], ["mcp-control-token", value.internal?.mcpControlToken], ["artifact-transfer-secret", value.internal?.artifactTransferSecret]];
+  if (internalSecrets.some(([, secret]) => secret !== undefined && (typeof secret !== "string" || !secret))) throw new Error("BOOTSTRAP_INVALID_INTERNAL_SECRET");
   const directories = ["config", "secrets", "data", "projects", "artifacts", "inbox"].map((name) => join(stateRoot, name));
   await Promise.all(directories.map((directory) => mkdir(directory, { recursive: true, mode: 0o700 })));
   await Promise.all(directories.map((directory) => chmod(directory, 0o700)));
-  const config = { instanceId: value.instanceId, owner: { platform: value.owner.platform, accountId: value.owner.accountId ?? "default", userId: value.owner.userId }, snowluma: { endpoint: value.snowluma.endpoint, apiEndpoint: value.snowluma.apiEndpoint ?? "http://127.0.0.1:3000" } };
+  const secrets: Array<[string, string | undefined]> = [["snowluma-access-token", typeof credential === "string" ? credential : undefined], ["snowluma-websocket-access-token", typeof websocketCredential === "string" ? websocketCredential : typeof credential === "string" ? credential : undefined], ...internalSecrets.map(([name, secret]) => [name, typeof secret === "string" ? secret : undefined] as [string, string | undefined])];
+  await Promise.all(secrets.filter(([, secret]) => secret !== undefined).map(async ([name, secret]) => {
+    const path = join(stateRoot, "secrets", name);
+    await writeFile(path, `${secret}\n`, { mode: 0o600 });
+    await chmod(path, 0o600);
+  }));
+  const owner = value.owner?.platform && value.owner.userId ? { platform: value.owner.platform, accountId: value.owner.accountId ?? "default", userId: value.owner.userId } : undefined;
+  const allowedActions = value.plugins?.allowedActions?.filter((action): action is string => typeof action === "string" && Boolean(action)) ?? [];
+  const config = { instanceId: value.instanceId, ...(owner ? { owner } : {}), snowluma: { endpoint: value.snowluma.endpoint, apiEndpoint: value.snowluma.apiEndpoint ?? "http://127.0.0.1:3000", reverseWebSocketPath: value.snowluma.reverseWebSocketPath ?? "/onebot/v11/ws" }, plugins: { allowedActions: [...new Set(allowedActions)] } };
   await writeFile(join(stateRoot, "config", "bootstrap.json"), `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
   await chmod(join(stateRoot, "config", "bootstrap.json"), 0o600);
-  if (value.snowluma.credential) {
-    const secretPath = join(stateRoot, "secrets", "snowluma-access-token");
-    await writeFile(secretPath, `${value.snowluma.credential}\n`, { mode: 0o600 });
-    await chmod(secretPath, 0o600);
-  }
   const database = new SqliteStore(join(stateRoot, "data", "agent.db"));
   try { migrate(database, runtimeMigrations); } finally { database.close(); }
   process.stdout.write(JSON.stringify({ status: "initialized", stateRoot, instanceId: value.instanceId }) + "\n");

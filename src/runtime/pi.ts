@@ -1,6 +1,7 @@
-import { spawn, type ChildProcess } from "node:child_process";
-import { mkdir } from "node:fs/promises";
-import { dirname } from "node:path";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { existsSync } from "node:fs";
+import { mkdir, readFile, stat } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Logger } from "../shared/logger.js";
 import { newId } from "../shared/ids.js";
@@ -10,84 +11,424 @@ export interface PiSession {
   sessionPath: string;
 }
 
+export interface PiProcessIdentity {
+  pid: number;
+  processGroupId: number;
+  startTime: string;
+}
+
+export type PiProcessInspection = "OWNED" | "NOT_FOUND" | "FOREIGN" | "UNKNOWN";
+
+export interface PiSandbox {
+  workspaceRoot: string;
+  sessionRoot: string;
+  writeAccess: boolean;
+  toolSocket?: string;
+  toolToken?: string;
+  mcpEndpoint?: string;
+  mcpToken?: string;
+}
+
+type PiLaunchOptions = { cwd?: string; sandbox?: PiSandbox; mainTools?: boolean; extensionPath?: string };
+type PiDefaults = { provider?: string; model?: string; agentDir?: string };
+
 export interface PiHarness {
-  createSession(sessionPath: string): Promise<PiSession>;
-  resumeSession(session: PiSession): Promise<boolean>;
-  send(session: PiSession, prompt: string, options?: { cwd?: string; timeoutMs?: number; taskId?: string; workerId?: string }): Promise<string>;
+  createSession(sessionPath: string, options?: PiLaunchOptions): Promise<PiSession>;
+  resumeSession(session: PiSession, options?: PiLaunchOptions): Promise<boolean>;
+  send(session: PiSession, prompt: string, options?: { cwd?: string; timeoutMs?: number; taskId?: string; workerId?: string; sandbox?: PiSandbox; mainTools?: boolean; extensionPath?: string }): Promise<string>;
   steer(session: PiSession, prompt: string, options?: { cwd?: string; timeoutMs?: number }): Promise<string>;
   abort(session: PiSession): Promise<boolean>;
   inspect(session: PiSession): Promise<"available" | "missing" | "unknown">;
   processId?(session: PiSession): number | undefined;
+  processInfo?(session: PiSession): Promise<PiProcessIdentity | undefined>;
+  inspectProcess?(session: PiSession, expected: PiProcessIdentity): Promise<PiProcessInspection>;
+  terminateProcess?(session: PiSession, expected: PiProcessIdentity): Promise<boolean>;
+  stop?(): Promise<void>;
 }
+
+type RpcValue = Record<string, unknown>;
+type PendingRpc = { resolve: (value: RpcValue) => void; reject: (error: Error) => void };
+type Turn = {
+  accepted: boolean;
+  settled: boolean;
+  completed?: string;
+  waiters: Array<{ resolve: (output: string) => void; reject: (error: Error) => void }>;
+  resolve: (output: string) => void;
+  reject: (error: Error) => void;
+};
+type RpcProcess = {
+  child: ChildProcessWithoutNullStreams;
+  sessionPath: string;
+  pending: Map<string, PendingRpc>;
+  turn?: Turn;
+  buffer: string;
+  sandbox?: PiSandbox;
+  mainTools: boolean;
+  extensionPath?: string;
+};
 
 export class PiCliHarness implements PiHarness {
   private readonly command: string;
-  private readonly active = new Map<string, ChildProcess>();
+  private readonly sandboxCommand: string;
+  private readonly active = new Map<string, RpcProcess>();
   private readonly log: Logger;
+  private readonly settledEvent: string;
+  private readonly provider: string;
+  private readonly model: string;
+  private readonly agentDir: string;
 
-  constructor(command: string, logger: Logger) { this.command = command; this.log = logger.child("pi"); }
+  constructor(command: string, logger: Logger, sandboxCommand = process.env.AGENT_HOME_WORKER_SANDBOX ?? "bwrap", settledEvent = process.env.AGENT_HOME_PI_SETTLED_EVENT ?? "agent_settled", defaults: PiDefaults = {}) { this.command = command; this.sandboxCommand = sandboxCommand; this.settledEvent = settledEvent; this.provider = defaults.provider ?? process.env.PI_PROVIDER ?? "openai-codex"; this.model = defaults.model ?? process.env.PI_MODEL ?? "gpt-5.5"; this.agentDir = defaults.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? join(process.env.AGENT_HOME_STATE ?? "/state", "home/.pi/agent"); this.log = logger.child("pi"); }
 
-  async createSession(sessionPath: string): Promise<PiSession> {
+  async createSession(sessionPath: string, options: PiLaunchOptions = {}): Promise<PiSession> {
     await mkdir(dirname(sessionPath), { recursive: true });
-    return { sessionId: newId("pi"), sessionPath };
+    const local = { sessionId: newId("pi"), sessionPath };
+    const process = await this.ensureProcess(local, options);
+    const state = await this.rpc(process, { type: "get_state" });
+    const realId = this.sessionIdFromState(state) ?? local.sessionId;
+    this.rekey(local.sessionId, realId, process);
+    return { sessionId: realId, sessionPath };
   }
 
-  async resumeSession(session: PiSession): Promise<boolean> {
-    try { await import("node:fs/promises").then((fs) => fs.access(session.sessionPath)); return true; } catch { return false; }
+  async resumeSession(session: PiSession, options: PiLaunchOptions = {}): Promise<boolean> {
+    try {
+      const info = await stat(session.sessionPath);
+      if (!info.isFile() || info.size === 0) return false;
+      const process = await this.ensureProcess(session, options);
+      const state = await this.rpc(process, { type: "get_state" });
+      const realId = this.sessionIdFromState(state);
+      if (realId) this.rekey(session.sessionId, realId, process);
+      return true;
+    } catch { return false; }
   }
 
-  async send(session: PiSession, prompt: string, options: { cwd?: string; timeoutMs?: number; taskId?: string; workerId?: string } = {}): Promise<string> {
-    return this.run(session, prompt, options);
+  async send(session: PiSession, prompt: string, options: { cwd?: string; timeoutMs?: number; taskId?: string; workerId?: string; sandbox?: PiSandbox; mainTools?: boolean; extensionPath?: string } = {}): Promise<string> {
+    return this.turn(session, { type: "prompt", message: prompt }, options);
   }
 
   async steer(session: PiSession, prompt: string, options: { cwd?: string; timeoutMs?: number } = {}): Promise<string> {
-    // Pi's print mode is one turn per process. The durable session file preserves context;
-    // steering is therefore the next real prompt in the same Pi session.
-    return this.run(session, prompt, options);
-  }
-
-  async abort(session: PiSession): Promise<boolean> {
-    const child = this.active.get(session.sessionId);
-    if (!child?.pid) return true;
-    try {
-      process.kill(-child.pid, "SIGTERM");
-      await delay(500);
-      if (this.active.has(session.sessionId)) process.kill(-child.pid, "SIGKILL");
-      return true;
-    } catch (error) {
-      this.log.warn("Pi abort could not confirm process termination", { sessionId: session.sessionId, error: String(error) });
-      return false;
-    }
-  }
-
-  async inspect(session: PiSession): Promise<"available" | "missing" | "unknown"> {
-    return (await this.resumeSession(session)) ? "available" : "missing";
-  }
-
-  processId(session: PiSession): number | undefined { return this.active.get(session.sessionId)?.pid; }
-
-  private async run(session: PiSession, prompt: string, options: { cwd?: string; timeoutMs?: number; taskId?: string; workerId?: string }): Promise<string> {
-    const args = ["--print", "--session", session.sessionPath, prompt];
-    const child = spawn(this.command, args, { cwd: options.cwd, detached: true, stdio: ["ignore", "pipe", "pipe"] });
-    this.active.set(session.sessionId, child);
-    const timeoutMs = options.timeoutMs ?? 60 * 60 * 1000;
+    const process = this.findProcess(session);
+    if (!process?.turn) return this.turn(session, { type: "prompt", message: prompt }, options);
+    const turn = process.turn;
     return await new Promise<string>((resolve, reject) => {
-      const stdout: Buffer[] = [];
-      const stderr: Buffer[] = [];
-      const timer = setTimeout(() => {
-        void this.abort(session);
-        reject(new Error("PI_TIMEOUT"));
-      }, timeoutMs);
-      child.stdout.on("data", (chunk) => stdout.push(Buffer.from(chunk)));
-      child.stderr.on("data", (chunk) => stderr.push(Buffer.from(chunk)));
-      child.on("error", (error) => { clearTimeout(timer); this.active.delete(session.sessionId); reject((error as NodeJS.ErrnoException).code === "ENOENT" ? new Error("PI_UNAVAILABLE") : error); });
-      child.on("close", (code, signal) => {
-        clearTimeout(timer);
-        this.active.delete(session.sessionId);
-        const output = Buffer.concat(stdout).toString("utf8").trim();
-        if (code === 0) resolve(output);
-        else reject(new Error(`PI_EXIT:${code ?? signal ?? "unknown"}:${Buffer.concat(stderr).toString("utf8").slice(-1000)}`));
+      const waiter = { resolve, reject };
+      turn.waiters.push(waiter);
+      void this.rpc(process, { type: "steer", message: prompt }).catch((error) => {
+        const index = turn.waiters.indexOf(waiter);
+        if (index >= 0) turn.waiters.splice(index, 1);
+        reject(error instanceof Error ? error : new Error(String(error)));
       });
     });
   }
+
+  async abort(session: PiSession): Promise<boolean> {
+    const process = this.findProcess(session);
+    if (!process) return true;
+    this.rejectTurn(process, new Error("PI_ABORTED"));
+    try { await this.rpc(process, { type: "abort" }); }
+    catch (error) { this.log.warn("Pi abort RPC was not acknowledged", { sessionId: session.sessionId, error: String(error) }); }
+    const identity = await this.processInfo(session);
+    if (!identity || !this.terminateProcess) return false;
+    const terminated = await this.terminateProcess(session, identity);
+    if (!terminated) this.log.warn("Pi abort could not confirm process-group termination", { sessionId: session.sessionId, pid: identity.pid });
+    return terminated;
+  }
+
+  async inspect(session: PiSession): Promise<"available" | "missing" | "unknown"> {
+    try {
+      const info = await stat(session.sessionPath);
+      if (!info.isFile() || info.size === 0) return "missing";
+    } catch { return "missing"; }
+    try {
+      const process = await this.ensureProcess(session);
+      const state = await this.rpc(process, { type: "get_state" });
+      return this.sessionIdFromState(state) ? "available" : "unknown";
+    } catch { return "unknown"; }
+  }
+
+  processId(session: PiSession): number | undefined { return this.findProcess(session)?.child.pid; }
+
+  async stop(): Promise<void> {
+    const processes = [...new Set(this.active.values())];
+    this.active.clear();
+    const exits: Promise<void>[] = [];
+    for (const process of processes) {
+      this.rejectTurn(process, new Error("PI_HARNESS_STOPPED"));
+      const exited = new Promise<void>((resolve) => process.child.once("exit", () => resolve()));
+      exits.push(Promise.race([exited, delay(1000)]).then(() => {
+        process.child.stdin.destroy();
+        process.child.stdout.destroy();
+        process.child.stderr.destroy();
+        process.child.unref();
+      }));
+      if (process.child.pid) {
+        try { globalThis.process.kill(-process.child.pid, "SIGTERM"); } catch { process.child.kill("SIGTERM"); }
+      }
+    }
+    await Promise.all(exits);
+  }
+
+  async processInfo(session: PiSession): Promise<PiProcessIdentity | undefined> {
+    const pid = this.processId(session);
+    return pid ? this.readProcessIdentity(pid) : undefined;
+  }
+
+  async inspectProcess(session: PiSession, expected: PiProcessIdentity): Promise<PiProcessInspection> {
+    try {
+      const current = await this.readProcessIdentity(expected.pid);
+      if (!current) return "NOT_FOUND";
+      if (current.startTime !== expected.startTime || current.processGroupId !== expected.processGroupId) return "FOREIGN";
+      if (!current.commandLine.includes("--mode rpc") || !current.commandLine.includes(session.sessionPath)) return "FOREIGN";
+      return "OWNED";
+    } catch { return "UNKNOWN"; }
+  }
+
+  async terminateProcess(session: PiSession, expected: PiProcessIdentity): Promise<boolean> {
+    const state = await this.inspectProcess(session, expected);
+    if (state === "NOT_FOUND") return true;
+    if (state !== "OWNED") return false;
+    try { globalThis.process.kill(-expected.processGroupId, "SIGTERM"); } catch { return false; }
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      await delay(100);
+      if ((await this.inspectProcess(session, expected)) === "NOT_FOUND") return true;
+    }
+    try { globalThis.process.kill(-expected.processGroupId, "SIGKILL"); } catch { return false; }
+    await delay(100);
+    return (await this.inspectProcess(session, expected)) === "NOT_FOUND";
+  }
+
+  private async turn(session: PiSession, command: RpcValue, options: { cwd?: string; timeoutMs?: number; sandbox?: PiSandbox; mainTools?: boolean; extensionPath?: string }): Promise<string> {
+    const process = await this.ensureProcess(session, options);
+    if (process.turn) throw new Error("PI_SESSION_BUSY");
+    const timeoutMs = options.timeoutMs ?? 60 * 60 * 1000;
+    return await new Promise<string>((resolve, reject) => {
+      let turn: Turn;
+      const timer = setTimeout(() => {
+        if (process.turn !== turn) return;
+        this.rejectTurn(process, new Error("PI_TIMEOUT"));
+        void this.abort(session);
+      }, timeoutMs);
+      turn = {
+        accepted: false,
+        settled: false,
+        waiters: [],
+        resolve: (output) => { clearTimeout(timer); resolve(output); },
+        reject: (error) => { clearTimeout(timer); reject(error); },
+      };
+      process.turn = turn;
+      void this.rpc(process, command).then(() => {
+        if (!process.turn) return;
+        process.turn.accepted = true;
+        this.completeTurn(process);
+      }).catch((error) => process.turn?.reject(error instanceof Error ? error : new Error(String(error))));
+    });
+  }
+
+  private async ensureProcess(session: PiSession, options: PiLaunchOptions = {}): Promise<RpcProcess> {
+    const existing = this.findProcess(session);
+    if (existing) {
+      if (options.sandbox && (!existing.sandbox || !sameSandbox(existing.sandbox, options.sandbox))) throw new Error("PI_SANDBOX_MISMATCH");
+      if (options.mainTools !== undefined && Boolean(options.mainTools) !== existing.mainTools) throw new Error("PI_TOOL_BOUNDARY_MISMATCH");
+      if (options.extensionPath !== undefined && options.extensionPath !== existing.extensionPath) throw new Error("PI_EXTENSION_BOUNDARY_MISMATCH");
+      return existing;
+    }
+    const invocation = options.sandbox ? this.sandboxInvocation(session, options.sandbox, options) : this.localInvocation(session, options);
+    const child = spawn(invocation.command, invocation.args, { cwd: invocation.cwd, env: invocation.env, detached: true, stdio: ["pipe", "pipe", "pipe"] });
+    const process: RpcProcess = { child, sessionPath: session.sessionPath, pending: new Map(), buffer: "", mainTools: Boolean(options.mainTools), ...(options.extensionPath ? { extensionPath: options.extensionPath } : {}), ...(options.sandbox ? { sandbox: options.sandbox } : {}) };
+    this.active.set(session.sessionId, process);
+    child.stdout.on("data", (chunk) => this.handleOutput(process, String(chunk)));
+    child.stderr.on("data", (chunk) => this.log.debug("Pi RPC stderr", { output: String(chunk).trim(), sessionId: session.sessionId }));
+    child.stdin.on("error", (error) => this.failProcess(process, error instanceof Error ? error : new Error(String(error))));
+    child.on("error", (error) => this.failProcess(process, error instanceof Error ? error : new Error(String(error))));
+    child.on("exit", (code, signal) => this.failProcess(process, new Error(`PI_EXIT:${code ?? signal ?? "unknown"}`)));
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => finish(new Error("PI_RPC_START_TIMEOUT")), 5000);
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        child.removeListener("error", onError);
+        child.removeListener("exit", onExit);
+        child.removeListener("spawn", onSpawn);
+        if (error) reject(error); else resolve();
+      };
+      const onError = (error: Error) => finish(error);
+      const onExit = (code: number | null, signal: NodeJS.Signals | null) => finish(new Error(`PI_EXIT:${code ?? signal ?? "unknown"}`));
+      const onSpawn = () => finish();
+      child.once("error", onError);
+      child.once("exit", onExit);
+      child.once("spawn", onSpawn);
+    });
+    return process;
+  }
+
+  private localInvocation(session: PiSession, options: PiLaunchOptions): { command: string; args: string[]; cwd?: string; env: NodeJS.ProcessEnv } {
+    const args: string[] = [];
+    if (options.mainTools) args.push("--no-builtin-tools", "--no-extensions", "--no-skills", "--no-context-files");
+    if (options.extensionPath) args.push("--extension", options.extensionPath);
+    args.push("--provider", this.provider, "--model", this.model, "--mode", "rpc", "--session", session.sessionPath);
+    const env = options.mainTools
+      ? { PATH: process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", HOME: "/tmp/agent-home-main", XDG_CONFIG_HOME: "/tmp/agent-home-main/.config", XDG_DATA_HOME: "/tmp/agent-home-main/.local/share", XDG_STATE_HOME: "/tmp/agent-home-main/.local/state", TMPDIR: "/tmp", PI_CODING_AGENT_DIR: this.agentDir }
+      : { ...globalThis.process.env, PI_CODING_AGENT_DIR: this.agentDir };
+    return { command: this.command, args, cwd: options.cwd, env };
+  }
+
+  private sandboxInvocation(session: PiSession, sandbox: PiSandbox, options: PiLaunchOptions): { command: string; args: string[]; cwd?: string; env: NodeJS.ProcessEnv } {
+    const args = [
+      // Pi's provider client must reach the container network. Container-level
+      // networking remains isolated from the host by Podman.
+      "--die-with-parent", "--new-session", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
+      "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+    ];
+    for (const path of ["/usr", "/bin", "/lib", "/lib64", "/etc"]) {
+      if (existsSync(path)) args.push("--ro-bind", path, path);
+    }
+    const authDirectory = existsSync(this.agentDir) ? [this.agentDir] : [];
+    for (const path of this.sandboxDirectories([sandbox.workspaceRoot, sandbox.sessionRoot, ...authDirectory, ...(sandbox.toolSocket ? [sandbox.toolSocket] : []), ...(options.extensionPath ? [options.extensionPath] : [])])) args.push("--dir", path);
+    args.push("--bind", sandbox.sessionRoot, sandbox.sessionRoot);
+    args.push(sandbox.writeAccess ? "--bind" : "--ro-bind", sandbox.workspaceRoot, sandbox.workspaceRoot);
+    if (sandbox.toolSocket) args.push("--ro-bind", sandbox.toolSocket, sandbox.toolSocket);
+    // Pi refreshes native OAuth credentials in place, so this directory must
+    // remain writable inside the sandbox. The container volume is still the
+    // only backing store; no Host path is mounted.
+    if (authDirectory.length) args.push("--bind", this.agentDir, this.agentDir);
+    if (options.extensionPath) args.push("--ro-bind", options.extensionPath, options.extensionPath);
+    args.push("--chdir", sandbox.workspaceRoot, "--clearenv", "--setenv", "HOME", "/tmp/agent-home-worker", "--setenv", "XDG_CONFIG_HOME", "/tmp/agent-home-worker/.config", "--setenv", "XDG_DATA_HOME", "/tmp/agent-home-worker/.local/share", "--setenv", "XDG_STATE_HOME", "/tmp/agent-home-worker/.local/state", "--setenv", "TMPDIR", "/tmp", "--setenv", "PI_CODING_AGENT_DIR", this.agentDir, "--setenv", "PATH", process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+    if (sandbox.toolSocket && sandbox.toolToken) args.push("--setenv", "AGENT_HOME_RUNTIME_TOOL_SOCKET", sandbox.toolSocket, "--setenv", "AGENT_HOME_RUNTIME_TOOL_TOKEN", sandbox.toolToken);
+    if (options.mainTools) args.push("--", this.command, "--no-builtin-tools", "--no-extensions", "--no-skills", "--no-context-files", ...(options.extensionPath ? ["--extension", options.extensionPath] : []), "--provider", this.provider, "--model", this.model, "--mode", "rpc", "--session", session.sessionPath);
+    else args.push("--", this.command, ...(options.extensionPath ? ["--extension", options.extensionPath] : []), "--provider", this.provider, "--model", this.model, "--mode", "rpc", "--session", session.sessionPath);
+    if (sandbox.mcpEndpoint && sandbox.mcpToken) args.splice(args.indexOf("--"), 0, "--setenv", "AGENT_HOME_MCP_URL", sandbox.mcpEndpoint, "--setenv", "AGENT_HOME_MCP_TOKEN", sandbox.mcpToken);
+    return { command: this.sandboxCommand, args, env: {} };
+  }
+
+  private sandboxDirectories(targets: string[]): string[] {
+    const directories = new Set<string>();
+    for (const target of targets) {
+      let current = dirname(target);
+      while (current !== "/" && current !== "/tmp") { directories.add(current); current = dirname(current); }
+    }
+    return [...directories].sort((a, b) => a.length - b.length);
+  }
+
+  private rpc(process: RpcProcess, command: RpcValue): Promise<RpcValue> {
+    const id = newId("pi-rpc");
+    return new Promise<RpcValue>((resolve, reject) => {
+      process.pending.set(id, { resolve, reject });
+      if (process.child.stdin.destroyed || process.child.stdin.writableEnded) {
+        process.pending.delete(id);
+        reject(new Error("PI_STDIN_UNAVAILABLE"));
+        return;
+      }
+      try {
+        process.child.stdin.write(`${JSON.stringify({ ...command, id })}\n`, (error) => {
+          if (!error) return;
+          process.pending.delete(id);
+          reject(error);
+        });
+      } catch (error) { process.pending.delete(id); reject(error instanceof Error ? error : new Error(String(error))); }
+    });
+  }
+
+  private handleOutput(process: RpcProcess, chunk: string): void {
+    process.buffer += chunk;
+    let index = process.buffer.indexOf("\n");
+    while (index >= 0) {
+      const line = process.buffer.slice(0, index).replace(/\r$/, "");
+      process.buffer = process.buffer.slice(index + 1);
+      index = process.buffer.indexOf("\n");
+      if (!line) continue;
+      let value: RpcValue;
+      try { value = JSON.parse(line) as RpcValue; } catch { this.log.warn("Ignoring invalid Pi RPC frame", { line: line.slice(0, 200) }); continue; }
+      if (value.type === "response" && typeof value.id === "string") {
+        const pending = process.pending.get(value.id);
+        if (!pending) continue;
+        process.pending.delete(value.id);
+        if (value.success === false) pending.reject(new Error(`PI_RPC_${String(value.error ?? "FAILED")}`));
+        else pending.resolve(value);
+        continue;
+      }
+      this.captureAssistantText(process, value);
+      if (value.type === this.settledEvent && process.turn) {
+        process.turn.settled = true;
+        this.completeTurn(process);
+      }
+    }
+  }
+
+  private completeTurn(process: RpcProcess): void {
+    if (!process.turn || !process.turn.accepted || !process.turn.settled || process.turn.completed === undefined) return;
+    const turn = process.turn;
+    const output = turn.completed ?? "";
+    process.turn = undefined;
+    turn.resolve(output);
+    for (const waiter of turn.waiters.splice(0)) waiter.resolve(output);
+  }
+
+  private captureAssistantText(process: RpcProcess, value: RpcValue): void {
+    if (!process.turn) return;
+    const text = this.extractAssistantText(value.message ?? value.messages);
+    if (text) process.turn.completed = text;
+    if (value.type === this.settledEvent && process.turn.completed === undefined) process.turn.completed = "";
+  }
+
+  private rejectTurn(process: RpcProcess, error: Error): void {
+    const turn = process.turn;
+    if (!turn) return;
+    process.turn = undefined;
+    turn.reject(error);
+    for (const waiter of turn.waiters.splice(0)) waiter.reject(error);
+  }
+
+  private failProcess(process: RpcProcess, error: Error): void {
+    for (const pending of process.pending.values()) pending.reject(error);
+    process.pending.clear();
+    this.rejectTurn(process, error);
+    for (const [id, value] of this.active) if (value === process) this.active.delete(id);
+  }
+
+  private findProcess(session: PiSession): RpcProcess | undefined {
+    const direct = this.active.get(session.sessionId);
+    if (direct) return direct;
+    return [...this.active.values()].find((process) => process.sessionPath === session.sessionPath);
+  }
+
+  private rekey(oldId: string, newId: string, process: RpcProcess): void {
+    if (oldId !== newId && this.active.get(oldId) === process) this.active.delete(oldId);
+    this.active.set(newId, process);
+  }
+
+  private sessionIdFromState(value: RpcValue): string | undefined {
+    const data = value.data;
+    if (!data || typeof data !== "object") return undefined;
+    const sessionId = (data as RpcValue).sessionId;
+    return typeof sessionId === "string" && sessionId ? sessionId : undefined;
+  }
+
+  private extractAssistantText(messages: unknown): string {
+    const values = Array.isArray(messages) ? messages : messages && typeof messages === "object" ? [messages] : [];
+    for (const message of [...values].reverse()) {
+      if (!message || typeof message !== "object" || (message as RpcValue).role !== "assistant") continue;
+      const content = (message as RpcValue).content;
+      if (typeof content === "string") return content;
+      if (Array.isArray(content)) return content.filter((item) => item && typeof item === "object" && (item as RpcValue).type === "text").map((item) => String((item as RpcValue).text ?? "")).join("");
+    }
+    return "";
+  }
+
+  private async readProcessIdentity(pid: number): Promise<(PiProcessIdentity & { commandLine: string }) | undefined> {
+    try {
+      const statLine = await readFile(`/proc/${pid}/stat`, "utf8");
+      const commandLine = (await readFile(`/proc/${pid}/cmdline`, "utf8")).replaceAll("\u0000", " ").trim();
+      const close = statLine.lastIndexOf(")");
+      const fields = statLine.slice(close + 2).trim().split(/\s+/);
+      const processGroupId = Number(fields[2]);
+      const startTime = fields[19];
+      if (!Number.isInteger(processGroupId) || !startTime) return undefined;
+      return { pid, processGroupId, startTime, commandLine };
+    } catch { return undefined; }
+  }
+}
+
+function sameSandbox(left: PiSandbox, right: PiSandbox): boolean {
+  return left.workspaceRoot === right.workspaceRoot && left.sessionRoot === right.sessionRoot && left.writeAccess === right.writeAccess && left.toolSocket === right.toolSocket && left.toolToken === right.toolToken && left.mcpEndpoint === right.mcpEndpoint && left.mcpToken === right.mcpToken;
 }
