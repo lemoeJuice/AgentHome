@@ -13,13 +13,17 @@
     "gateway": "node dist/cli.js gateway",
     "runtime": "node dist/cli.js runtime",
     "doctor": "node dist/cli.js doctor",
+    "pi:login": "bash scripts/pi-login.sh",
     "status": "node dist/cli.js status",
     "dev": "node --experimental-strip-types --experimental-loader ./scripts/ts-loader.mjs src/cli.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --test --experimental-strip-types --experimental-loader ./scripts/ts-loader.mjs test/**/*.test.ts",
+    "integration:e2e": "AGENT_HOME_RUN_INTEGRATION=1 bash scripts/integration-e2e.sh",
     "lint": "tsc -p tsconfig.json --noEmit"
   },
-  "dependencies": {},
+  "dependencies": {
+    "@snowluma/mcp": "1.14.15"
+  },
   "devDependencies": {
     "@types/node": "^24.0.0",
     "typescript": "^5.9.0"
