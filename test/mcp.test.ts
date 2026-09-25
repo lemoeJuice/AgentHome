@@ -64,7 +64,7 @@ test("SnowLuma MCP client speaks stdio JSON-RPC and unwraps OneBot envelopes", a
     paths: { gatewayState: root, pluginData: root, backupDir: root, stateRoot: root, runtimeSocket: join(root, "runtime.sock") },
     snowluma: { accountId: "default", endpoint: "ws://127.0.0.1:1", apiEndpoint: "http://snowluma:3000", reverseWebSocketPath: "/onebot/v11/ws", reconnectMs: 10, requestTimeoutMs: 1000 },
     chat: { global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" as const }, qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" as const }, conversationOverrides: {} },
-    runtime: { maxInFlight: 1, maxWorkers: 1, maxArtifactBytes: 1000, piCommand: "pi", piTimeoutMs: 1000, workerSandboxCommand: "bwrap", piProvider: "test", piModel: "test", piAgentDir: root },
+    runtime: { maxInFlight: 1, maxWorkers: 1, maxArtifactBytes: 1000, piCommand: "pi", piTimeoutMs: 1000, workerSandboxCommand: "bwrap", piAgentDir: root },
     plugins: { enabled: [], allowedActions: [] },
     logging: { level: "error" as const },
   } as import("../src/config.ts").AppConfig;

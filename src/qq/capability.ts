@@ -16,6 +16,12 @@ function integerValue(value: string, field: string): number {
   return numeric;
 }
 
+function messageIdValue(value: string, field: string): number {
+  const numeric = Number(value);
+  if (!Number.isSafeInteger(numeric)) throw new Error(`ONEBOT_INTEGER_REQUIRED:${field}`);
+  return numeric;
+}
+
 export class SnowLumaQQCapability {
   private readonly config: AppConfig;
   private readonly artifacts: ArtifactService;
@@ -54,7 +60,7 @@ export class SnowLumaQQCapability {
   async getMessage(ref: PlatformMessageRef, kind: ConversationAddress["kind"] = "group", authorization?: QQReadAuthorization): Promise<ChatEvent | null> {
     this.assertReadable(authorization);
     this.assertTarget(authorization, { platform: ref.platform, accountId: ref.accountId, kind, platformConversationId: ref.platformConversationId, threadId: ref.threadId });
-    const raw = await this.mcp.queryAction<Record<string, unknown>>("get_msg", { message_id: integerValue(ref.messageId, "message_id") });
+    const raw = await this.mcp.queryAction<Record<string, unknown>>("get_msg", { message_id: messageIdValue(ref.messageId, "message_id") });
     const event = normalizeQQEvent({ ...raw, message_id: ref.messageId }, this.config, undefined, kind);
     if (event && !messageMatchesReference(event, ref, kind)) throw new Error("QQ_MESSAGE_SCOPE_MISMATCH");
     return event;
@@ -65,7 +71,7 @@ export class SnowLumaQQCapability {
     this.assertTarget(authorization, query.conversation);
     if (query.conversation.kind !== "group") return NOT_IMPLEMENTED;
     const params: Record<string, string | number> = { group_id: integerValue(query.conversation.platformConversationId, "group_id"), count: query.limit ?? 20 };
-    if (query.beforeMessageId) params.message_id = integerValue(query.beforeMessageId, "message_id");
+    if (query.beforeMessageId) params.message_id = messageIdValue(query.beforeMessageId, "message_id");
     const raw = await this.mcp.queryAction<{ messages?: unknown[] }>("get_group_msg_history", params);
     return (raw.messages ?? []).map((item) => normalizeQQEvent({ ...(item as Record<string, unknown>), message_type: "group", group_id: query.conversation.platformConversationId }, this.config)).filter((event): event is ChatEvent => event !== null && conversationMatchesAddress(event, query.conversation));
   }

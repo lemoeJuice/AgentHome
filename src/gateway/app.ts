@@ -9,6 +9,7 @@ import { Router } from "./router.js";
 import { PodmanController } from "../controller.js";
 import { GatewayMcpServer, JsonFileMcpWorkerCapabilityResolver, type WorkerBinding } from "./mcp.js";
 import { GatewayArtifactService } from "./artifacts.js";
+import { createPiModelCommand } from "./pi-model-command.js";
 import { newId, nowIso } from "../shared/ids.js";
 
 export class GatewayApp {
@@ -41,6 +42,7 @@ export class GatewayApp {
   }
 
   async start(): Promise<void> {
+    this.commands.register({ name: "model", aliases: ["models"], permission: "admin", pluginId: "core.pi-model", kind: "CORE" }, createPiModelCommand(this.config, this.log));
     await loadPlugins(this.config, this.commands, this.actions, this.log);
     await this.controller.start();
     await this.artifacts.start();

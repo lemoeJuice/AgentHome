@@ -24,10 +24,23 @@ class Adapter implements ChatPlatformAdapter {
   async start(): Promise<void> {}
   async stop(): Promise<void> {}
   async sendMessage(target: ConversationAddress, message: OutgoingMessage): Promise<SendResult> { if (this.fail) throw new Error("OUTBOUND_UNAVAILABLE"); this.sent.push(message); return { message: { platform: "qq", accountId: target.accountId, platformConversationId: target.platformConversationId, threadId: target.threadId, messageId: `out-${this.sent.length}` } }; }
-  async getMessage(): Promise<null> { return null; }
-  async getRecentMessages(): Promise<[]> { return []; }
-  async fetchAttachment(): Promise<never> { throw new Error("not used"); }
 }
+
+test("Controller ingress contains only the summary and trusted message references", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-home-router-summary-"));
+  const state = new GatewayState(join(root, "gateway.sqlite")); const adapter = new Adapter(); let delivered: unknown;
+  const router = new Router(config, adapter, state, new CommandRegistry(), new AgentActionRegistry(), { deliver: async (event) => { delivered = event; } }, logger);
+  const incoming = event("@bot inspect", "group", true);
+  incoming.message.attachments = [{ type: "image", id: "image-id", url: "https://platform.invalid/image" }];
+  await router.handle(incoming);
+  const envelope = delivered as { payload: Record<string, unknown>; message: { ref: unknown; replyTo: unknown } };
+  assert.deepEqual(envelope.payload, { text: "@bot inspect [图片]" });
+  assert.equal(JSON.stringify(envelope).includes("image-id"), false);
+  assert.equal(JSON.stringify(envelope).includes("platform.invalid"), false);
+  assert.deepEqual(envelope.message.ref, incoming.message.ref);
+  assert.equal(envelope.message.replyTo, null);
+  state.close(); await rm(root, { recursive: true, force: true });
+});
 
 function event(text: string, kind: "private" | "group" = "private", mentionsBot: boolean = false, accountId = "a", platformConversationId?: string): ChatEvent {
   const conversation = { platform: "qq", accountId, kind, platformConversationId: platformConversationId ?? (kind === "group" ? "g" : "u"), threadId: null } as const;
@@ -44,6 +57,57 @@ test("direct plugin command bypasses Controller and Main", async () => {
   assert.equal(adapter.sent[0]?.text, "hello"); assert.equal(controllerEvents.length, 0);
   assert.equal(state.store.get<{ status: string }>("SELECT status FROM command_invocations LIMIT 1")?.status, "COMPLETED");
   state.close(); await rm(root, { recursive: true, force: true });
+});
+
+test("admin model commands are restricted to the configured Owner, not to private chat", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-home-router-admin-model-"));
+  const state = new GatewayState(join(root, "gateway.sqlite"));
+  const adapter = new Adapter();
+  let executions = 0;
+  const commands = new CommandRegistry();
+  commands.register({ name: "model", permission: "admin", kind: "CORE" }, async () => { executions++; return { text: "model status" }; });
+  const router = new Router(config, adapter, state, commands, new AgentActionRegistry(), { deliver: async () => {} }, logger);
+  await router.handle(event("/model"));
+  assert.equal(executions, 0);
+  assert.match(adapter.sent[0]?.text ?? "", /没有执行此命令的权限/);
+  const ownerEvent = event("/model");
+  ownerEvent.sender.userId = "owner";
+  await router.handle(ownerEvent);
+  assert.equal(executions, 1);
+  assert.equal(adapter.sent[1]?.text, "model status");
+  const ownerGroupEvent = event("/model", "group", false);
+  ownerGroupEvent.sender.userId = "owner";
+  await router.handle(ownerGroupEvent);
+  assert.equal(executions, 2);
+  assert.equal(adapter.sent[2]?.text, "model status");
+  state.close(); await rm(root, { recursive: true, force: true });
+});
+
+test("help lists runtime and Gateway commands and reports the active @ rule", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-home-router-help-"));
+  const state = new GatewayState(join(root, "gateway.sqlite"));
+  const adapter = new Adapter();
+  const commands = new CommandRegistry();
+  commands.register({ name: "model", aliases: ["models"], permission: "admin", kind: "CORE" }, async () => ({ text: "" }));
+  commands.register({ name: "echo", aliases: ["say"], permission: "command.echo", kind: "PLUGIN" }, async () => ({ text: "" }));
+  const router = new Router(config, adapter, state, commands, new AgentActionRegistry(), { deliver: async () => {} }, logger);
+  await router.handle(event("/help", "group", false));
+  assert.match(adapter.sent[0]?.text ?? "", /\/status/);
+  assert.match(adapter.sent[0]?.text ?? "", /\/model set <provider> <model>/);
+  assert.match(adapter.sent[0]?.text ?? "", /\/echo.*\/say/);
+  assert.match(adapter.sent[0]?.text ?? "", /群聊命令不需要 @机器人/);
+  state.close();
+
+  const mentionState = new GatewayState(join(root, "mention-gateway.sqlite"));
+  const mentionAdapter = new Adapter();
+  const mentionConfig = { ...config, chat: { ...config.chat, qq: { ...config.chat.qq, commandRequireMention: true } } } as AppConfig;
+  const mentionRouter = new Router(mentionConfig, mentionAdapter, mentionState, new CommandRegistry(), new AgentActionRegistry(), { deliver: async () => {} }, logger);
+  await mentionRouter.handle(event("/help", "group", false));
+  assert.equal(mentionAdapter.sent.length, 0);
+  await mentionRouter.handle(event("@bot /help", "group", true));
+  assert.match(mentionAdapter.sent[0]?.text ?? "", /群聊命令需要 @机器人/);
+  mentionState.close();
+  await rm(root, { recursive: true, force: true });
 });
 
 test("group explicit wake policy does not forward unmentioned messages", async () => {

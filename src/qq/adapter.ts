@@ -1,6 +1,6 @@
 import type { AppConfig } from "../config.js";
 import { Logger } from "../shared/logger.js";
-import { NOT_IMPLEMENTED, type ChatAttachmentRef, type ChatEvent, type ChatPlatformAdapter, type ConversationAddress, type HistoryQuery, type OutgoingMessage, type PlatformMessageRef, type SendResult, type ArtifactTransfer } from "../shared/types.js";
+import { NOT_IMPLEMENTED, type ChatAttachmentRef, type ChatEvent, type ChatPlatformAdapter, type ConversationAddress, type OutgoingMessage, type PlatformMessageRef, type SendResult } from "../shared/types.js";
 import { OneBotClient, resolveWebSocketEndpoint } from "./onebot.js";
 import { snowlumaAccessToken, snowlumaWebSocketAccessToken } from "../config.js";
 
@@ -86,44 +86,6 @@ export class QQChatPlatformAdapter implements ChatPlatformAdapter {
     return { message: { platform: "qq", accountId: target.accountId, platformConversationId: target.platformConversationId, threadId: target.threadId, messageId }, raw: result as never };
   }
 
-  async getMessage(ref: PlatformMessageRef, kind?: ConversationAddress["kind"]): Promise<ChatEvent | null> {
-    const raw = await this.client.action<Record<string, unknown>>("get_msg", { message_id: integerValue(ref.messageId, "message_id") });
-    const event = this.normalize({ ...raw, post_type: "message", message_type: raw.message_type ?? kind ?? (ref.platformConversationId ? "group" : "private"), user_id: raw.user_id ?? "unknown", message_id: ref.messageId, group_id: raw.group_id ?? (ref.platformConversationId || undefined) });
-    if (event && !messageMatchesReference(event, ref)) throw new Error("QQ_MESSAGE_SCOPE_MISMATCH");
-    return event;
-  }
-
-  async getRecentMessages(query: HistoryQuery): Promise<ChatEvent[] | import("../shared/types.js").NotImplemented> {
-    if (query.conversation.kind !== "group") return NOT_IMPLEMENTED;
-    const params: Record<string, string | number> = { group_id: integerValue(query.conversation.platformConversationId, "group_id"), count: query.limit ?? 20 };
-    if (query.beforeMessageId) params.message_id = integerValue(query.beforeMessageId, "message_id");
-    const raw = await this.client.action<{ messages?: unknown[] }>("get_group_msg_history", params);
-    return (raw.messages ?? []).map((item) => this.normalize({ ...(item as Record<string, unknown>), post_type: "message", message_type: "group", group_id: query.conversation.platformConversationId })).filter((event): event is ChatEvent => event !== null && conversationMatchesAddress(event, query.conversation));
-  }
-
-  async fetchAttachment(attachment: ChatAttachmentRef): Promise<ArtifactTransfer> {
-    const result = await this.resolveAttachment(attachment);
-    const response = await fetch(result.url);
-    if (!response.ok || !response.body) throw new Error(`ATTACHMENT_DOWNLOAD_FAILED:${response.status}`);
-    return {
-      filename: attachment.filename ?? attachment.id ?? "attachment",
-      ...(attachment.mime ? { mime: attachment.mime } : {}),
-      ...(result.size ? { size: result.size } : {}),
-      stream: response.body as unknown as AsyncIterable<Uint8Array>,
-    };
-  }
-
-  async resolveAttachment(attachment: ChatAttachmentRef): Promise<{ url: string; size?: number }> {
-    const fileId = attachment.id;
-    if (!fileId) {
-      if (attachment.url) return { url: attachment.url, ...(attachment.size ? { size: attachment.size } : {}) };
-      throw new Error("ATTACHMENT_REFERENCE_MISSING");
-    }
-    const result = await this.client.action<{ url?: string; file_size?: number }>("get_file", { file_id: fileId });
-    if (!result.url) throw new Error("ATTACHMENT_URL_UNAVAILABLE");
-    return { url: result.url, ...(result.file_size ? { size: result.file_size } : {}) };
-  }
-
   private normalize(raw: Record<string, unknown>): ChatEvent | null { return normalizeQQEvent(raw, this.config, this.botId); }
 }
 
@@ -146,7 +108,6 @@ export function normalizeQQEvent(raw: Record<string, unknown>, config: AppConfig
       replyTo,
       mentionsBot: parsed.mentionsBot,
       attachments: parsed.attachments,
-      rawSegments: (Array.isArray(raw.message) ? raw.message : []) as never,
     },
     timestamp: new Date(Number(raw.time ?? Math.floor(Date.now() / 1000)) * 1000).toISOString(),
     extensions: { postType: String(raw.post_type ?? "message"), rawSender: (raw.sender ?? null) as never },

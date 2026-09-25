@@ -20,6 +20,13 @@ export interface AgentEventController {
 
 const coreCommands = new Set(["status", "tasks", "stop", "new", "usage", "help", "bind", "unbind"]);
 
+function messageSummary(event: ChatEvent): string | null {
+  const text = event.message.text?.trim() ?? "";
+  const attachments = event.message.attachments.map((attachment) => attachment.type === "image" ? "[图片]" : attachment.type === "file" ? "[文件]" : "[附件]");
+  const summary = [text, ...attachments].filter(Boolean).join(" ").trim();
+  return summary || null;
+}
+
 export class Router {
   private readonly config: AppConfig;
   private readonly adapter: ChatPlatformAdapter;
@@ -46,7 +53,7 @@ export class Router {
     const replyBinding = event.message.replyTo && event.message.replyTo !== null && "messageId" in event.message.replyTo
       ? this.lookupBinding(event.message.replyTo as PlatformMessageRef)
       : undefined;
-    const command = this.parseCommand(text);
+    const command = this.parseCommand(text, event.message.mentionsBot === true);
     if (command) {
       if (!this.commandWakes(event)) return;
       await this.handleCommand(event, conversationId, command.name, command.args);
@@ -62,6 +69,10 @@ export class Router {
   }
 
   private async handleCommand(event: ChatEvent, conversationId: string, name: string, args: string[]): Promise<void> {
+    if (name === "help") {
+      await this.sendHelp(event);
+      return;
+    }
     if (coreCommands.has(name)) {
       await this.controller.deliver(this.toEnvelope(event, conversationId, { type: "control_command", command: name, args }));
       return;
@@ -112,6 +123,33 @@ export class Router {
     }
     const intent = this.state.store.get<{ id: string }>("SELECT id FROM gateway_outbound_intents WHERE invocation_id=?", invocationId);
     if (intent) await this.deliverIntent(intent.id);
+  }
+
+  private async sendHelp(event: ChatEvent): Promise<void> {
+    const runtimeCommands = [
+      "/status — 查看当前会话任务进度",
+      "/tasks — 列出当前会话任务",
+      "/stop <task-id> — 请求取消指定任务（按任务权限校验）",
+      "/new — 新建 Main Session；不会删除长期记忆或任务",
+      "/usage — 查看 Pi 命令和 SnowLuma API 端点",
+      "/bind <platform> <accountId> <userId> — 绑定身份（Owner 私聊）",
+      "/unbind <platform> <accountId> <userId> — 解除身份绑定（Owner 私聊）",
+    ];
+    const gatewayCommands = this.commands.list().map((definition) => {
+      const aliases = definition.aliases?.length ? `（别名：${definition.aliases.map((alias) => `/${alias}`).join("、")}）` : "";
+      const permission = definition.permission === "admin" || definition.permission === "owner" || definition.permission.startsWith("owner.")
+        ? "Owner（私聊或群聊）"
+        : "直接命令";
+      if (definition.name === "model") return `/model — 查看当前 provider/model；/model list [provider] — 查看 Pi 提供的模型列表；/model set <provider> <model> — 切换默认模型并热切换活动会话（${permission}）${aliases}`;
+      if (definition.name === "echo") return `/echo <text> — 原样回复文本，用于测试（${permission}）${aliases}`;
+      return `/${definition.name} [参数]（${permission}）${aliases}`;
+    });
+    const policy = this.policy(event);
+    const mentionRule = event.conversation.kind === "private"
+      ? "私聊命令不需要 @。"
+      : `群聊命令${policy.commandRequireMention ? "需要" : "不需要"} @机器人；群聊自然语言${policy.naturalLanguageMode === "observe_all" ? "无需唤醒" : "需要 @机器人或回复机器人消息"}。`;
+    const text = ["可用指令：", ...runtimeCommands, ...gatewayCommands, "/help — 显示此列表。", "", mentionRule].join("\n");
+    await this.adapter.sendMessage(event.conversation, { text, replyTo: event.message.ref });
   }
 
   private async deliverIntent(intentId: string): Promise<void> {
@@ -184,9 +222,10 @@ export class Router {
     return { ...base, ...accountOverride, ...override };
   }
 
-  private parseCommand(text: string): { name: string; args: string[] } | null {
-    if (!text.startsWith("/")) return null;
-    const parts = text.slice(1).trim().split(/\s+/).filter(Boolean);
+  private parseCommand(text: string, mentionsBot: boolean): { name: string; args: string[] } | null {
+    const commandText = mentionsBot ? text.trim().replace(/^@\S+\s+(?=\/)/, "") : text.trim();
+    if (!commandText.startsWith("/")) return null;
+    const parts = commandText.slice(1).trim().split(/\s+/).filter(Boolean);
     if (!parts[0]) return null;
     return { name: parts[0].toLowerCase(), args: parts.slice(1) };
   }
@@ -216,7 +255,7 @@ export class Router {
       trustedIdentity: { userId: event.sender.userId },
       conversation: { conversationId: conversationKeyValue, address: event.conversation },
       message: { ref: event.message.ref, replyTo: event.message.replyTo },
-      payload: { text: event.message.text, attachments: event.message.attachments, rawSegments: event.message.rawSegments ?? [], ...(extra ?? {}) } as never,
+      payload: { text: messageSummary(event), ...(extra ?? {}) } as never,
     };
   }
 }

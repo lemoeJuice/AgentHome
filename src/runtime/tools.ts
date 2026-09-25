@@ -1,6 +1,6 @@
 import { chmod, unlink } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
-import type { CapabilitySet, ChatAttachmentRef, ConversationAddress, JsonValue, PlatformMessageRef, TaskRequester, Trust } from "../shared/types.js";
+import type { CapabilitySet, ConversationAddress, JsonValue, PlatformMessageRef, TaskRequester, Trust } from "../shared/types.js";
 
 export interface RuntimeToolContext {
   conversationId: string;
@@ -12,7 +12,6 @@ export interface RuntimeToolContext {
   eventId?: string;
   message?: PlatformMessageRef;
   replyTo?: PlatformMessageRef;
-  attachments?: ChatAttachmentRef[];
   taskId?: string;
 }
 
