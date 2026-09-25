@@ -19,7 +19,7 @@ async function main(): Promise<void> {
   if (command === "bootstrap") { await bootstrapFromStdin(process.env.AGENT_HOME_STATE ?? "/state"); return; }
   if (command === "hold") { await holdProcess(); return; }
   if (command === "supervise") { await superviseRuntime(); return; }
-  if (command === "help") { process.stdout.write("agent-home gateway|runtime|control stream|control ping|control backup-prepare|control backup-finish|bootstrap|doctor|status\n"); return; }
+  if (command === "help") { process.stdout.write("agent-home gateway|runtime|control stream|control ping|control backup-prepare|control backup-finish|control set-pi-model <provider> <model>|bootstrap|doctor|status\n"); return; }
   let config: Awaited<ReturnType<typeof loadConfig>>;
   try { config = await loadConfig(); } catch (error) {
     if (command === "doctor" || command === "status") { await doctorUnavailable(String(error)); return; }
@@ -33,6 +33,11 @@ async function main(): Promise<void> {
     else if (subcommand === "ping") await runControlPing(config.paths.runtimeSocket);
     else if (subcommand === "backup-prepare") await runControlRequest(config.paths.runtimeSocket, { type: "backup_prepare" });
     else if (subcommand === "backup-finish") await runControlRequest(config.paths.runtimeSocket, { type: "backup_finish" });
+    else if (subcommand === "set-pi-model") {
+      const provider = process.argv[4]; const model = process.argv[5];
+      if (!provider || !model) throw new Error("USAGE: agent-home control set-pi-model <provider> <model>");
+      await runControlRequest(config.paths.runtimeSocket, { type: "set_pi_model", provider, model });
+    }
     else throw new Error(`UNKNOWN_CONTROL_COMMAND:${subcommand}`);
     return;
   }
@@ -82,9 +87,9 @@ async function doctor(config: Awaited<ReturnType<typeof loadConfig>>, logger: Lo
     try {
       const { execFileSync } = await import("node:child_process");
       const container = process.env.AGENT_HOME_CONTAINER ?? `agent-home-${config.instanceId}`;
-      const record = JSON.parse(execFileSync(process.env.PODMAN_COMMAND ?? "podman", ["exec", container, "cat", "/state/config/pi-install.json"], { encoding: "utf8", timeout: 5000 })) as { package?: string; version?: string; command?: string; prefix?: string; providerConfigured?: boolean };
+      const record = JSON.parse(execFileSync(process.env.PODMAN_COMMAND ?? "podman", ["exec", container, "cat", "/state/config/pi-install.json"], { encoding: "utf8", timeout: 5000 })) as { package?: string; version?: string; command?: string; prefix?: string };
       const actualVersion = execFileSync(process.env.PODMAN_COMMAND ?? "podman", ["exec", container, config.runtime.piCommand, "--version"], { encoding: "utf8", timeout: 5000 }).trim();
-      const valid = Boolean(record.package && record.version && record.version === actualVersion && record.command === config.runtime.piCommand && record.prefix && record.providerConfigured === false);
+      const valid = Boolean(record.package && record.version && record.version === actualVersion && record.command === config.runtime.piCommand && record.prefix);
       checks.piInstallation = valid ? { status: "healthy", detail: `${record.package}@${record.version}; provider setup skipped` } : { status: "degraded", detail: "Pi installation record does not match the executable" };
     } catch (error) { checks.piInstallation = { status: "temporarily_unavailable", detail: String(error) }; }
   } else {
@@ -133,7 +138,7 @@ async function loadConfigForState(): Promise<Awaited<ReturnType<typeof loadConfi
     try {
       const value = JSON.parse(await readFile(bootstrap, "utf8")) as Partial<Awaited<ReturnType<typeof loadConfig>>>;
       await mkdir(dirname(bootstrap), { recursive: true });
-       return { ...(value as Awaited<ReturnType<typeof loadConfig>>), paths: { gatewayState: "./runtime-state/gateway.sqlite", pluginData: "./runtime-state/plugin-data", backupDir: "./backups", stateRoot, runtimeSocket: "/run/agent-home/control.sock" }, snowluma: { ...(value.snowluma as Awaited<ReturnType<typeof loadConfig>>["snowluma"]), accountId: "default", reverseWebSocketPath: (value.snowluma as Awaited<ReturnType<typeof loadConfig>>["snowluma"]).reverseWebSocketPath ?? "/onebot/v11/ws", reconnectMs: 2000, requestTimeoutMs: 15000 }, chat: { global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, conversationOverrides: {} }, runtime: { maxInFlight: 16, maxWorkers: 2, maxWorkersTotal: 8, maxWorkersPerProject: 2, maxWorkersPerRequester: 4, maxTasks: 32, maxArtifactBytes: 52428800, piCommand: process.env.PI_COMMAND ?? "pi", piTimeoutMs: 3600000, workerSandboxCommand: process.env.AGENT_HOME_WORKER_SANDBOX ?? "bwrap", piProvider: "openai-codex", piModel: "gpt-5.5", piAgentDir: `${stateRoot}/home/.pi/agent` }, plugins: { enabled: [] }, logging: { level: "info" } };
+       return { ...(value as Awaited<ReturnType<typeof loadConfig>>), paths: { gatewayState: "./runtime-state/gateway.sqlite", pluginData: "./runtime-state/plugin-data", backupDir: "./backups", stateRoot, runtimeSocket: "/run/agent-home/control.sock" }, snowluma: { ...(value.snowluma as Awaited<ReturnType<typeof loadConfig>>["snowluma"]), accountId: "default", reverseWebSocketPath: (value.snowluma as Awaited<ReturnType<typeof loadConfig>>["snowluma"]).reverseWebSocketPath ?? "/onebot/v11/ws", reconnectMs: 2000, requestTimeoutMs: 15000 }, chat: { global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, conversationOverrides: {} }, agent: { persona: typeof value.agent?.persona === "string" ? value.agent.persona : "" }, runtime: { maxInFlight: 16, maxWorkers: 2, maxWorkersTotal: 8, maxWorkersPerProject: 2, maxWorkersPerRequester: 4, maxTasks: 32, maxArtifactBytes: 52428800, piCommand: process.env.PI_COMMAND ?? "pi", piTimeoutMs: 3600000, workerSandboxCommand: process.env.AGENT_HOME_WORKER_SANDBOX ?? "bwrap", piAgentDir: `${stateRoot}/home/.pi/agent` }, plugins: { enabled: [] }, logging: { level: "info" } };
     } catch { throw error; }
   }
 }

@@ -48,7 +48,6 @@ export interface ChatEvent {
     replyTo: NullableOrUnsupported<PlatformMessageRef>;
     mentionsBot: boolean | NotImplemented;
     attachments: ChatAttachmentRef[];
-    rawSegments?: JsonValue[];
   };
   timestamp: string;
   extensions?: JsonObject;
@@ -81,9 +80,6 @@ export interface ChatPlatformAdapter {
   start(onEvent: (event: ChatEvent) => Promise<void>): Promise<void>;
   stop(): Promise<void>;
   sendMessage(target: ConversationAddress, message: OutgoingMessage): Promise<SendResult>;
-  getMessage(ref: PlatformMessageRef): Promise<ChatEvent | null | NotImplemented>;
-  getRecentMessages(query: HistoryQuery): Promise<ChatEvent[] | NotImplemented>;
-  fetchAttachment(attachment: ChatAttachmentRef): Promise<ArtifactTransfer | NotImplemented>;
 }
 
 export interface ArtifactRef {

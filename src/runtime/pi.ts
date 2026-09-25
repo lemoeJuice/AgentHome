@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, stat } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Logger } from "../shared/logger.js";
 import { newId } from "../shared/ids.js";
@@ -30,7 +30,7 @@ export interface PiSandbox {
 }
 
 type PiLaunchOptions = { cwd?: string; sandbox?: PiSandbox; mainTools?: boolean; extensionPath?: string };
-type PiDefaults = { provider?: string; model?: string; agentDir?: string };
+type PiDefaults = { agentDir?: string };
 
 export interface PiHarness {
   createSession(sessionPath: string, options?: PiLaunchOptions): Promise<PiSession>;
@@ -52,6 +52,7 @@ type Turn = {
   accepted: boolean;
   settled: boolean;
   completed?: string;
+  failure?: Error;
   waiters: Array<{ resolve: (output: string) => void; reject: (error: Error) => void }>;
   resolve: (output: string) => void;
   reject: (error: Error) => void;
@@ -73,11 +74,9 @@ export class PiCliHarness implements PiHarness {
   private readonly active = new Map<string, RpcProcess>();
   private readonly log: Logger;
   private readonly settledEvent: string;
-  private readonly provider: string;
-  private readonly model: string;
   private readonly agentDir: string;
 
-  constructor(command: string, logger: Logger, sandboxCommand = process.env.AGENT_HOME_WORKER_SANDBOX ?? "bwrap", settledEvent = process.env.AGENT_HOME_PI_SETTLED_EVENT ?? "agent_settled", defaults: PiDefaults = {}) { this.command = command; this.sandboxCommand = sandboxCommand; this.settledEvent = settledEvent; this.provider = defaults.provider ?? process.env.PI_PROVIDER ?? "openai-codex"; this.model = defaults.model ?? process.env.PI_MODEL ?? "gpt-5.5"; this.agentDir = defaults.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? join(process.env.AGENT_HOME_STATE ?? "/state", "home/.pi/agent"); this.log = logger.child("pi"); }
+  constructor(command: string, logger: Logger, sandboxCommand = process.env.AGENT_HOME_WORKER_SANDBOX ?? "bwrap", settledEvent = process.env.AGENT_HOME_PI_SETTLED_EVENT ?? "agent_settled", defaults: PiDefaults = {}) { this.command = command; this.sandboxCommand = sandboxCommand; this.settledEvent = settledEvent; this.agentDir = defaults.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? join(process.env.AGENT_HOME_STATE ?? "/state", "home/.pi/agent"); this.log = logger.child("pi"); }
 
   async createSession(sessionPath: string, options: PiLaunchOptions = {}): Promise<PiSession> {
     await mkdir(dirname(sessionPath), { recursive: true });
@@ -102,12 +101,12 @@ export class PiCliHarness implements PiHarness {
   }
 
   async send(session: PiSession, prompt: string, options: { cwd?: string; timeoutMs?: number; taskId?: string; workerId?: string; sandbox?: PiSandbox; mainTools?: boolean; extensionPath?: string } = {}): Promise<string> {
-    return this.turn(session, { type: "prompt", message: prompt }, options);
+    return this.turnWithRetries(session, { type: "prompt", message: prompt }, options);
   }
 
   async steer(session: PiSession, prompt: string, options: { cwd?: string; timeoutMs?: number } = {}): Promise<string> {
     const process = this.findProcess(session);
-    if (!process?.turn) return this.turn(session, { type: "prompt", message: prompt }, options);
+    if (!process?.turn) return this.turnWithRetries(session, { type: "prompt", message: prompt }, options);
     const turn = process.turn;
     return await new Promise<string>((resolve, reject) => {
       const waiter = { resolve, reject };
@@ -146,6 +145,35 @@ export class PiCliHarness implements PiHarness {
   }
 
   processId(session: PiSession): number | undefined { return this.findProcess(session)?.child.pid; }
+
+  async setDefaultModel(provider: string, modelId: string): Promise<{ activeSessionsUpdated: number; activeSessionFailures: number }> {
+    if (!/^[a-z0-9][a-z0-9._-]*$/i.test(provider) || !/^[a-z0-9][a-z0-9._:/+-]*$/i.test(modelId)) throw new Error("PI_MODEL_SELECTION_INVALID");
+    await mkdir(this.agentDir, { recursive: true });
+    const settingsPath = join(this.agentDir, "settings.json");
+    let settings: Record<string, unknown> = {};
+    try {
+      const parsed = JSON.parse(await readFile(settingsPath, "utf8")) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) settings = parsed as Record<string, unknown>;
+    } catch { /* The first selected provider creates Pi's settings file. */ }
+    settings.defaultProvider = provider;
+    settings.defaultModel = modelId;
+    const tempPath = `${settingsPath}.tmp-${process.pid}`;
+    await writeFile(tempPath, `${JSON.stringify(settings, null, 2)}\n`, { mode: 0o600 });
+    await rename(tempPath, settingsPath);
+
+    let activeSessionsUpdated = 0;
+    let activeSessionFailures = 0;
+    for (const sessionProcess of new Set(this.active.values())) {
+      try {
+        await this.rpc(sessionProcess, { type: "set_model", provider, modelId });
+        activeSessionsUpdated++;
+      } catch (error) {
+        activeSessionFailures++;
+        this.log.warn("Could not hot-switch an active Pi session", { provider, model: modelId, error: String(error) });
+      }
+    }
+    return { activeSessionsUpdated, activeSessionFailures };
+  }
 
   async stop(): Promise<void> {
     const processes = [...new Set(this.active.values())];
@@ -223,6 +251,25 @@ export class PiCliHarness implements PiHarness {
     });
   }
 
+  private async turnWithRetries(session: PiSession, command: RpcValue, options: { cwd?: string; timeoutMs?: number; sandbox?: PiSandbox; mainTools?: boolean; extensionPath?: string }): Promise<string> {
+    const maxAttempts = 2;
+    let lastError: Error | undefined;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        const response = await this.turn(session, command, options);
+        if (response.trim()) return response;
+        lastError = new Error("PI_EMPTY_RESPONSE");
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+        if (!isRetryablePiFailure(lastError)) throw lastError;
+      }
+      if (attempt === maxAttempts) break;
+      this.log.warn("Retrying failed or empty Pi turn", { sessionId: session.sessionId, attempt, error: lastError.message });
+      await delay(500 * attempt);
+    }
+    throw lastError ?? new Error("PI_EMPTY_RESPONSE");
+  }
+
   private async ensureProcess(session: PiSession, options: PiLaunchOptions = {}): Promise<RpcProcess> {
     const existing = this.findProcess(session);
     if (existing) {
@@ -266,9 +313,9 @@ export class PiCliHarness implements PiHarness {
     const args: string[] = [];
     if (options.mainTools) args.push("--no-builtin-tools", "--no-extensions", "--no-skills", "--no-context-files");
     if (options.extensionPath) args.push("--extension", options.extensionPath);
-    args.push("--provider", this.provider, "--model", this.model, "--mode", "rpc", "--session", session.sessionPath);
+    args.push("--mode", "rpc", "--session", session.sessionPath);
     const env = options.mainTools
-      ? { PATH: process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", HOME: "/tmp/agent-home-main", XDG_CONFIG_HOME: "/tmp/agent-home-main/.config", XDG_DATA_HOME: "/tmp/agent-home-main/.local/share", XDG_STATE_HOME: "/tmp/agent-home-main/.local/state", TMPDIR: "/tmp", PI_CODING_AGENT_DIR: this.agentDir }
+      ? { PATH: process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", HOME: "/tmp/agent-home-main", XDG_CONFIG_HOME: "/tmp/agent-home-main/.config", XDG_DATA_HOME: "/tmp/agent-home-main/.local/share", XDG_STATE_HOME: "/tmp/agent-home-main/.local/state", TMPDIR: "/tmp", PI_CODING_AGENT_DIR: this.agentDir, ...this.proxyEnvironment() }
       : { ...globalThis.process.env, PI_CODING_AGENT_DIR: this.agentDir };
     return { command: this.command, args, cwd: options.cwd, env };
   }
@@ -276,15 +323,19 @@ export class PiCliHarness implements PiHarness {
   private sandboxInvocation(session: PiSession, sandbox: PiSandbox, options: PiLaunchOptions): { command: string; args: string[]; cwd?: string; env: NodeJS.ProcessEnv } {
     const args = [
       // Pi's provider client must reach the container network. Container-level
-      // networking remains isolated from the host by Podman.
-      "--die-with-parent", "--new-session", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
+      // networking remains isolated from the host by Podman. The outer
+      // rootless container already supplies a PID namespace; nested
+      // --unshare-pid cannot mount /proc in that environment.
+      "--die-with-parent", "--new-session", "--unshare-ipc", "--unshare-uts",
       "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
     ];
     for (const path of ["/usr", "/bin", "/lib", "/lib64", "/etc"]) {
       if (existsSync(path)) args.push("--ro-bind", path, path);
     }
+    const commandRoots = this.sandboxCommandRoots();
     const authDirectory = existsSync(this.agentDir) ? [this.agentDir] : [];
-    for (const path of this.sandboxDirectories([sandbox.workspaceRoot, sandbox.sessionRoot, ...authDirectory, ...(sandbox.toolSocket ? [sandbox.toolSocket] : []), ...(options.extensionPath ? [options.extensionPath] : [])])) args.push("--dir", path);
+    for (const path of this.sandboxDirectories([sandbox.workspaceRoot, sandbox.sessionRoot, ...authDirectory, ...commandRoots, ...(sandbox.toolSocket ? [sandbox.toolSocket] : []), ...(options.extensionPath ? [options.extensionPath] : [])])) args.push("--dir", path);
+    for (const path of commandRoots) args.push("--ro-bind", path, path);
     args.push("--bind", sandbox.sessionRoot, sandbox.sessionRoot);
     args.push(sandbox.writeAccess ? "--bind" : "--ro-bind", sandbox.workspaceRoot, sandbox.workspaceRoot);
     if (sandbox.toolSocket) args.push("--ro-bind", sandbox.toolSocket, sandbox.toolSocket);
@@ -294,11 +345,24 @@ export class PiCliHarness implements PiHarness {
     if (authDirectory.length) args.push("--bind", this.agentDir, this.agentDir);
     if (options.extensionPath) args.push("--ro-bind", options.extensionPath, options.extensionPath);
     args.push("--chdir", sandbox.workspaceRoot, "--clearenv", "--setenv", "HOME", "/tmp/agent-home-worker", "--setenv", "XDG_CONFIG_HOME", "/tmp/agent-home-worker/.config", "--setenv", "XDG_DATA_HOME", "/tmp/agent-home-worker/.local/share", "--setenv", "XDG_STATE_HOME", "/tmp/agent-home-worker/.local/state", "--setenv", "TMPDIR", "/tmp", "--setenv", "PI_CODING_AGENT_DIR", this.agentDir, "--setenv", "PATH", process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+    for (const [name, value] of Object.entries(this.proxyEnvironment())) args.push("--setenv", name, value);
     if (sandbox.toolSocket && sandbox.toolToken) args.push("--setenv", "AGENT_HOME_RUNTIME_TOOL_SOCKET", sandbox.toolSocket, "--setenv", "AGENT_HOME_RUNTIME_TOOL_TOKEN", sandbox.toolToken);
-    if (options.mainTools) args.push("--", this.command, "--no-builtin-tools", "--no-extensions", "--no-skills", "--no-context-files", ...(options.extensionPath ? ["--extension", options.extensionPath] : []), "--provider", this.provider, "--model", this.model, "--mode", "rpc", "--session", session.sessionPath);
-    else args.push("--", this.command, ...(options.extensionPath ? ["--extension", options.extensionPath] : []), "--provider", this.provider, "--model", this.model, "--mode", "rpc", "--session", session.sessionPath);
+    if (options.mainTools) args.push("--", this.command, "--no-builtin-tools", "--no-extensions", "--no-skills", "--no-context-files", ...(options.extensionPath ? ["--extension", options.extensionPath] : []), "--mode", "rpc", "--session", session.sessionPath);
+    else args.push("--", this.command, ...(options.extensionPath ? ["--extension", options.extensionPath] : []), "--mode", "rpc", "--session", session.sessionPath);
     if (sandbox.mcpEndpoint && sandbox.mcpToken) args.splice(args.indexOf("--"), 0, "--setenv", "AGENT_HOME_MCP_URL", sandbox.mcpEndpoint, "--setenv", "AGENT_HOME_MCP_TOKEN", sandbox.mcpToken);
     return { command: this.sandboxCommand, args, env: {} };
+  }
+
+  private sandboxCommandRoots(): string[] {
+    if (this.command.includes("/")) return [];
+    const roots = new Set<string>();
+    for (const directory of (process.env.PATH ?? "").split(":").filter(Boolean)) {
+      if (!existsSync(join(directory, this.command))) continue;
+      const root = basename(directory) === "bin" ? dirname(directory) : directory;
+      if (["/usr", "/bin", "/lib", "/lib64", "/etc"].some((systemRoot) => root === systemRoot || root.startsWith(`${systemRoot}/`))) continue;
+      roots.add(root);
+    }
+    return [...roots];
   }
 
   private sandboxDirectories(targets: string[]): string[] {
@@ -308,6 +372,11 @@ export class PiCliHarness implements PiHarness {
       while (current !== "/" && current !== "/tmp") { directories.add(current); current = dirname(current); }
     }
     return [...directories].sort((a, b) => a.length - b.length);
+  }
+
+  private proxyEnvironment(): Record<string, string> {
+    const names = ["NODE_USE_ENV_PROXY", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"];
+    return Object.fromEntries(names.flatMap((name) => process.env[name] ? [[name, process.env[name] as string]] : []));
   }
 
   private rpc(process: RpcProcess, command: RpcValue): Promise<RpcValue> {
@@ -349,6 +418,10 @@ export class PiCliHarness implements PiHarness {
       }
       this.captureAssistantText(process, value);
       if (value.type === this.settledEvent && process.turn) {
+        if (process.turn.failure) {
+          this.rejectTurn(process, process.turn.failure);
+          continue;
+        }
         process.turn.settled = true;
         this.completeTurn(process);
       }
@@ -366,9 +439,23 @@ export class PiCliHarness implements PiHarness {
 
   private captureAssistantText(process: RpcProcess, value: RpcValue): void {
     if (!process.turn) return;
-    const text = this.extractAssistantText(value.message ?? value.messages);
+    const messages = value.message ?? value.messages;
+    const failure = this.extractAssistantFailure(messages) ?? (value.type === "agent_error" ? rpcError(value.error) : undefined);
+    if (failure) process.turn.failure = failure;
+    const text = this.extractAssistantText(messages);
     if (text) process.turn.completed = text;
     if (value.type === this.settledEvent && process.turn.completed === undefined) process.turn.completed = "";
+  }
+
+  private extractAssistantFailure(messages: unknown): Error | undefined {
+    const values = Array.isArray(messages) ? messages : messages && typeof messages === "object" ? [messages] : [];
+    for (const message of [...values].reverse()) {
+      if (!message || typeof message !== "object" || (message as RpcValue).role !== "assistant") continue;
+      const value = message as RpcValue;
+      const errorMessage = typeof value.errorMessage === "string" ? value.errorMessage.trim() : "";
+      if (value.stopReason === "error" || errorMessage) return new Error(errorMessage || "PI_PROVIDER_ERROR");
+    }
+    return undefined;
   }
 
   private rejectTurn(process: RpcProcess, error: Error): void {
@@ -427,6 +514,29 @@ export class PiCliHarness implements PiHarness {
       return { pid, processGroupId, startTime, commandLine };
     } catch { return undefined; }
   }
+}
+
+function rpcError(value: unknown): Error {
+  if (value instanceof Error) return value;
+  if (typeof value === "string" && value.trim()) return new Error(value);
+  if (value && typeof value === "object" && "message" in value && typeof value.message === "string") return new Error(value.message);
+  return new Error("PI_PROVIDER_ERROR");
+}
+
+function isRetryablePiFailure(error: Error): boolean {
+  const message = error.message.toLowerCase();
+  if (message === "pi_empty_response") return true;
+  return [
+    "provider_transport_failure",
+    "websocket error",
+    "fetch failed",
+    "network socket disconnected",
+    "socket hang up",
+    "econnreset",
+    "etimedout",
+    "tls",
+    "unexpected eof",
+  ].some((marker) => message.includes(marker));
 }
 
 function sameSandbox(left: PiSandbox, right: PiSandbox): boolean {

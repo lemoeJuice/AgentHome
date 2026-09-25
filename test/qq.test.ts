@@ -88,7 +88,6 @@ test("lazy message reads reject a provider response from another conversation", 
       runtime: { maxInFlight: 2, maxWorkers: 1, maxArtifactBytes: 1000, piCommand: "pi", piTimeoutMs: 1000 }, plugins: { enabled: [] }, logging: { level: "error" as const },
     } as AppConfig;
     const ref = { platform: "qq", accountId: "default", platformConversationId: "42", threadId: null, messageId: "9" } as const;
-    await assert.rejects(() => new QQChatPlatformAdapter(config, logger).getMessage(ref), /QQ_MESSAGE_SCOPE_MISMATCH/);
     const db = new SqliteStore(":memory:");
     migrate(db, runtimeMigrations);
     try {
@@ -100,31 +99,31 @@ test("lazy message reads reject a provider response from another conversation", 
 });
 
 test("QQ history consumes SnowLuma data.messages and numeric IDs", async () => {
-  await withHttpServer((path, body) => {
-    assert.equal(path, "/get_group_msg_history");
-    assert.deepEqual(body, { group_id: 42, count: 1 });
-    return {
-      status: "ok",
-      retcode: 0,
-      data: { messages: [{ message_id: 9, message_type: "group", group_id: 42, user_id: 8, time: 1, message: [{ type: "text", data: { text: "hello" } }] }] },
-    };
-  }, async (endpoint) => {
-    const config = {
-      instanceId: "test",
-      owner: { platform: "qq", accountId: "default", userId: "8" },
-      paths: { gatewayState: "./gateway.sqlite", pluginData: "./plugins", backupDir: "./backups", stateRoot: "/state", runtimeSocket: "/run/agent-home/control.sock" },
-      snowluma: { accountId: "default", endpoint: "ws://127.0.0.1:1", apiEndpoint: endpoint, reverseWebSocketPath: "/", reconnectMs: 10, requestTimeoutMs: 1000 },
-      chat: { global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" as const }, qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" as const }, conversationOverrides: {} },
-      runtime: { maxInFlight: 2, maxWorkers: 1, maxArtifactBytes: 1000, piCommand: "pi", piTimeoutMs: 1000 },
-      plugins: { enabled: [] },
-      logging: { level: "error" as const },
-    } as AppConfig;
-    const adapter = new QQChatPlatformAdapter(config, logger);
-    const events = await adapter.getRecentMessages({ conversation: { platform: "qq", accountId: "default", kind: "group", platformConversationId: "42", threadId: null }, limit: 1 });
-    assert.equal(events.length, 1);
-    assert.equal(events[0]?.message.text, "hello");
-    assert.equal(events[0]?.message.ref.messageId, "9");
-  });
+  const config = {
+    instanceId: "test",
+    owner: { platform: "qq", accountId: "default", userId: "8" },
+    paths: { gatewayState: "./gateway.sqlite", pluginData: "./plugins", backupDir: "./backups", stateRoot: "/state", runtimeSocket: "/run/agent-home/control.sock" },
+    snowluma: { accountId: "default", endpoint: "ws://127.0.0.1:1", apiEndpoint: "http://127.0.0.1:1", reverseWebSocketPath: "/", reconnectMs: 10, requestTimeoutMs: 1000 },
+    chat: { global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" as const }, qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" as const }, conversationOverrides: {} },
+    runtime: { maxInFlight: 2, maxWorkers: 1, maxArtifactBytes: 1000, piCommand: "pi", piTimeoutMs: 1000 },
+    plugins: { enabled: [] },
+    logging: { level: "error" as const },
+  } as AppConfig;
+  const db = new SqliteStore(":memory:");
+  try {
+    migrate(db, runtimeMigrations);
+    const conversation = { platform: "qq", accountId: "default", kind: "group" as const, platformConversationId: "42", threadId: null };
+    const capabilities = { memory: { allowedScopes: [] }, projects: [], qq: { readConversations: ["conversation-1"], sendConversations: [] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: [], publishTaskIds: [], allowedDestinations: [] }, tasks: { canCreate: false, visibleTaskIds: [], canCancel: false, canFollowUp: false } };
+    const mcp = fakeMcp({ queryAction: async <T>(action, params) => {
+      assert.equal(action, "get_group_msg_history");
+      assert.deepEqual(params, { group_id: 42, count: 1 });
+      return { messages: [{ message_id: 9, message_type: "group", group_id: 42, user_id: 8, time: 1, message: [{ type: "text", data: { text: "hello" } }] }] } as T;
+    } });
+    const events = await new SnowLumaQQCapability(config, new ArtifactService(db, "/tmp"), logger, mcp).getHistory({ conversation, limit: 1 }, { conversationId: "conversation-1", capabilities, target: conversation });
+    assert.equal(Array.isArray(events) ? events.length : 0, 1);
+    assert.equal(Array.isArray(events) ? events[0]?.message.text : undefined, "hello");
+    assert.equal(Array.isArray(events) ? events[0]?.message.ref.messageId : undefined, "9");
+  } finally { db.close(); }
 });
 
 test("QQ capability normalizes lazy message responses", () => {
@@ -141,6 +140,31 @@ test("QQ capability normalizes lazy message responses", () => {
   assert.equal(event?.conversation.kind, "private");
 });
 
+test("QQ capability accepts negative OneBot message IDs", async () => {
+  const config = {
+    instanceId: "test", owner: { platform: "qq", accountId: "default", userId: "8" },
+    paths: { gatewayState: "./gateway.sqlite", pluginData: "./plugins", backupDir: "./backups", stateRoot: "/state", runtimeSocket: "/run/agent-home/control.sock" },
+    snowluma: { accountId: "default", endpoint: "ws://127.0.0.1:1", apiEndpoint: "http://127.0.0.1:1", reverseWebSocketPath: "/", reconnectMs: 10, requestTimeoutMs: 1000 },
+    chat: { global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" as const }, qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" as const }, conversationOverrides: {} },
+    runtime: { maxInFlight: 2, maxWorkers: 1, maxArtifactBytes: 1000, piCommand: "pi", piTimeoutMs: 1000 }, plugins: { enabled: [] }, logging: { level: "error" as const },
+  } as AppConfig;
+  const db = new SqliteStore(":memory:");
+  migrate(db, runtimeMigrations);
+  try {
+    const conversation = { platform: "qq" as const, accountId: "default", kind: "group" as const, platformConversationId: "42", threadId: null };
+    const capabilities = { memory: { allowedScopes: [] }, projects: [], qq: { readConversations: ["conversation-1"], sendConversations: [] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: [], publishTaskIds: [], allowedDestinations: [] }, tasks: { canCreate: false, visibleTaskIds: [], canCancel: false, canFollowUp: false } };
+    const ref = { ...conversation, messageId: "-1396864604" };
+    const mcp = fakeMcp({ queryAction: async <T>(action, params) => {
+      assert.equal(action, "get_msg");
+      assert.deepEqual(params, { message_id: -1396864604 });
+      return { message_id: -1396864604, message_type: "group", group_id: 42, user_id: 8, time: 1, message: [{ type: "image", data: { file: "image-1" } }] } as T;
+    } });
+    const event = await new SnowLumaQQCapability(config, new ArtifactService(db, "/tmp"), logger, mcp).getMessage(ref, "group", { conversationId: "conversation-1", capabilities, target: conversation });
+    assert.equal(event?.message.ref.messageId, "-1396864604");
+    assert.equal(event?.message.attachments[0]?.id, "image-1");
+  } finally { db.close(); }
+});
+
 test("unsupported QQ private history is explicit", async () => {
   const config = {
     instanceId: "test",
@@ -152,8 +176,13 @@ test("unsupported QQ private history is explicit", async () => {
     plugins: { enabled: [] },
     logging: { level: "error" as const },
   } as AppConfig;
-  const adapter = new QQChatPlatformAdapter(config, logger);
-  assert.deepEqual(await adapter.getRecentMessages({ conversation: { platform: "qq", accountId: "default", kind: "private", platformConversationId: "8", threadId: null }, limit: 5 }), { kind: "NOT_IMPLEMENTED" });
+  const db = new SqliteStore(":memory:");
+  try {
+    migrate(db, runtimeMigrations);
+    const conversation = { platform: "qq", accountId: "default", kind: "private" as const, platformConversationId: "8", threadId: null };
+    const capabilities = { memory: { allowedScopes: [] }, projects: [], qq: { readConversations: ["conversation-1"], sendConversations: [] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: [], publishTaskIds: [], allowedDestinations: [] }, tasks: { canCreate: false, visibleTaskIds: [], canCancel: false, canFollowUp: false } };
+    assert.deepEqual(await new SnowLumaQQCapability(config, new ArtifactService(db, "/tmp"), logger, fakeMcp()).getHistory({ conversation, limit: 5 }, { conversationId: "conversation-1", capabilities, target: conversation }), { kind: "NOT_IMPLEMENTED" });
+  } finally { db.close(); }
 });
 
 test("QQ outbound rejects raw URLs instead of treating them as artifacts", async () => {

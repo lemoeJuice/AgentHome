@@ -16,7 +16,7 @@ test("runtime ingress is enqueue-before-ACK and deduplicated", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-runtime-"));
   const config = { instanceId: "test", owner: { platform: "qq", accountId: "a", userId: "owner" }, paths: { gatewayState: join(root, "gateway.sqlite"), pluginData: join(root, "plugins"), backupDir: join(root, "backups"), stateRoot: root, runtimeSocket: join(root, "run.sock") }, snowluma: { accountId: "a", endpoint: "ws://127.0.0.1:1", apiEndpoint: "http://127.0.0.1:1", accessTokenEnv: "NO_TOKEN", reverseWebSocketPath: "/ws", reconnectMs: 10, requestTimeoutMs: 10 }, chat: { global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, conversationOverrides: {} }, runtime: { maxInFlight: 2, maxWorkers: 1, maxArtifactBytes: 100000, piCommand: "missing-pi", piTimeoutMs: 100 }, plugins: { enabled: [] }, logging: { level: "error" } } as AppConfig;
   const runtime = new RuntimeApp(config, logger);
-  const event = { protocolVersion: 1 as const, eventId: "evt-1", instanceId: "test", type: "chat.message" as const, occurredAt: new Date().toISOString(), source: { platform: "qq", accountId: "a", adapter: "test" }, trustedIdentity: { userId: "owner" }, conversation: { conversationId: "external", address: { platform: "qq", accountId: "a", kind: "private" as const, platformConversationId: "owner", threadId: null } }, message: { ref: { platform: "qq", accountId: "a", platformConversationId: "owner", threadId: null, messageId: "m" }, replyTo: null }, payload: { text: "hello", attachments: [], rawSegments: [] } };
+  const event = { protocolVersion: 1 as const, eventId: "evt-1", instanceId: "test", type: "chat.message" as const, occurredAt: new Date().toISOString(), source: { platform: "qq", accountId: "a", adapter: "test" }, trustedIdentity: { userId: "owner" }, conversation: { conversationId: "external", address: { platform: "qq", accountId: "a", kind: "private" as const, platformConversationId: "owner", threadId: null } }, message: { ref: { platform: "qq", accountId: "a", platformConversationId: "owner", threadId: null, messageId: "m" }, replyTo: null }, payload: { text: "hello" } };
   const first = await runtime.receive(event);
   const second = await runtime.receive(event);
   assert.equal(first.status, "accepted");
@@ -103,7 +103,7 @@ test("main turns are durable and serialized per conversation", async () => {
   const internals = runtime as unknown as { pi: { createSession: (path: string) => Promise<{ sessionId: string; sessionPath: string }>; send: (session: { sessionId: string; sessionPath: string }, prompt: string) => Promise<string>; stop: () => Promise<void> }; qq: { sendMessage: (target: unknown, message: { text: string }) => Promise<unknown> } };
   internals.pi = { createSession: async (path) => ({ sessionId: `main-session-${path}`, sessionPath: path }), send: async (_session, prompt) => { prompts.push(prompt); activeTurns += 1; maxActiveTurns = Math.max(maxActiveTurns, activeTurns); await new Promise((resolve) => setTimeout(resolve, 10)); activeTurns -= 1; return `response-${prompts.length}`; }, stop: async () => {} };
   internals.qq = { sendMessage: async (_target, message) => ({ message: { platform: "qq", accountId: "a", platformConversationId: "owner", threadId: null, messageId: `out-${prompts.length}` }, accepted: true, echoedText: message.text }) };
-  const event = (eventId: string, text: string, group = false) => ({ protocolVersion: 1 as const, eventId, instanceId: "main-queue", type: "chat.message" as const, occurredAt: new Date().toISOString(), source: { platform: "qq", accountId: "a", adapter: "test" }, trustedIdentity: { userId: group ? "guest" : "owner" }, conversation: { conversationId: "external", address: { platform: "qq", accountId: "a", kind: group ? "group" as const : "private" as const, platformConversationId: group ? "group-1" : "owner", threadId: null } }, message: { ref: { platform: "qq", accountId: "a", platformConversationId: group ? "group-1" : "owner", threadId: null, messageId: eventId }, replyTo: null }, payload: { text, attachments: [], rawSegments: [] } });
+  const event = (eventId: string, text: string, group = false) => ({ protocolVersion: 1 as const, eventId, instanceId: "main-queue", type: "chat.message" as const, occurredAt: new Date().toISOString(), source: { platform: "qq", accountId: "a", adapter: "test" }, trustedIdentity: { userId: group ? "guest" : "owner" }, conversation: { conversationId: "external", address: { platform: "qq", accountId: "a", kind: group ? "group" as const : "private" as const, platformConversationId: group ? "group-1" : "owner", threadId: null } }, message: { ref: { platform: "qq", accountId: "a", platformConversationId: group ? "group-1" : "owner", threadId: null, messageId: eventId }, replyTo: null }, payload: { text } });
   try {
     await runtime.start();
     await runtime.receive(event("main-1", "first message"));
@@ -113,6 +113,8 @@ test("main turns are durable and serialized per conversation", async () => {
     assert.equal(prompts.filter((prompt) => prompt.includes("first message")).length, 1);
     assert.equal(prompts.filter((prompt) => prompt.includes("second message")).length, 1);
     assert.ok(prompts.findIndex((prompt) => prompt.includes("first message")) < prompts.findIndex((prompt) => prompt.includes("second message")));
+    assert.match(prompts[0] ?? "", /Always call get_current_message before answering any user-triggered message/);
+    assert.match(prompts[0] ?? "", /Current message reference \(trusted routing metadata, not message content\)/);
     assert.ok(maxActiveTurns >= 2);
     assert.equal(runtime.db.get<{ count: number }>("SELECT count(*) AS count FROM main_turn_queue WHERE status='DONE'")?.count, 3);
   } finally {
@@ -124,7 +126,7 @@ test("main turns are durable and serialized per conversation", async () => {
 test("runtime outbound intents recover after failed delivery", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-outbound-"));
   const config = { instanceId: "outbound", owner: { platform: "qq", accountId: "a", userId: "owner" }, paths: { gatewayState: join(root, "gateway.sqlite"), pluginData: join(root, "plugins"), backupDir: join(root, "backups"), stateRoot: root, runtimeSocket: join(root, "run.sock") }, snowluma: { accountId: "a", endpoint: "ws://127.0.0.1:1", apiEndpoint: "http://127.0.0.1:1", accessTokenEnv: "NO_TOKEN", reverseWebSocketPath: "/ws", reconnectMs: 10, requestTimeoutMs: 10 }, chat: { global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, conversationOverrides: {} }, runtime: { maxInFlight: 2, maxWorkers: 1, maxArtifactBytes: 100000, piCommand: "missing-pi", piTimeoutMs: 100 }, plugins: { enabled: [] }, logging: { level: "error" } } as AppConfig;
-  const event = { protocolVersion: 1 as const, eventId: "outbound-1", instanceId: "outbound", type: "chat.message" as const, occurredAt: new Date().toISOString(), source: { platform: "qq", accountId: "a", adapter: "test" }, trustedIdentity: { userId: "owner" }, conversation: { conversationId: "external", address: { platform: "qq", accountId: "a", kind: "private" as const, platformConversationId: "owner", threadId: null } }, message: { ref: { platform: "qq", accountId: "a", platformConversationId: "owner", threadId: null, messageId: "outbound-1" }, replyTo: null }, payload: { text: "first message", attachments: [], rawSegments: [] } };
+  const event = { protocolVersion: 1 as const, eventId: "outbound-1", instanceId: "outbound", type: "chat.message" as const, occurredAt: new Date().toISOString(), source: { platform: "qq", accountId: "a", adapter: "test" }, trustedIdentity: { userId: "owner" }, conversation: { conversationId: "external", address: { platform: "qq", accountId: "a", kind: "private" as const, platformConversationId: "owner", threadId: null } }, message: { ref: { platform: "qq", accountId: "a", platformConversationId: "owner", threadId: null, messageId: "outbound-1" }, replyTo: null }, payload: { text: "first message" } };
   const installFakes = (runtime: RuntimeApp, fail: boolean) => {
     const internals = runtime as unknown as { pi: { createSession: (path: string) => Promise<{ sessionId: string; sessionPath: string }>; send: () => Promise<string>; stop: () => Promise<void> }; qq: { sendMessage: () => Promise<unknown> } };
     internals.pi = { createSession: async (path) => ({ sessionId: "main-session", sessionPath: path }), send: async () => "response", stop: async () => {} };
@@ -154,7 +156,7 @@ test("Main lazy QQ tools enforce the current conversation read capability", asyn
   const internals = runtime as unknown as {
     getOrCreateConversation: (value: ConversationAddress, principal: { principalId: string; trust: "OWNER" | "GUEST" }) => { id: string; address: ConversationAddress; trust: "OWNER" | "GUEST" };
     handleMainTool: (action: string, input: unknown, context: unknown) => Promise<unknown>;
-    qq: { getMessage: (value: PlatformMessageRef) => Promise<unknown>; getHistory: (query: unknown) => Promise<unknown> };
+    qq: { getMessage: (value: PlatformMessageRef) => Promise<unknown>; getHistory: (query: unknown) => Promise<unknown>; fetchAttachment: (value: unknown, authorization: unknown) => Promise<unknown> };
   };
   const conversation = internals.getOrCreateConversation(address, { principalId: "principal:test", trust: "OWNER" });
   internals.getOrCreateConversation(otherAddress, { principalId: "principal:other", trust: "GUEST" });
@@ -169,7 +171,15 @@ test("Main lazy QQ tools enforce the current conversation read capability", asyn
   try {
     const artifact = await runtime.artifacts.ingestAttachment({ stream: (async function* () { yield Buffer.from("authorized artifact"); })(), filename: "note.txt", mime: "text/plain", conversationId: conversation.id, requesterId: "owner", eventId: "artifact-event", maxBytes: 1000 });
     assert.deepEqual(await internals.handleMainTool("get_message", { ref }, context), { ref, payload: { text: "authorized" } });
+    assert.deepEqual(await internals.handleMainTool("get_current_message", {}, context), { ref, payload: { text: "authorized" } });
     assert.deepEqual(await internals.handleMainTool("get_reply_context", {}, context), { ref: { ...ref, messageId: "7" }, payload: { text: "authorized" } });
+    internals.qq = {
+      getMessage: async (value) => ({ message: { attachments: [{ type: "image", id: "image-1" }] }, ref: value }),
+      getHistory: async (query) => [{ query }],
+      fetchAttachment: async () => ({ filename: "image.png", mime: "image/png", stream: (async function* () { yield Buffer.from("image"); })() }),
+    };
+    const fetched = await internals.handleMainTool("get_attachment", { attachment: { type: "image", id: "image-1" } }, context) as { filename: string };
+    assert.equal(fetched.filename, "image.png");
     assert.equal((await internals.handleMainTool("read_artifact", { ref: artifact.ref }, context) as { content: string }).content, "authorized artifact");
     const history = await internals.handleMainTool("get_history", { limit: 3 }, context) as Array<{ query: { limit: number } }>;
     assert.equal(history[0]?.query.limit, 3);

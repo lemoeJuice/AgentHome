@@ -21,7 +21,8 @@ export interface AppConfig {
     conversationOverrides: Record<string, Partial<{ commandRequireMention: boolean; naturalLanguageMode: "observe_all" | "explicit_wake" }>>;
     accountOverrides?: Record<string, Partial<{ commandRequireMention: boolean; naturalLanguageMode: "observe_all" | "explicit_wake" }>>;
   };
-  runtime: { maxInFlight: number; maxWorkers: number; maxWorkersTotal: number; maxWorkersPerProject: number; maxWorkersPerRequester: number; maxTasks: number; maxArtifactBytes: number; piCommand: string; piTimeoutMs: number; workerSandboxCommand: string; piProvider: string; piModel: string; piAgentDir: string };
+  agent: { persona: string };
+  runtime: { maxInFlight: number; maxWorkers: number; maxWorkersTotal: number; maxWorkersPerProject: number; maxWorkersPerRequester: number; maxTasks: number; maxArtifactBytes: number; piCommand: string; piTimeoutMs: number; workerSandboxCommand: string; piAgentDir: string };
   memory: { rawEpisodeDays: number | null; keepExplicitForever: boolean; keepProvenanceForActiveFacts: boolean; maxPromptBytes: number };
   plugins: { enabled: string[]; allowedActions?: string[]; allowedPermissions?: string[]; guestAllowedActions?: string[]; guestAllowedPermissions?: string[] };
   logging: { level: LogLevel };
@@ -50,7 +51,8 @@ const defaults: AppConfig = {
     conversationOverrides: {},
     accountOverrides: {},
   },
-  runtime: { maxInFlight: 16, maxWorkers: 2, maxWorkersTotal: 8, maxWorkersPerProject: 2, maxWorkersPerRequester: 4, maxTasks: 32, maxArtifactBytes: 50 * 1024 * 1024, piCommand: "pi", piTimeoutMs: 60 * 60 * 1000, workerSandboxCommand: "bwrap", piProvider: "openai-codex", piModel: "gpt-5.5", piAgentDir: "/state/home/.pi/agent" },
+  agent: { persona: "" },
+  runtime: { maxInFlight: 16, maxWorkers: 2, maxWorkersTotal: 8, maxWorkersPerProject: 2, maxWorkersPerRequester: 4, maxTasks: 32, maxArtifactBytes: 50 * 1024 * 1024, piCommand: "pi", piTimeoutMs: 60 * 60 * 1000, workerSandboxCommand: "bwrap", piAgentDir: "/state/home/.pi/agent" },
   memory: { rawEpisodeDays: 30, keepExplicitForever: true, keepProvenanceForActiveFacts: true, maxPromptBytes: 24 * 1024 },
   plugins: { enabled: [], allowedActions: [], allowedPermissions: [], guestAllowedActions: [], guestAllowedPermissions: [] },
   logging: { level: "info" },
@@ -100,8 +102,11 @@ export async function loadConfig(path = process.env.AGENT_HOME_CONFIG ?? "./conf
     if (!config.paths[key].startsWith("/")) config.paths[key] = resolve(configDirectory, config.paths[key]);
   }
   if (process.env.PI_COMMAND) config.runtime.piCommand = process.env.PI_COMMAND;
+  if (process.env.PI_AGENT_DIR) config.runtime.piAgentDir = process.env.PI_AGENT_DIR;
   if (process.env.AGENT_HOME_WORKER_SANDBOX) config.runtime.workerSandboxCommand = process.env.AGENT_HOME_WORKER_SANDBOX;
   if (process.env.AGENT_HOME_LOG_LEVEL) config.logging.level = process.env.AGENT_HOME_LOG_LEVEL as LogLevel;
+  delete (config.runtime as AppConfig["runtime"] & { piProvider?: string }).piProvider;
+  delete (config.runtime as AppConfig["runtime"] & { piModel?: string }).piModel;
   validateConfig(config);
   return config;
 }
@@ -116,6 +121,7 @@ export function validateConfig(config: AppConfig): void {
   if (typeof config.memory.keepExplicitForever !== "boolean" || typeof config.memory.keepProvenanceForActiveFacts !== "boolean") throw new Error("CONFIG_INVALID: memory.retention");
   if (!Number.isInteger(config.memory.maxPromptBytes) || config.memory.maxPromptBytes < 1024) throw new Error("CONFIG_INVALID: memory.maxPromptBytes");
   if (config.chat.qq.naturalLanguageMode !== "observe_all" && config.chat.qq.naturalLanguageMode !== "explicit_wake") throw new Error("CONFIG_INVALID: naturalLanguageMode");
+  if (typeof config.agent.persona !== "string" || config.agent.persona.length > 12_000) throw new Error("CONFIG_INVALID: agent.persona");
 }
 
 export function snowlumaAccessToken(config: AppConfig): string | undefined {
