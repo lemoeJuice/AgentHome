@@ -14,25 +14,6 @@ IMAGE="$AGENT_HOME_IMAGE"
 BASE_IMAGE="$AGENT_HOME_BASE_IMAGE"
 VOLUME="$AGENT_HOME_VOLUME"
 NETWORK="$AGENT_HOME_NETWORK"
-proxy_exec_env_args=()
-proxy_build_args=()
-if [[ "$AGENT_HOME_USE_PROXY" == 1 ]]; then
-  proxy_exec_env_args+=(--env "NODE_USE_ENV_PROXY=1")
-  proxy_build_args+=(--build-arg "NODE_USE_ENV_PROXY=1")
-  for proxy_name in HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY; do
-    proxy_value=""
-    case "$proxy_name" in
-      HTTP_PROXY) proxy_value="$AGENT_HOME_HTTP_PROXY" ;;
-      HTTPS_PROXY) proxy_value="$AGENT_HOME_HTTPS_PROXY" ;;
-      ALL_PROXY) proxy_value="$AGENT_HOME_ALL_PROXY" ;;
-      NO_PROXY) proxy_value="$AGENT_HOME_NO_PROXY" ;;
-    esac
-    [[ -n "$proxy_value" ]] || continue
-    proxy_exec_env_args+=(--env "$proxy_name=$proxy_value" --env "${proxy_name,,}=$proxy_value")
-    proxy_build_args+=(--build-arg "$proxy_name=$proxy_value")
-  done
-fi
-
 command -v "$PODMAN" >/dev/null || { printf '%s\n' "missing dependency: $PODMAN" >&2; exit 2; }
 "$PODMAN" info --format '{{.Host.Security.Rootless}}' | while IFS= read -r rootless; do
   [[ "$rootless" == true ]] || { printf '%s\n' 'Podman must run rootless' >&2; exit 2; }
@@ -75,8 +56,8 @@ build_without_overlay_context() (
   "$PODMAN" rm -f "$build_container" >/dev/null 2>&1 || true
   "$PODMAN" create --name "$build_container" "$BASE_IMAGE" sleep infinity >/dev/null
   "$PODMAN" start "$build_container" >/dev/null
-  "$PODMAN" exec "${proxy_exec_env_args[@]}" "$build_container" apt-get update
-  "$PODMAN" exec "${proxy_exec_env_args[@]}" "$build_container" apt-get install -y --no-install-recommends bubblewrap ca-certificates git python3 make g++
+  "$PODMAN" exec "$build_container" apt-get update
+  "$PODMAN" exec "$build_container" apt-get install -y --no-install-recommends bubblewrap ca-certificates git python3 make g++
   "$PODMAN" exec "$build_container" rm -rf /var/lib/apt/lists/*
   "$PODMAN" exec "$build_container" mkdir -p /app
   "$PODMAN" cp package.json "$build_container:/app/package.json"
@@ -87,9 +68,9 @@ build_without_overlay_context() (
     printf '%s\n' 'using the lockfile-verified host node_modules cache for the isolated image build'
     "$PODMAN" cp "$ROOT_DIR/node_modules" "$build_container:/app/node_modules"
   else
-    "$PODMAN" exec "${proxy_exec_env_args[@]}" --workdir /app "$build_container" sh -c 'if [ -f package-lock.json ]; then npm ci; else npm install; fi'
+    "$PODMAN" exec --workdir /app "$build_container" sh -c 'if [ -f package-lock.json ]; then npm ci; else npm install; fi'
   fi
-  "$PODMAN" exec "${proxy_exec_env_args[@]}" --workdir /app "$build_container" npm run build
+  "$PODMAN" exec --workdir /app "$build_container" npm run build
   "$PODMAN" exec "$build_container" sh -c 'useradd --create-home --uid 10001 agent && mkdir -p /state /cache /scratch /run/agent-home && chown -R agent:agent /app /state /cache /scratch /run/agent-home'
   "$PODMAN" exec "$build_container" sh -c "printf '%s\\n' '#!/bin/sh' 'exec node /app/dist/cli.js \"\$@\"' > /usr/local/bin/agent-home && chmod 755 /usr/local/bin/agent-home"
   "$PODMAN" commit --pause=false \
@@ -112,7 +93,7 @@ build_without_overlay_context() (
   if [[ "$(stat -f -c '%T' "$ROOT_DIR" 2>/dev/null || true)" == btrfs ]] && ! command -v fuse-overlayfs >/dev/null 2>&1; then
     build_without_overlay_context || build_status=$?
   else
-    "$PODMAN" build --build-arg "BASE_IMAGE=$BASE_IMAGE" "${proxy_build_args[@]}" --tag "$IMAGE" --file Containerfile . || build_status=$?
+    "$PODMAN" build --build-arg "BASE_IMAGE=$BASE_IMAGE" --tag "$IMAGE" --file Containerfile . || build_status=$?
   fi
   if [[ "$build_status" != 0 ]]; then
     if [[ "${AGENT_HOME_REBUILD_IMAGE:-0}" != 1 ]] && "$PODMAN" image exists "$IMAGE"; then

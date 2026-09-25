@@ -86,10 +86,6 @@ Main Pi sessions use a fixed Agent Home tool extension over a Runtime-owned, mod
 
 Pi owns the provider/model catalog and the current default in `PI_CODING_AGENT_DIR/settings.json` (default `/state/home/.pi/agent/settings.json`). Agent Home starts Pi without overriding those settings. The Gateway's owner-only `/model`, `/model list [provider]`, and `/model set <provider> <model>` commands query `pi --list-models` and the current Pi settings through `podman exec`; switching a model updates Pi's settings and hot-switches active Pi sessions through Runtime control without restarting Runtime. On first setup, `scripts/pi-provider-onboarding.sh` checks Pi's saved provider and authentication: it can open Pi's built-in selector, authenticate, or skip. `scripts/pi-login.sh` only starts Pi's authentication flow. Configure Main's optional conversational style in `agent.persona`; it is not passed to Workers, and it cannot change Runtime authorization or safety rules. After editing the persona, run `AGENT_HOME_REBOOTSTRAP=1 bash scripts/init-container.sh` to sync it into the state volume and restart the Agent container. Credentials are stored at `/state/home/.pi/agent/auth.json` inside the named state volume; no Host bind mount or credential argument is used.
 
-### Agent Container Proxy
-
-Set `AGENT_HOME_USE_PROXY=1` in the ignored `config/agent-home.env` to pass `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` into the Agent Home container. When enabled, `scripts/init-container.sh` recreates the container if these values change, and Pi's bwrap workers inherit the same network proxy environment. The configured proxy endpoint must be reachable from the Podman network; use `host.containers.internal` for a host-side bridge rather than a host-only `127.0.0.1` listener or a Tailscale address. `config/agent-home.env.example` documents the available overrides.
-
 ### Remote Pi Login
 
 `scripts/pi-login.sh` needs a real TTY because Pi's `/login` flow is interactive. The SnowLuma noVNC endpoint is not a Pi terminal; it only exposes SnowLuma's QQ desktop. Use any authenticated SSH session to the host instead of exposing a web terminal:
