@@ -6,6 +6,46 @@ if [[ -z "${ROOT_DIR:-}" ]]; then
   ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fi
 
+AGENT_HOME_ENV_FILE="${AGENT_HOME_ENV_FILE:-$ROOT_DIR/config/agent-home.env}"
+if [[ ! -e "$AGENT_HOME_ENV_FILE" && -f "$ROOT_DIR/config/agent-home.env.example" ]]; then
+  cp "$ROOT_DIR/config/agent-home.env.example" "$AGENT_HOME_ENV_FILE"
+  chmod 600 "$AGENT_HOME_ENV_FILE"
+fi
+if [[ -r "$AGENT_HOME_ENV_FILE" ]]; then
+  while IFS='=' read -r config_key config_value; do
+    config_value="${config_value%$'\r'}"
+    [[ -z "$config_key" || "$config_key" == \#* ]] && continue
+    case "$config_key" in
+      AGENT_HOME_USE_PROXY|AGENT_HOME_HTTP_PROXY|AGENT_HOME_HTTPS_PROXY|AGENT_HOME_ALL_PROXY|AGENT_HOME_NO_PROXY)
+        [[ -v "$config_key" ]] || printf -v "$config_key" '%s' "$config_value"
+        ;;
+    esac
+  done < "$AGENT_HOME_ENV_FILE"
+fi
+
+AGENT_HOME_USE_PROXY="${AGENT_HOME_USE_PROXY:-0}"
+AGENT_HOME_HTTP_PROXY="${AGENT_HOME_HTTP_PROXY:-}"
+AGENT_HOME_HTTPS_PROXY="${AGENT_HOME_HTTPS_PROXY:-}"
+AGENT_HOME_ALL_PROXY="${AGENT_HOME_ALL_PROXY:-}"
+AGENT_HOME_NO_PROXY="${AGENT_HOME_NO_PROXY:-}"
+case "$AGENT_HOME_USE_PROXY" in
+  0|1) ;;
+  *) printf '%s\n' 'AGENT_HOME_USE_PROXY must be 0 or 1' >&2; return 2 2>/dev/null || exit 2 ;;
+esac
+if [[ "$AGENT_HOME_USE_PROXY" == 1 ]]; then
+  AGENT_HOME_HTTP_PROXY="${AGENT_HOME_HTTP_PROXY:-${HTTP_PROXY:-${http_proxy:-}}}"
+  AGENT_HOME_HTTPS_PROXY="${AGENT_HOME_HTTPS_PROXY:-${HTTPS_PROXY:-${https_proxy:-}}}"
+  AGENT_HOME_ALL_PROXY="${AGENT_HOME_ALL_PROXY:-${ALL_PROXY:-${all_proxy:-}}}"
+  AGENT_HOME_NO_PROXY="${AGENT_HOME_NO_PROXY:-${NO_PROXY:-${no_proxy:-}}}"
+fi
+for agent_home_proxy_value in "$AGENT_HOME_HTTP_PROXY" "$AGENT_HOME_HTTPS_PROXY" "$AGENT_HOME_ALL_PROXY" "$AGENT_HOME_NO_PROXY"; do
+  if [[ "$agent_home_proxy_value" == *$'\n'* || "$agent_home_proxy_value" == *$'\r'* ]]; then
+    printf '%s\n' 'Agent Home proxy values must not contain newlines' >&2
+    return 2 2>/dev/null || exit 2
+  fi
+done
+export AGENT_HOME_ENV_FILE AGENT_HOME_USE_PROXY AGENT_HOME_HTTP_PROXY AGENT_HOME_HTTPS_PROXY AGENT_HOME_ALL_PROXY AGENT_HOME_NO_PROXY
+
 FIXED_PODMAN="$ROOT_DIR/.agent-home/podman/bin/podman"
 AGENT_HOME_PODMAN_STORAGE_CONF="$ROOT_DIR/.agent-home/podman/storage.conf"
 if [[ -z "${CONTAINERS_STORAGE_CONF:-}" && -r "$AGENT_HOME_PODMAN_STORAGE_CONF" ]]; then

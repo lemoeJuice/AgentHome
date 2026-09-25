@@ -1012,6 +1012,26 @@ Agent Home 不需要 Host 访问 TCP listener。
 
 Controller 通过 `exec` 进入。
 
+这里的 `published ports = 0` 只约束 **Agent Home 容器**。SnowLuma 是同一 Podman 网络中的独立容器，当前部署会将它的服务端口发布到宿主机：
+
+```text
+Host 127.0.0.1:3000 → SnowLuma:3000   OneBot HTTP
+Host 127.0.0.1:3001 → SnowLuma:3001   OneBot WebSocket
+Host 0.0.0.0:6081   → SnowLuma:6081   noVNC
+Host 0.0.0.0:5100   → SnowLuma:5099   SnowLuma WebUI
+```
+
+OneBot 宿主端口默认只绑定 loopback；noVNC/WebUI 默认绑定所有宿主接口，可由部署配置调整。Rootless Podman 可能通过宿主机上的 `rootlessport` 进程接受连接并转发到 SnowLuma 容器。该进程只是端口转发层，宿主端口能 accept TCP 并不代表容器内 OneBot 服务正在监听，更不代表 QQ 已登录。部署检查应探测 SnowLuma 容器内的 OneBot 端口（当前 WebSocket 端口为 `3001`），不能仅检查宿主机的转发端口。
+
+两个调用方使用的是**同一个 SnowLuma OneBot 服务在各自网络命名空间中的地址**，不是两套 API：
+
+```text
+Host Gateway → http://127.0.0.1:3000 / ws://127.0.0.1:3001
+Agent Home   → http://snowluma:3000   / ws://snowluma:3001
+```
+
+因此当前仍需发布宿主机的 `3000/3001`：Host Gateway 是宿主机进程，依赖它们调用 OneBot HTTP action 并接收 OneBot WebSocket 事件。关闭这两个发布端口会切断 QQ 入站和 Host 侧 QQ action；`6081/5100` 则是独立的 noVNC/WebUI 管理入口。修改为完全不发布 OneBot 端口，需要先迁移 Host Gateway 到可直接加入 `agent-home-net` 的通信拓扑。
+
 ---
 
 # 25. 网络方向
@@ -1748,14 +1768,16 @@ pi_available
 ```text
 1. install/bootstrap Rootless Podman
 2. acquire Agent Home image
-3. create agent-home-state volume
-4. create/start Agent Home container
-5. podman exec -i ... bootstrap --stdin
-6. Runtime initializes /state
-7. configure SnowLuma inbound for Router / Bot Gateway
-8. start Router + Controller
-9. Controller establishes exec bridge
-10. end-to-end test
+3. inspect the configured Agent Home named volume
+4. if absent, ask whether to initialize empty state or restore a portable deployment backup
+5. for restore, accept the backup directory (or a path to a file in it); require `manifest.json`, `state.tar`, `image.tar`, and every manifest-referenced archive
+6. create/restore the Agent Home volume and create/start Agent Home container
+7. podman exec -i ... bootstrap --stdin
+8. Runtime initializes /state
+9. configure SnowLuma inbound for Router / Bot Gateway
+10. start Router + Controller
+11. Controller establishes exec bridge
+12. end-to-end test
 ```
 
 ---

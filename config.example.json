@@ -1,5 +1,8 @@
 {
   "instanceId": "default",
+  "agent": {
+    "persona": ""
+  },
   "paths": {
     "gatewayState": "../runtime-state/gateway.sqlite",
     "pluginData": "../runtime-state/plugin-data",
@@ -38,8 +41,6 @@
     "piCommand": "pi",
     "piTimeoutMs": 3600000,
     "workerSandboxCommand": "bwrap",
-    "piProvider": "openai-codex",
-    "piModel": "gpt-5.5",
     "piAgentDir": "/state/home/.pi/agent"
   },
   "memory": {
