@@ -21,7 +21,6 @@ ACCEPT_PRIVACY="$SNOWLUMA_ACCEPT_PRIVACY"
 NOFILE_ULIMIT="${SNOWLUMA_NOFILE_ULIMIT:-65536:524288}"
 CONFIG_PATH="${AGENT_HOME_CONFIG:-$ROOT_DIR/config/agent-home.json}"
 OWNER_CONFIG_PATH="${AGENT_HOME_OWNER_CONFIG:-}"
-container_changed=false
 
 fail() {
   printf 'SnowLuma setup error: %s\n' "$1" >&2
@@ -57,10 +56,15 @@ fi
 OWNER_CONFIG_PATH="$OWNER_CONFIG_PATH" node --input-type=module -e 'import fs from "node:fs"; const owner=JSON.parse(fs.readFileSync(process.env.OWNER_CONFIG_PATH,"utf8")); const configured=owner.userId && !owner.userId.startsWith("REPLACE_"); if (configured && (!owner.platform || !owner.accountId)) process.exit(1);' || fail "owner config is invalid: $OWNER_CONFIG_PATH"
 
 if [[ "${SNOWLUMA_REFRESH_IMAGE:-0}" == 1 ]]; then
-  "$PODMAN" pull "$IMAGE"
+  "$PODMAN" pull "$IMAGE" || { "$PODMAN" image exists "$IMAGE" || exit 1; printf 'SnowLuma refresh failed; using cached image %s\n' "$IMAGE" >&2; }
 else
-  "$PODMAN" pull --policy missing "$IMAGE"
+  printf 'checking SnowLuma image updates: %s\n' "$IMAGE"
+  if ! "$PODMAN" pull --policy newer "$IMAGE"; then
+    "$PODMAN" image exists "$IMAGE" || { printf 'SnowLuma image is unavailable: %s\n' "$IMAGE" >&2; exit 1; }
+    printf 'SnowLuma update check failed; continuing with cached image %s\n' "$IMAGE" >&2
+  fi
 fi
+target_image_id="$("$PODMAN" image inspect -f '{{.Id}}' "$IMAGE")"
 if ! "$PODMAN" network inspect "$NETWORK" >/dev/null 2>&1; then
   "$PODMAN" network create "$NETWORK" >/dev/null
 fi
@@ -70,7 +74,7 @@ for volume in snowluma-gateway-data snowluma-client-config snowluma-client-data;
 done
 
 if "$PODMAN" container exists "$CONTAINER"; then
-  existing_image="$($PODMAN container inspect -f '{{.Config.Image}}' "$CONTAINER")"
+  existing_image_id="$($PODMAN container inspect -f '{{.Image}}' "$CONTAINER")"
   existing_ports="$($PODMAN container inspect -f '{{json .HostConfig.PortBindings}}' "$CONTAINER")"
   existing_env="$($PODMAN container inspect -f '{{json .Config.Env}}' "$CONTAINER")"
   expected_ports_match=false
@@ -95,7 +99,7 @@ if "$PODMAN" container exists "$CONTAINER"; then
       if (!existing.includes(`${name}=${value}`)) process.exit(1);
     }
   ' && expected_env_match=true
-  if [[ "$existing_image" != "$IMAGE" || "$expected_ports_match" != true || "$expected_env_match" != true ]]; then
+  if [[ "$existing_image_id" != "$target_image_id" || "$expected_ports_match" != true || "$expected_env_match" != true ]]; then
     "$PODMAN" rm -f "$CONTAINER" >/dev/null
   fi
 fi
@@ -121,10 +125,8 @@ if ! "$PODMAN" container exists "$CONTAINER"; then
     "$IMAGE"
   )
   "$PODMAN" "${args[@]}" >/dev/null
-  container_changed=true
 elif [[ "$("$PODMAN" container inspect -f '{{.State.Running}}' "$CONTAINER")" != true ]]; then
   "$PODMAN" start "$CONTAINER" >/dev/null
-  container_changed=true
 fi
 
 HOST_WS_PATH="$($PODMAN exec "$CONTAINER" node --input-type=module -e 'import fs from "node:fs"; const value=JSON.parse(fs.readFileSync("/app/data/config/onebot.json", "utf8")); process.stdout.write(value.networks?.wsServers?.[0]?.path || "/");')"
@@ -153,9 +155,6 @@ printf '%s\n' "Scan QQ at noVNC: http://${DISPLAY_HOST}:${NOVNC_PORT}/"
 printf '%s\n' "SnowLuma WebUI: http://${DISPLAY_HOST}:${WEBUI_PORT}/"
 printf '%s\n' "OneBot endpoints: HTTP=${SERVICE_BIND_ADDRESS}:${HTTP_PORT} WS=${SERVICE_BIND_ADDRESS}:${WS_PORT}"
 printf '%s\n' 'SnowLuma uses its persistent QQ volumes and QR login; OneBot tokens are kept in ignored local secret files.'
-if [[ "$container_changed" == true || "${SNOWLUMA_QR_PROMPT:-0}" == 1 ]] && [[ -t 0 ]]; then
-  read -r -p '完成 noVNC 扫码登录后按 Enter 继续 Agent Home 配置...'
-fi
 
 ACCESS_TOKEN_FILE="${SNOWLUMA_ACCESS_TOKEN_FILE:-$ROOT_DIR/.agent-home/snowluma-access-token}"
 mkdir -p "$(dirname "$ACCESS_TOKEN_FILE")"

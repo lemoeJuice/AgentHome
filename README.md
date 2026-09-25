@@ -5,14 +5,15 @@ Agent Home is a durable QQ-connected Agent runtime built around Rootless Podman,
 ## Quick Start
 
 ```bash
-pnpm install
-./scripts/configure-podman-snowluma.sh
+./scripts/deploy.sh
 ./scripts/doctor.sh
 ```
 
-`configure-podman-snowluma.sh` detects a usable local rootless Podman installation and automatically installs Podman with `pacman`, `apt-get`, `dnf`, `yum`, `zypper`, or `apk` when needed. It then uses the fixed `docker.io/motricseven7/snowluma:latest` image, creates persistent QQ volumes, and starts the SnowLuma container. OneBot HTTP/WS bind to `127.0.0.1` by default; noVNC and the WebUI bind to `0.0.0.0` on ports `6081` and `5100` for remote operator access. Edit the generated `config/snowluma.env` to change these values. The same file enables declarative EULA/privacy consent for unattended setup; QQ authentication still requires an existing persisted login or a first-run QR scan. It never asks for a Podman path or a SnowLuma access token, and refuses to claim success unless the local rootless engine is reachable.
+Host prerequisite: Node.js `>=22.5` with `npm` or `pnpm`; `deploy.sh` installs project dependencies itself, so a separate `pnpm install` is not required. The script can install Podman through the host package manager, but it does not install Node.js.
 
-The configure flow is safe to rerun: existing Agent Home and SnowLuma images, containers, dependencies, volumes, and runtime bootstrap are reused. Set `AGENT_HOME_REBUILD_IMAGE=1`, `SNOWLUMA_REFRESH_IMAGE=1`, `AGENT_HOME_REFRESH_DEPS=1`, or `AGENT_HOME_REBOOTSTRAP=1` only when an explicit refresh is needed. `scripts/retry-setup-podman.sh` retries the Podman image/build phase up to 100 times by default.
+`scripts/deploy.sh` is the single full-deployment entrypoint (also available through the compatibility alias `scripts/configure-podman-snowluma.sh`). It checks host dependencies and existing images/containers, checks registry image updates, prepares a usable rootless Podman installation, installs Pi, and starts the runtime and host Gateway. If the configured Agent Home volume does not exist, startup asks whether to initialize an empty volume or restore a deployment backup. For migration, provide the backup directory produced by `scripts/backup.sh`, or the path to one of its files; it must include `manifest.json`, `state.tar`, `image.tar`, and all companion files referenced by the manifest. `scripts/migrate.sh <backup-directory-or-file>` remains a shortcut that selects restore and uses the same deployment flow. If Pi has no provider/model saved in its own settings, startup offers to open Pi's built-in model selector or skip; it never maintains a separate provider/model catalog. Podman is automatically installed with `pacman`, `apt-get`, `dnf`, `yum`, `zypper`, or `apk` when needed. SnowLuma uses the fixed `docker.io/motricseven7/snowluma:latest` image and persistent QQ volumes. OneBot HTTP/WS bind to `127.0.0.1` by default; noVNC and the WebUI bind to `0.0.0.0` on ports `6081` and `5100`. Edit `config/snowluma.env` to change these values. QQ login is the final deployment stage, after containers, Pi, health checks, and Gateway startup, so the QR does not age during setup. When OneBot is offline, the script screenshots the desktop, recognizes a QR with ZXing-C++, and renders a scannable terminal QR with `qrencode`; when no QR is decodable it clicks the fixed refresh point (default `960,582`, configurable with `SNOWLUMA_QR_REFRESH_X/Y`). After printing the QR it waits for a key: it checks whether login completed and, if OneBot is still offline, refreshes and prints a new QR. Host-side QR output needs ImageMagick, ZXing-C++, and `qrencode`; QQ desktop input uses XTest in the SnowLuma container. The same config enables declarative EULA/privacy consent for unattended setup. It never asks for a Podman path or a SnowLuma access token, and refuses to claim success unless the local rootless engine is reachable.
+
+The deployment flow is safe to rerun after interruption: unchanged source/dependency fingerprints, containers, volumes, and initialized state are reused; startup resumes the remaining setup phases. Changed lockfiles or Agent Home source trigger the required dependency/image refresh automatically. SnowLuma and the base image are checked against the registry. Set `AGENT_HOME_REBUILD_IMAGE=1`, `SNOWLUMA_REFRESH_IMAGE=1`, `AGENT_HOME_REFRESH_DEPS=1`, or `AGENT_HOME_REBOOTSTRAP=1` to force a refresh. `scripts/retry-setup-podman.sh` retries the Podman image/build phase up to 100 times by default.
 
 Podman setup uses an Agent Home-local storage configuration under `.agent-home/podman/`. It selects the native `btrfs` driver on Btrfs, `fuse-overlayfs` when available elsewhere, and `vfs` as a portable fallback. On Btrfs without `fuse-overlayfs`, it builds through a temporary rootless container and `commit` instead of Buildah's unsupported overlay build context. This avoids changing or reusing an incompatible global rootless storage database.
 
@@ -25,6 +26,9 @@ Useful commands:
 ./scripts/setup-snowluma.sh
 ./scripts/init-container.sh
 ./scripts/install-pi.sh
+./scripts/pi-provider-onboarding.sh
+./scripts/pi-login.sh
+./scripts/qq-login.sh
 ./scripts/migrate.sh backups/<backup-directory>
 ./scripts/upgrade.sh
 ./scripts/start.sh
@@ -50,7 +54,7 @@ before exporting the state volume.
 
 ## Deployment Lifecycle
 
-Use `scripts/configure-podman-snowluma.sh` for a new deployment from the project files; it builds the image, creates the containers, bootstraps the state, and starts the host Gateway. Use `scripts/backup.sh` on the source host and `scripts/migrate.sh backups/<backup-directory>` on a new host to import the Agent Home state, gateway data, deployment secrets, image, SnowLuma configuration, and SnowLuma volumes before recreating the containers. Use `scripts/upgrade.sh` after pulling project updates; it creates a backup, rebuilds the Agent Home image from the current source, replaces the container while retaining the named state volume, reapplies bootstrap configuration, and restarts the host Gateway.
+Use `scripts/deploy.sh` for a new deployment or to check/reconcile an existing one; existing dependencies, images, containers, and initialized state are reused when possible. If the Agent Home volume is missing, the entrypoint offers fresh initialization or backup restore. Set `AGENT_HOME_MIGRATION_BACKUP` to select a backup directory/file non-interactively. Set `AGENT_HOME_REBUILD_IMAGE=1`, `SNOWLUMA_REFRESH_IMAGE=1`, or `AGENT_HOME_REFRESH_DEPS=1` to refresh the corresponding resources. Use `scripts/backup.sh` on the source host to create a portable migration directory. Use `scripts/upgrade.sh` after pulling project updates; it creates a backup, rebuilds the Agent Home image from the current source, replaces the container while retaining the named state volume, reapplies bootstrap configuration, and restarts the host Gateway.
 
 The common chat model always namespaces platform, account, conversation, thread, and message IDs. `null` means a supported field has no value; `NOT_IMPLEMENTED` is a structured unsupported-field sentinel. SnowLuma is deployed as a separate container on `agent-home-net` using its official Docker framework defaults and persistent QQ volumes.
 
@@ -66,9 +70,11 @@ SnowLuma → QQChatPlatformAdapter → Router → Controller
 
 Direct plugin commands bypass Main and use the Host Gateway's SnowLuma adapter. Runtime/Main platform reads, attachment resolution, and outbound sends use the official `@snowluma/mcp` stdio client launched by Runtime; Gateway MCP is reserved for Agent Actions and Worker bindings. Worker files must be registered as `ArtifactRef` objects before delivery; raw local paths are never passed to QQ.
 
+Send `/help` in QQ to list the Runtime and Gateway commands currently loaded. Slash commands in groups follow `chat.qq.commandRequireMention` (default `false`); private-chat commands never need an @ mention. Model commands require the configured Owner identity, but can be used from either private or group chat (subject to the group @ setting). Group natural-language messages use the configured wake policy; the default `explicit_wake` requires an @ mention or reply to the bot.
+
 ## External Integrations
 
-The production Gateway OneBot adapter uses forward WebSocket events and SnowLuma HTTP action paths for ingress and direct plugin commands. Runtime starts the pinned, image-installed `@snowluma/mcp@1.14.15` server over stdio with `SNOWLUMA_MCP_ENDPOINT`, `SNOWLUMA_MCP_TOKEN`, and `SNOWLUMA_MCP_MODE=write`; Main calls `query_action`/`invoke_action` for platform operations. Inbound attachments cross the Controller as metadata and are downloaded only when Main invokes `get_attachment`, which uses MCP's `download_file_stream`. Pi is isolated in `src/runtime/pi.ts` and uses its real CLI print/session interface. Live verification requires a completed QR login, a Pi installation, and rootless Podman.
+The production Gateway OneBot adapter uses forward WebSocket events and SnowLuma HTTP action paths for ingress and direct plugin commands. Controller ingress carries only the normalized text summary, attachment type markers such as `[图片]`, and trusted message/reply references; it does not retain or transport platform attachment metadata, URLs, IDs, or raw segments. Runtime starts the pinned, image-installed `@snowluma/mcp@1.14.15` server over stdio with `SNOWLUMA_MCP_ENDPOINT`, `SNOWLUMA_MCP_TOKEN`, and `SNOWLUMA_MCP_MODE=write`; Main uses the authorized SnowLuma QQ capability for lazy message, history, and attachment reads, and attachment bytes are downloaded only through MCP's `download_file_stream`. Pi is isolated in `src/runtime/pi.ts` and uses its real CLI print/session interface. Live verification requires a completed QR login, a Pi installation, and rootless Podman.
 
 Small Main artifacts are sent through OneBot's `base64://` file reference via MCP. Larger files are copied into the MCP upload root and sent through `upload_file_stream`; no unrestricted Agent Home filesystem URL is exposed.
 
@@ -78,7 +84,11 @@ Gateway MCP exposes no Agent Actions unless either `GATEWAY_MCP_ALLOWED_ACTIONS`
 
 Main Pi sessions use a fixed Agent Home tool extension over a Runtime-owned, mode-600 Unix socket. The Runtime binds each socket token to the current conversation capability and rejects caller-supplied identity or scope. Main Pi built-in tools, project extensions, skills, and context files are disabled; Worker Pi sessions retain only their separate bwrap-scoped execution surface. Pi 0.86.1 turns settle on `agent_settled`, after retries, compaction, and queued continuations.
 
-Pi defaults to the native `openai-codex` provider and `gpt-5.5`. After the container is running, use `pnpm pi:login` (or `scripts/pi-login.sh`) from the Host, then run `/login` in the attached Pi session. Credentials are stored at `/state/home/.pi/agent/auth.json` inside the named state volume; no Host bind mount or credential argument is used.
+Pi owns the provider/model catalog and the current default in `PI_CODING_AGENT_DIR/settings.json` (default `/state/home/.pi/agent/settings.json`). Agent Home starts Pi without overriding those settings. The Gateway's owner-only `/model`, `/model list [provider]`, and `/model set <provider> <model>` commands query `pi --list-models` and the current Pi settings through `podman exec`; switching a model updates Pi's settings and hot-switches active Pi sessions through Runtime control without restarting Runtime. On first setup, `scripts/pi-provider-onboarding.sh` checks Pi's saved provider and authentication: it can open Pi's built-in selector, authenticate, or skip. `scripts/pi-login.sh` only starts Pi's authentication flow. Configure Main's optional conversational style in `agent.persona`; it is not passed to Workers, and it cannot change Runtime authorization or safety rules. After editing the persona, run `AGENT_HOME_REBOOTSTRAP=1 bash scripts/init-container.sh` to sync it into the state volume and restart the Agent container. Credentials are stored at `/state/home/.pi/agent/auth.json` inside the named state volume; no Host bind mount or credential argument is used.
+
+### Agent Container Proxy
+
+Set `AGENT_HOME_USE_PROXY=1` in the ignored `config/agent-home.env` to pass `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` into the Agent Home container. When enabled, `scripts/init-container.sh` recreates the container if these values change, and Pi's bwrap workers inherit the same network proxy environment. The configured proxy endpoint must be reachable from the Podman network; use `host.containers.internal` for a host-side bridge rather than a host-only `127.0.0.1` listener or a Tailscale address. `config/agent-home.env.example` documents the available overrides.
 
 ### Remote Pi Login
 

@@ -22,9 +22,9 @@ if [[ "${PI_FORCE_REINSTALL:-0}" != 1 ]] && "$PODMAN" exec "$CONTAINER" env PI_P
 fi
 "$PODMAN" exec --user 0 "$CONTAINER" env NPM_CONFIG_PREFIX="$PI_PREFIX" npm install --global "$PI_PACKAGE"
 PI_VERSION="$($PODMAN exec "$CONTAINER" env PATH="$PI_PREFIX/bin:/usr/local/bin:/usr/bin:/bin" "$PI_COMMAND" --version)"
-"$PODMAN" exec --user 0 "$CONTAINER" env PI_PACKAGE="$PI_PACKAGE" PI_VERSION="$PI_VERSION" PI_COMMAND="$PI_COMMAND" PI_PREFIX="$PI_PREFIX" node --input-type=module -e 'import fs from "node:fs"; const path="/state/config/pi-install.json"; fs.mkdirSync("/state/config", { recursive: true, mode: 0o700 }); fs.writeFileSync(path, JSON.stringify({ package: process.env.PI_PACKAGE, version: process.env.PI_VERSION, command: process.env.PI_COMMAND, prefix: process.env.PI_PREFIX, installedAt: new Date().toISOString(), providerConfigured: false, providerConfiguration: "SKIPPED_USER_ACTION_REQUIRED" }, null, 2)+"\n", { mode: 0o600 }); fs.chmodSync(path, 0o600);'
+"$PODMAN" exec --user 0 "$CONTAINER" env PI_PACKAGE="$PI_PACKAGE" PI_VERSION="$PI_VERSION" PI_COMMAND="$PI_COMMAND" PI_PREFIX="$PI_PREFIX" node --input-type=module -e 'import fs from "node:fs"; const path="/state/config/pi-install.json"; fs.mkdirSync("/state/config", { recursive: true, mode: 0o700 }); fs.writeFileSync(path, JSON.stringify({ package: process.env.PI_PACKAGE, version: process.env.PI_VERSION, command: process.env.PI_COMMAND, prefix: process.env.PI_PREFIX, installedAt: new Date().toISOString() }, null, 2)+"\n", { mode: 0o600 }); fs.chmodSync(path, 0o600);'
 PI_UID="$($PODMAN exec "$CONTAINER" id -u)"
 PI_GID="$($PODMAN exec "$CONTAINER" id -g)"
 "$PODMAN" exec --user 0 "$CONTAINER" chown "$PI_UID:$PI_GID" "$PI_RECORD"
 printf '%s\n' "Pi installed in persistent state: $PI_VERSION"
-printf '%s\n' 'PI_PROVIDER_DEFAULT: openai-codex/gpt-5.5; run scripts/pi-login.sh and /login after deployment.' >&2
+printf '%s\n' 'Run scripts/pi-login.sh and /login after deployment to authenticate the selected Pi provider.' >&2
