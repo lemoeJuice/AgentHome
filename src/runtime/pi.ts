@@ -315,7 +315,7 @@ export class PiCliHarness implements PiHarness {
     if (options.extensionPath) args.push("--extension", options.extensionPath);
     args.push("--mode", "rpc", "--session", session.sessionPath);
     const env = options.mainTools
-      ? { PATH: process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", HOME: "/tmp/agent-home-main", XDG_CONFIG_HOME: "/tmp/agent-home-main/.config", XDG_DATA_HOME: "/tmp/agent-home-main/.local/share", XDG_STATE_HOME: "/tmp/agent-home-main/.local/state", TMPDIR: "/tmp", PI_CODING_AGENT_DIR: this.agentDir, ...this.proxyEnvironment() }
+      ? { PATH: process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", HOME: "/tmp/agent-home-main", XDG_CONFIG_HOME: "/tmp/agent-home-main/.config", XDG_DATA_HOME: "/tmp/agent-home-main/.local/share", XDG_STATE_HOME: "/tmp/agent-home-main/.local/state", TMPDIR: "/tmp", PI_CODING_AGENT_DIR: this.agentDir }
       : { ...globalThis.process.env, PI_CODING_AGENT_DIR: this.agentDir };
     return { command: this.command, args, cwd: options.cwd, env };
   }
@@ -345,7 +345,6 @@ export class PiCliHarness implements PiHarness {
     if (authDirectory.length) args.push("--bind", this.agentDir, this.agentDir);
     if (options.extensionPath) args.push("--ro-bind", options.extensionPath, options.extensionPath);
     args.push("--chdir", sandbox.workspaceRoot, "--clearenv", "--setenv", "HOME", "/tmp/agent-home-worker", "--setenv", "XDG_CONFIG_HOME", "/tmp/agent-home-worker/.config", "--setenv", "XDG_DATA_HOME", "/tmp/agent-home-worker/.local/share", "--setenv", "XDG_STATE_HOME", "/tmp/agent-home-worker/.local/state", "--setenv", "TMPDIR", "/tmp", "--setenv", "PI_CODING_AGENT_DIR", this.agentDir, "--setenv", "PATH", process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
-    for (const [name, value] of Object.entries(this.proxyEnvironment())) args.push("--setenv", name, value);
     if (sandbox.toolSocket && sandbox.toolToken) args.push("--setenv", "AGENT_HOME_RUNTIME_TOOL_SOCKET", sandbox.toolSocket, "--setenv", "AGENT_HOME_RUNTIME_TOOL_TOKEN", sandbox.toolToken);
     if (options.mainTools) args.push("--", this.command, "--no-builtin-tools", "--no-extensions", "--no-skills", "--no-context-files", ...(options.extensionPath ? ["--extension", options.extensionPath] : []), "--mode", "rpc", "--session", session.sessionPath);
     else args.push("--", this.command, ...(options.extensionPath ? ["--extension", options.extensionPath] : []), "--mode", "rpc", "--session", session.sessionPath);
@@ -372,11 +371,6 @@ export class PiCliHarness implements PiHarness {
       while (current !== "/" && current !== "/tmp") { directories.add(current); current = dirname(current); }
     }
     return [...directories].sort((a, b) => a.length - b.length);
-  }
-
-  private proxyEnvironment(): Record<string, string> {
-    const names = ["NODE_USE_ENV_PROXY", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"];
-    return Object.fromEntries(names.flatMap((name) => process.env[name] ? [[name, process.env[name] as string]] : []));
   }
 
   private rpc(process: RpcProcess, command: RpcValue): Promise<RpcValue> {

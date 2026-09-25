@@ -12,22 +12,6 @@ VOLUME="$AGENT_HOME_VOLUME"
 NETWORK="$AGENT_HOME_NETWORK"
 BOOTSTRAP_FILE="${AGENT_HOME_BOOTSTRAP_FILE:-}"
 initialized=false
-proxy_env_entries=()
-if [[ "$AGENT_HOME_USE_PROXY" == 1 ]]; then
-  proxy_env_entries+=("NODE_USE_ENV_PROXY=1")
-  for proxy_name in HTTP HTTPS ALL NO; do
-    case "$proxy_name" in
-      HTTP) proxy_value="$AGENT_HOME_HTTP_PROXY" ;;
-      HTTPS) proxy_value="$AGENT_HOME_HTTPS_PROXY" ;;
-      ALL) proxy_value="$AGENT_HOME_ALL_PROXY" ;;
-      NO) proxy_value="$AGENT_HOME_NO_PROXY" ;;
-    esac
-    [[ -n "$proxy_value" ]] || continue
-    container_proxy_name="${proxy_name}_PROXY"
-    [[ "$proxy_name" == NO ]] && container_proxy_name="NO_PROXY"
-    proxy_env_entries+=("$container_proxy_name=$proxy_value" "${container_proxy_name,,}=$proxy_value")
-  done
-fi
 
 command -v "$PODMAN" >/dev/null || { printf '%s\n' "missing dependency: $PODMAN" >&2; exit 2; }
 "$PODMAN" volume inspect "$VOLUME" >/dev/null 2>&1 || "$PODMAN" volume create "$VOLUME" >/dev/null
@@ -52,19 +36,10 @@ if "$PODMAN" container exists "$CONTAINER"; then
   [[ "$mounts" != *"/var/run/podman.sock"* && "$mounts" != *"/run/podman/podman.sock"* && "$mounts" != *"/var/run/docker.sock"* ]] || { printf '%s\n' 'existing Agent Home container exposes a host container socket' >&2; exit 2; }
   networks="$($PODMAN container inspect -f '{{json .NetworkSettings.Networks}}' "$CONTAINER")"
   EXPECTED_VOLUME="$VOLUME" EXPECTED_NETWORK="$NETWORK" MOUNTS_JSON="$mounts" NETWORKS_JSON="$networks" node --input-type=module -e 'const mounts=JSON.parse(process.env.MOUNTS_JSON); const networks=Object.keys(JSON.parse(process.env.NETWORKS_JSON)); if (mounts.length !== 1 || (mounts[0].Name !== process.env.EXPECTED_VOLUME && mounts[0].Source !== process.env.EXPECTED_VOLUME)) process.exit(1); if (networks.length !== 1 || networks[0] !== process.env.EXPECTED_NETWORK) process.exit(1);' || { printf '%s\n' 'existing Agent Home container has mismatched volume or network topology' >&2; exit 2; }
-  existing_env="$($PODMAN container inspect -f '{{json .Config.Env}}' "$CONTAINER")"
-  expected_proxy_env="$(printf '%s\n' "${proxy_env_entries[@]}")"
-  EXISTING_ENV="$existing_env" EXPECTED_PROXY_ENV="$expected_proxy_env" node --input-type=module -e '
-    const relevant = new Set(["NODE_USE_ENV_PROXY", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"]);
-    const actual = JSON.parse(process.env.EXISTING_ENV || "[]").filter((entry) => relevant.has(entry.split("=", 1)[0])).sort();
-    const expected = (process.env.EXPECTED_PROXY_ENV || "").split("\n").filter(Boolean).sort();
-    if (JSON.stringify(actual) !== JSON.stringify(expected)) process.exit(1);
-  ' || { printf '%s\n' 'existing Agent Home container has mismatched proxy environment' >&2; "$PODMAN" rm -f "$CONTAINER" >/dev/null; }
 fi
 
 if ! "$PODMAN" container exists "$CONTAINER"; then
   run_args=(run -d --name "$CONTAINER" --volume "${VOLUME}:/state:Z,U" --network "$NETWORK")
-  for proxy_env_entry in "${proxy_env_entries[@]}"; do run_args+=(--env "$proxy_env_entry"); done
   [[ -n "${AGENT_HOME_MCP_URL:-}" ]] && run_args+=(--env "AGENT_HOME_MCP_URL=${AGENT_HOME_MCP_URL}")
   [[ -n "${AGENT_HOME_MCP_CALLER:-}" ]] && run_args+=(--env "AGENT_HOME_MCP_CALLER=${AGENT_HOME_MCP_CALLER}")
   if [[ -z "${AGENT_HOME_MCP_URL:-}" ]]; then run_args+=(--env "AGENT_HOME_MCP_URL=${AGENT_HOME_MCP_DEFAULT_URL:-http://host.containers.internal:8787/mcp}"); fi
