@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { PiCliHarness } from "../src/runtime/pi.ts";
+import { PiCliHarness, PI_MAX_NETWORK_RETRIES, piNetworkFailureHint } from "../src/runtime/pi.ts";
 import { Logger } from "../src/shared/logger.ts";
 
 test("PiCliHarness drives a persistent RPC session", async () => {
@@ -15,6 +15,8 @@ test("PiCliHarness drives a persistent RPC session", async () => {
      writeFileSync(process.argv[process.argv.length - 1], JSON.stringify({ booted: true, args: process.argv.slice(2) }) + "\\n");
     let buffer = "";
     let transientAttempts = 0;
+    let repeatedTransientAttempts = 0;
+    const maxTransientAttempts = ${PI_MAX_NETWORK_RETRIES};
     process.stdin.setEncoding("utf8");
     process.stdin.on("data", (chunk) => {
       buffer += chunk;
@@ -31,6 +33,11 @@ test("PiCliHarness drives a persistent RPC session", async () => {
             if (command.message === "exit") { setTimeout(() => process.exit(2), 20); return; }
             if (command.message === "transient" && transientAttempts++ === 0) {
               process.stdout.write(JSON.stringify({ type: "agent_end", messages: [{ role: "assistant", content: [], stopReason: "error", errorMessage: "provider_transport_failure: fetch failed" }] }) + "\\n");
+              process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
+              return;
+            }
+            if (command.message === "transient-five" && repeatedTransientAttempts++ < maxTransientAttempts) {
+              process.stdout.write(JSON.stringify({ type: "agent_end", messages: [{ role: "assistant", content: [], stopReason: "error", errorMessage: "fetch failed: ECONNRESET" }] }) + "\\n");
               process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
               return;
             }
@@ -67,6 +74,7 @@ test("PiCliHarness drives a persistent RPC session", async () => {
     assert.equal(await harness.resumeSession(session), true);
     assert.equal(await harness.send(session, "hello"), "reply:hello");
     assert.equal(await harness.send(session, "transient"), "reply:transient");
+    assert.equal(await harness.send(session, "transient-five"), "reply:transient-five");
     await assert.rejects(harness.send(session, "empty"), /PI_EMPTY_RESPONSE/);
     assert.equal(await harness.steer(session, "follow up"), "reply:follow up");
     const long = harness.send(session, "long");
@@ -111,4 +119,11 @@ test("PiCliHarness drives a persistent RPC session", async () => {
     await boundaryHarness.stop();
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("Pi network failures produce actionable categories", () => {
+  assert.equal(PI_MAX_NETWORK_RETRIES, 5);
+  assert.equal(piNetworkFailureHint(new Error("fetch failed: ECONNRESET")), "与模型服务的连接被重置");
+  assert.equal(piNetworkFailureHint(new Error("fetch failed")), "模型服务网络请求失败（fetch failed）");
+  assert.equal(piNetworkFailureHint(new Error("PI_TIMEOUT")), undefined);
 });

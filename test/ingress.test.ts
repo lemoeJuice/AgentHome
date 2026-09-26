@@ -60,7 +60,8 @@ test("principal binding is explicit and group scope stays separate from Owner re
     assert.equal(owner.trust, "OWNER");
     assert.equal(group.trust, "GUEST");
     const groupCaps = deriveCapabilities({ platform: "qq", accountId: "a", userId: "owner", principalId: owner.principalId, trust: owner.trust, conversationId: group.id }, groupAddress, config.owner, group.id);
-    assert.equal(groupCaps.tasks.canCreate, false);
+    assert.equal(groupCaps.tasks.canCreate, true);
+    assert.deepEqual(groupCaps.projects, [{ projectId: "*", access: "WRITE" }]);
     assert.equal(groupCaps.memory.allowedScopes.includes("owner_private"), false);
   } finally {
     await runtime.stop();
@@ -157,12 +158,29 @@ test("Main lazy QQ tools enforce the current conversation read capability", asyn
     getOrCreateConversation: (value: ConversationAddress, principal: { principalId: string; trust: "OWNER" | "GUEST" }) => { id: string; address: ConversationAddress; trust: "OWNER" | "GUEST" };
     handleMainTool: (action: string, input: unknown, context: unknown) => Promise<unknown>;
     qq: { getMessage: (value: PlatformMessageRef) => Promise<unknown>; getHistory: (query: unknown) => Promise<unknown>; fetchAttachment: (value: unknown, authorization: unknown) => Promise<unknown> };
+    snowlumaMcp: {
+      listActions: (category?: string) => Promise<unknown>;
+      searchActions: (query: string) => Promise<unknown>;
+      getAction: (name: string) => Promise<unknown>;
+      queryAction: (action: string, params?: Record<string, unknown>) => Promise<unknown>;
+      invokeAction: (action: string, params?: Record<string, unknown>) => Promise<unknown>;
+      stop: () => Promise<void>;
+    };
   };
   const conversation = internals.getOrCreateConversation(address, { principalId: "principal:test", trust: "OWNER" });
   internals.getOrCreateConversation(otherAddress, { principalId: "principal:other", trust: "GUEST" });
   internals.qq = {
     getMessage: async (value) => ({ ref: value, payload: { text: "authorized" } }),
     getHistory: async (query) => [{ query, payload: { text: "history" } }],
+  };
+  const snowlumaCalls: Array<{ tool: string; action?: string; params?: Record<string, unknown> }> = [];
+  internals.snowlumaMcp = {
+    listActions: async (category) => { snowlumaCalls.push({ tool: "list_actions", params: { category } }); return [{ name: "send_private_msg", category: "消息" }]; },
+    searchActions: async (query) => { snowlumaCalls.push({ tool: "search_actions", params: { query } }); return [{ name: "send_private_msg" }]; },
+    getAction: async (name) => { snowlumaCalls.push({ tool: "get_action", action: name }); return { name, inputSchema: { type: "object" } }; },
+    queryAction: async (action, params) => { snowlumaCalls.push({ tool: "query_action", action, params }); return { action, params }; },
+    invokeAction: async (action, params) => { snowlumaCalls.push({ tool: "invoke_action", action, params }); return { action, accepted: true }; },
+    stop: async () => {},
   };
   const capabilities = {
     memory: { allowedScopes: ["global_agent"] }, projects: [], qq: { readConversations: [conversation.id], sendConversations: [conversation.id] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: ["agent-home"], publishTaskIds: [], allowedDestinations: [conversation.id] }, tasks: { canCreate: true, visibleTaskIds: [], canCancel: true, canFollowUp: true },
@@ -183,6 +201,15 @@ test("Main lazy QQ tools enforce the current conversation read capability", asyn
     assert.equal((await internals.handleMainTool("read_artifact", { ref: artifact.ref }, context) as { content: string }).content, "authorized artifact");
     const history = await internals.handleMainTool("get_history", { limit: 3 }, context) as Array<{ query: { limit: number } }>;
     assert.equal(history[0]?.query.limit, 3);
+    assert.deepEqual(await internals.handleMainTool("list_snowluma_actions", { category: "消息" }, context), [{ name: "send_private_msg", category: "消息" }]);
+    assert.deepEqual(await internals.handleMainTool("search_snowluma_actions", { query: "私聊" }, context), [{ name: "send_private_msg" }]);
+    assert.deepEqual(await internals.handleMainTool("get_snowluma_action", { name: "send_private_msg" }, context), { name: "send_private_msg", inputSchema: { type: "object" } });
+    assert.deepEqual(await internals.handleMainTool("query_snowluma_action", { action: "get_friend_list", params: {} }, context), { action: "get_friend_list", params: {} });
+    assert.deepEqual(await internals.handleMainTool("invoke_snowluma_action", { action: "send_private_msg", params: { user_id: 1234, message: [{ type: "text", data: { text: "hi" } }] } }, context), { action: "send_private_msg", accepted: true });
+    const guestCaps = deriveCapabilities({ platform: "qq", accountId: "a", userId: "guest", principalId: "principal:guest", trust: "GUEST", conversationId: conversation.id }, address, config.owner, conversation.id);
+    await assert.rejects(() => internals.handleMainTool("invoke_snowluma_action", { action: "send_private_msg", params: { user_id: 1234 } }, { ...context, requesterId: "guest", requester: { platform: "qq", accountId: "a", userId: "guest", principalId: "principal:guest" }, trust: "GUEST", capabilities: guestCaps }), /SNOWLUMA_OWNER_REQUIRED/);
+    assert.equal(snowlumaCalls.filter((call) => call.tool === "invoke_action").length, 1);
+    assert.equal(runtime.db.get<{ count: number }>("SELECT count(*) AS count FROM authorization_audit_events WHERE operation='snowluma.invoke_action' AND decision='DENY'")?.count, 1);
     await assert.rejects(() => internals.handleMainTool("get_message", { ref: { ...ref, platformConversationId: "group-2" } }, context), /QQ_READ_DENIED/);
     await assert.rejects(() => internals.handleMainTool("read_artifact", { ref: artifact.ref }, { ...context, conversationId: "other-conversation" }), /ARTIFACT_CONVERSATION_READ_DENIED/);
     await assert.rejects(() => internals.handleMainTool("get_history", {}, { ...context, address: { ...address, kind: "private", platformConversationId: "owner" } }), /QQ_HISTORY_NOT_IMPLEMENTED/);

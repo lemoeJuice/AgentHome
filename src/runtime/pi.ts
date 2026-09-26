@@ -68,6 +68,8 @@ type RpcProcess = {
   extensionPath?: string;
 };
 
+export const PI_MAX_NETWORK_RETRIES = 5;
+
 export class PiCliHarness implements PiHarness {
   private readonly command: string;
   private readonly sandboxCommand: string;
@@ -252,9 +254,8 @@ export class PiCliHarness implements PiHarness {
   }
 
   private async turnWithRetries(session: PiSession, command: RpcValue, options: { cwd?: string; timeoutMs?: number; sandbox?: PiSandbox; mainTools?: boolean; extensionPath?: string }): Promise<string> {
-    const maxAttempts = 2;
     let lastError: Error | undefined;
-    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    for (let retry = 0; retry <= PI_MAX_NETWORK_RETRIES; retry += 1) {
       try {
         const response = await this.turn(session, command, options);
         if (response.trim()) return response;
@@ -263,9 +264,9 @@ export class PiCliHarness implements PiHarness {
         lastError = error instanceof Error ? error : new Error(String(error));
         if (!isRetryablePiFailure(lastError)) throw lastError;
       }
-      if (attempt === maxAttempts) break;
-      this.log.warn("Retrying failed or empty Pi turn", { sessionId: session.sessionId, attempt, error: lastError.message });
-      await delay(500 * attempt);
+      if (retry === PI_MAX_NETWORK_RETRIES) break;
+      this.log.warn("Retrying failed or empty Pi turn", { sessionId: session.sessionId, retry: retry + 1, maxRetries: PI_MAX_NETWORK_RETRIES, error: lastError.message });
+      await delay(500 * (retry + 1));
     }
     throw lastError ?? new Error("PI_EMPTY_RESPONSE");
   }
@@ -518,7 +519,7 @@ function rpcError(value: unknown): Error {
 }
 
 function isRetryablePiFailure(error: Error): boolean {
-  const message = error.message.toLowerCase();
+  const message = errorMessages(error).toLowerCase();
   if (message === "pi_empty_response") return true;
   return [
     "provider_transport_failure",
@@ -527,10 +528,42 @@ function isRetryablePiFailure(error: Error): boolean {
     "network socket disconnected",
     "socket hang up",
     "econnreset",
+    "econnrefused",
     "etimedout",
+    "eai_again",
+    "enotfound",
+    "dns",
     "tls",
     "unexpected eof",
   ].some((marker) => message.includes(marker));
+}
+
+export function piNetworkFailureHint(error: unknown): string | undefined {
+  const message = errorMessages(error).toLowerCase();
+  if (["econnreset", "connection reset", "network socket disconnected", "socket hang up", "unexpected eof"].some((marker) => message.includes(marker))) return "与模型服务的连接被重置";
+  if (!message.includes("pi_timeout") && ["etimedout", "timeout", "timed out"].some((marker) => message.includes(marker))) return "连接模型服务超时";
+  if (["econnrefused", "connection refused"].some((marker) => message.includes(marker))) return "模型服务拒绝了连接";
+  if (["enotfound", "eai_again", "dns"].some((marker) => message.includes(marker))) return "模型服务域名解析失败";
+  if (["tls", "ssl", "certificate"].some((marker) => message.includes(marker))) return "与模型服务建立 TLS 安全连接失败";
+  if (["fetch failed", "provider_transport_failure", "websocket error"].some((marker) => message.includes(marker))) return "模型服务网络请求失败（fetch failed）";
+  return undefined;
+}
+
+function errorMessages(error: unknown): string {
+  const messages: string[] = [];
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  while (current && !seen.has(current)) {
+    seen.add(current);
+    if (current instanceof Error) {
+      messages.push(current.message);
+      current = current.cause;
+    } else {
+      messages.push(String(current));
+      break;
+    }
+  }
+  return messages.join(" ");
 }
 
 function sameSandbox(left: PiSandbox, right: PiSandbox): boolean {

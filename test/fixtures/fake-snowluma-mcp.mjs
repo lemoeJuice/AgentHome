@@ -19,9 +19,17 @@ function handle(request) {
   if (request.method === "tools/call") {
     const args = request.params?.arguments ?? {};
     const name = request.params?.name;
-    const data = name === "query_action"
-      ? { status: "ok", retcode: 0, data: { action: args.action, params: args.params } }
-      : { status: "ok", retcode: 0, data: { message_id: 42 } };
+    const data = name === "list_actions"
+      ? [{ name: "send_private_msg", category: "消息" }]
+      : name === "search_actions"
+        ? [{ name: "send_private_msg", category: "消息", query: args.query }]
+        : name === "get_action"
+          ? { name: args.name, inputSchema: { type: "object" } }
+          : name === "query_action"
+            ? { status: "ok", retcode: 0, data: { action: args.action, params: args.params } }
+            : name === "invoke_action"
+              ? { status: "ok", retcode: 0, data: { action: args.action, params: args.params, message_id: 42 } }
+              : {};
     respond(request.id, { content: [{ type: "text", text: JSON.stringify(data) }] });
   }
 }

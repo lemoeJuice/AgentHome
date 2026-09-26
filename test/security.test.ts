@@ -143,13 +143,16 @@ test("Principal-scoped Memory survives reopening the canonical database", async 
   await rm(root, { recursive: true, force: true });
 });
 
-test("Owner group identity does not grant unrestricted project write", () => {
+test("Owner permissions follow identity in groups while Memory stays conversation-scoped", () => {
   const group = { platform: "qq", accountId: "a", kind: "group" as const, platformConversationId: "g", threadId: null };
   const owner = deriveCapabilities({ platform: "qq", accountId: "a", userId: "owner", trust: "OWNER", conversationId: "group-conv" }, group, { platform: "qq", accountId: "a", userId: "owner" }, "group-conv");
+  const guest = deriveCapabilities({ platform: "qq", accountId: "a", userId: "guest", trust: "GUEST", conversationId: "group-conv" }, group, { platform: "qq", accountId: "a", userId: "owner" }, "group-conv");
   const privateOwner = deriveCapabilities({ platform: "qq", accountId: "a", userId: "owner", trust: "OWNER", conversationId: "private-conv" }, { ...group, kind: "private", platformConversationId: "owner" }, { platform: "qq", accountId: "a", userId: "owner" }, "private-conv");
-  assert.deepEqual(owner.projects, []);
-  assert.equal(owner.tasks.canCreate, false);
-  assert.deepEqual(privateOwner.projects, [{ projectId: "*", access: "WRITE" }]);
+  assert.deepEqual(owner.projects, [{ projectId: "*", access: "WRITE" }]);
+  assert.equal(owner.tasks.canCreate, true);
+  assert.equal(owner.memory.allowedScopes.includes("owner_private"), false);
+  assert.equal(guest.tasks.canCreate, false);
+  assert.deepEqual(privateOwner.projects, owner.projects);
   assert.equal(privateOwner.tasks.canCreate, true);
 });
 

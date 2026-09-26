@@ -17,6 +17,9 @@ const logger = { child: () => logger, info() {}, warn() {}, error() {}, debug() 
 
 function fakeMcp(overrides: Partial<SnowLumaMcpActions> = {}): SnowLumaMcpActions {
   return {
+    listActions: async () => [],
+    searchActions: async () => [],
+    getAction: async () => ({}),
     queryAction: async <T>() => ({}) as T,
     invokeAction: async <T>() => ({}) as T,
     stop: async () => {},

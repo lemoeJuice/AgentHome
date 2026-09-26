@@ -71,8 +71,11 @@ test("SnowLuma MCP client speaks stdio JSON-RPC and unwraps OneBot envelopes", a
   const logger = new Logger("snowluma-test", "error");
   const client = new SnowLumaMcpClient(config, logger);
   try {
+    assert.deepEqual(await client.listActions("消息"), [{ name: "send_private_msg", category: "消息" }]);
+    assert.deepEqual(await client.searchActions("私聊"), [{ name: "send_private_msg", category: "消息", query: "私聊" }]);
+    assert.deepEqual(await client.getAction("send_private_msg"), { name: "send_private_msg", inputSchema: { type: "object" } });
     assert.deepEqual(await client.queryAction("get_msg", { message_id: 7 }), { action: "get_msg", params: { message_id: 7 } });
-    assert.deepEqual(await client.invokeAction("send_private_msg", { user_id: 8 }), { message_id: 42 });
+    assert.deepEqual(await client.invokeAction("send_private_msg", { user_id: 8 }), { action: "send_private_msg", params: { user_id: 8 }, message_id: 42 });
   } finally {
     await client.stop();
     await rm(root, { recursive: true, force: true });

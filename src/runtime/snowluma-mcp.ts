@@ -24,6 +24,9 @@ export async function checkSnowLumaMcpInstallation(): Promise<boolean> {
 }
 
 export interface SnowLumaMcpActions {
+  listActions(category?: string): Promise<unknown>;
+  searchActions(query: string): Promise<unknown>;
+  getAction(name: string): Promise<unknown>;
   queryAction<T>(action: string, params?: Record<string, unknown>): Promise<T>;
   invokeAction<T>(action: string, params?: Record<string, unknown>, execution?: SnowLumaMcpExecution): Promise<T>;
   stop(): Promise<void>;
@@ -54,6 +57,18 @@ export class SnowLumaMcpClient implements SnowLumaMcpActions {
     this.streamDir = join(config.paths.stateRoot, "snowluma", "mcp", "streams");
     this.uploadRoot = join(config.paths.stateRoot, "snowluma", "mcp", "uploads");
     this.logger = logger.child("snowluma-mcp");
+  }
+
+  listActions(category?: string): Promise<unknown> {
+    return this.callTool("list_actions", category ? { category } : {});
+  }
+
+  searchActions(query: string): Promise<unknown> {
+    return this.callTool("search_actions", { query });
+  }
+
+  getAction(name: string): Promise<unknown> {
+    return this.callTool("get_action", { name });
   }
 
   async queryAction<T>(action: string, params: Record<string, unknown> = {}): Promise<T> {

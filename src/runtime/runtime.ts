@@ -11,7 +11,7 @@ import { runtimeMigrations } from "../schema.js";
 import { newId, nowIso, messageKey } from "../shared/ids.js";
 import type { ArtifactRef, CapabilitySet, ChatAttachmentRef, ControllerEventEnvelope, ConversationAddress, JsonValue, MemoryScope, PlatformIdentityRef, PlatformMessageRef, TaskRecord, Trust } from "../shared/types.js";
 import type { Logger } from "../shared/logger.js";
-import { PiCliHarness } from "./pi.js";
+import { PiCliHarness, PI_MAX_NETWORK_RETRIES, piNetworkFailureHint } from "./pi.js";
 import { ArtifactService } from "./artifacts.js";
 import { MemoryService } from "./memory.js";
 import { TaskService, type RuntimeEvent } from "./tasks.js";
@@ -433,7 +433,11 @@ export class RuntimeApp {
       return await this.sendText(address, response, event.message?.ref, conversationId, caps, delivery);
     } catch (error) {
       this.log.error("Main Pi turn failed", { error: String(error), conversationId });
-      return await this.sendText(address, "Main 当前不可用，Runtime 已保留这条消息；请稍后重试。", event.message?.ref, conversationId, caps, delivery);
+      const networkFailure = piNetworkFailureHint(error);
+      const reply = networkFailure
+        ? `模型服务网络错误：${networkFailure}。已自动重试 ${PI_MAX_NETWORK_RETRIES} 次仍失败，请检查宿主机 TUN/网络连接后重新发送。`
+        : "Main 当前不可用，Runtime 已保留这条消息；请稍后重试。";
+      return await this.sendText(address, reply, event.message?.ref, conversationId, caps, delivery);
     }
   }
 
@@ -545,6 +549,22 @@ export class RuntimeApp {
         const sent = await this.sendText(context.address, requiredText(values.text, "text"), context.message, context.conversationId, context.capabilities, { kind: "MAIN_TOOL" });
         return sent.message as never;
       }
+      case "list_snowluma_actions":
+        return await this.snowlumaMcp.listActions(typeof values.category === "string" ? values.category : undefined) as never;
+      case "search_snowluma_actions":
+        return await this.snowlumaMcp.searchActions(requiredText(values.query, "query")) as never;
+      case "get_snowluma_action":
+        return await this.snowlumaMcp.getAction(requiredText(values.name, "name")) as never;
+      case "query_snowluma_action": {
+        const action = requiredText(values.action, "action");
+        this.authorizeSnowLumaAction("snowluma.query_action", action, context);
+        return await this.snowlumaMcp.queryAction(action, optionalInputObject(values.params)) as never;
+      }
+      case "invoke_snowluma_action": {
+        const action = requiredText(values.action, "action");
+        this.authorizeSnowLumaAction("snowluma.invoke_action", action, context);
+        return await this.snowlumaMcp.invokeAction(action, optionalInputObject(values.params)) as never;
+      }
       case "inspect_artifact": {
         const artifact = this.artifacts.authorizeRead(readArtifactRef(values.ref), { conversationId: context.conversationId, requesterId: context.requesterId, ...(context.taskId ? { taskId: context.taskId } : {}), ...(context.eventId ? { sourceEventId: context.eventId } : {}), readCapability: context.capabilities.artifacts });
         const { path: _path, ...metadata } = artifact;
@@ -610,6 +630,15 @@ export class RuntimeApp {
     if (!(capabilities.plugins.allowedActions.includes("*") || capabilities.plugins.allowedActions.includes(name))) return false;
     const permissions = capabilities.plugins.allowedPermissions;
     return permissions === undefined || permissions.includes("*") || permissions.includes(permission);
+  }
+
+  private authorizeSnowLumaAction(operation: string, action: string, context: RuntimeToolContext): void {
+    const owner = context.trust === "OWNER" && (
+      this.isConfiguredOwner(context.requester.platform, context.requester.accountId, context.requester.userId)
+      || context.requester.principalId === "principal:owner"
+    );
+    this.db.run("INSERT INTO authorization_audit_events(id,operation,decision,reason,resource,requester_id,task_id,conversation_id,metadata_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)", newId("authz"), operation, owner ? "ALLOW" : "DENY", owner ? null : "SNOWLUMA_OWNER_REQUIRED", action, context.requesterId, context.taskId ?? null, context.conversationId, JSON.stringify({ action }), nowIso());
+    if (!owner) throw new Error("SNOWLUMA_OWNER_REQUIRED");
   }
 
   private conversationReadable(context: RuntimeToolContext): boolean {
@@ -912,6 +941,10 @@ export class RuntimeApp {
 function inputObject(input: JsonValue): Record<string, JsonValue> {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("TOOL_INPUT_OBJECT_REQUIRED");
   return input as Record<string, JsonValue>;
+}
+
+function optionalInputObject(input: JsonValue | undefined): Record<string, JsonValue> {
+  return input === undefined || input === null ? {} : inputObject(input);
 }
 
 function requiredText(value: JsonValue | undefined, field: string): string {
