@@ -395,7 +395,7 @@ test("terminal Tasks reject Worker creation, follow-up, and cancellation", async
   db.close();
 });
 
-test("TaskService rejects forged group capability and malformed durable capability JSON", () => {
+test("TaskService rejects forged Owner group capability and malformed durable capability JSON", () => {
   const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
   const timestamp = new Date().toISOString();
   db.run("INSERT INTO conversations(conversation_id,platform,account_id,kind,platform_conversation_id,thread_id_json,trust,memory_scopes_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)", "group-conv", "qq", "a", "group", "g", "null", "GUEST", JSON.stringify(["global_agent", "group:group-conv"]), timestamp, timestamp);
@@ -403,7 +403,7 @@ test("TaskService rejects forged group capability and malformed durable capabili
   const config = { owner: { platform: "qq", accountId: "a", userId: "owner" }, runtime: { maxWorkers: 1, maxArtifactBytes: 100000, piCommand: "pi", piTimeoutMs: 1000 } } as AppConfig;
   const tasks = new TaskService(db, new TestPi(), new ArtifactService(db, "/tmp"), config, { workerRoot: "/tmp", onEvent: async () => {} }, logger);
   const forged = { memory: { allowedScopes: ["global_agent", "group:group-conv"] }, projects: [{ projectId: "*", access: "WRITE" as const }], qq: { readConversations: ["group-conv"], sendConversations: ["group-conv"] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: ["agent-home"], publishTaskIds: [], allowedDestinations: ["group-conv"] }, tasks: { canCreate: true, visibleTaskIds: [], canCancel: true, canFollowUp: true } };
-  assert.throws(() => tasks.createTask({ title: "forged", goal: "forged", requester: { platform: "qq", accountId: "a", userId: "owner" }, trust: "OWNER", originConversationId: "group-conv", notificationConversationId: "group-conv", parentCapabilities: forged }), /CAPABILITY_CONTEXT_INVALID/);
+  assert.throws(() => tasks.createTask({ title: "forged", goal: "forged", requester: { platform: "qq", accountId: "a", userId: "guest" }, trust: "OWNER", originConversationId: "group-conv", notificationConversationId: "group-conv", parentCapabilities: forged }), /CAPABILITY_CONTEXT_INVALID/);
   assert.throws(() => tasks.getTask("bad-task"), /CAPABILITY_SNAPSHOT_INVALID/);
   db.close();
 });

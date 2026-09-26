@@ -17,14 +17,14 @@ export function deriveCapabilities(requester: RequesterContext, conversation: Co
   const principalScope = requester.principalId ?? requester.userId;
   const baseScopes: MemoryScope[] = ["global_agent", conversation.kind === "group" ? `group:${conversationId}` : `user:${principalScope}`];
   if (trust === "OWNER" && conversation.kind === "private") baseScopes.push("owner_private");
-  const canCreate = trust === "OWNER" && conversation.kind === "private";
+  const canCreate = trust === "OWNER";
   const allowedActions = trust === "OWNER" ? policy.allowedActions : policy.guestAllowedActions;
   const allowedPermissions = trust === "OWNER" ? policy.allowedPermissions : policy.guestAllowedPermissions;
   return {
     memory: { allowedScopes: baseScopes },
-    // Group Owner identity is trusted, but it must not turn a shared conversation
-    // into an unrestricted project writer. Project scope must be selected separately.
-    projects: trust === "OWNER" && conversation.kind === "private" ? [{ projectId: "*", access: "WRITE" }] : [],
+    // Requester permissions follow the authenticated identity. Conversation-scoped
+    // Memory and chat destinations remain bounded separately below.
+    projects: trust === "OWNER" ? [{ projectId: "*", access: "WRITE" }] : [],
     qq: { readConversations: [conversationId], sendConversations: [conversationId] },
     plugins: { allowedActions: [...new Set(allowedActions ?? [])], ...(allowedPermissions ? { allowedPermissions: [...new Set(allowedPermissions)] } : {}) },
     artifacts: { readableArtifactAuthorities: ["agent-home"], publishTaskIds: isOwner ? ["*"] : [], allowedDestinations: [conversationId] },

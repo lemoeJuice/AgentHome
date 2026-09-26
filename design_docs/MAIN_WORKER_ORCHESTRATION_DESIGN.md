@@ -1230,13 +1230,15 @@ send_reply
 send_published_artifact
 ```
 
-不直接暴露：
+SnowLuma MCP 同时向 Main 提供固定 Schema 的 Progressive Discovery 工具：
 
 ```text
-invoke_any_snowluma_action(name, params)
+list_actions / search_actions / get_action
+query_action (read-only)
+invoke_action (side effect)
 ```
 
-除非 Authorization 设计明确允许。
+Main 先发现并读取 OneBot action 文档，再使用 `query_action` 或 `invoke_action`。这不是暴露 Pi 原生任意工具；Runtime 对两种通用 action 调用执行 Owner 身份检查并记录审计。Owner 可通过目录中实际存在的 action 操作 QQ，包括向指定用户私聊或处理收到的好友申请；Guest 仅可使用当前 Conversation 的安全封装。普通 Main 回复仍固定发往当前 Conversation。
 
 ---
 
@@ -1246,7 +1248,8 @@ SnowLuma MCP/Action Catalog 用于：
 
 - Main lazy read；
 - Main safe send；
-- 必要 QQ query。
+- Main / Owner turn 的 OneBot action 发现；
+- Owner 授权的 OneBot query / invoke，包括私聊与好友申请管理操作。
 
 Inbound event streaming 不通过 MCP，仍按：
 

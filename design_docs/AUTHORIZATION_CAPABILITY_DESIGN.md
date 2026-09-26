@@ -271,11 +271,14 @@ Owner 在群里发消息时：
 - requester trust 仍然是 OWNER；
 - 但当前长期 Main Conversation Session 仍然是 `group:<id>`；
 - 不得把 `owner_private` Memory 永久注入群 Session；
-- 不得因为一个 Owner turn 永久扩大群 Session 的 capability baseline。
+- 当前 turn 的 requester capabilities 依据 Owner 身份计算，不因群聊类型而降低；
+- turn capability 只用于本次请求及其派生的 Task / Worker，Guest turn 不得继承；
+- Chat send destination 仍限制在当前授权 Conversation。
 
 如果某个 Owner turn 确实需要更高权限操作：
 
 - Runtime 可以计算 turn-scoped capability；
+- 可包含该 Owner 原本具有的 Project / Task 权限；
 - capability 仅属于该请求派生的 Task / Worker；
 - 不回写成整个群 Session 的永久权限；
 - user-facing 输出仍受当前 conversation destination 约束。
@@ -1220,7 +1223,7 @@ MVP 优先使用 Runtime 内结构化 policy + deterministic checks。
 1. **身份来自可信 transport metadata，不来自消息文本。**
 2. **Trust 不等于完整权限。**
 3. **Conversation boundary 参与有效权限计算。**
-4. **Owner 身份不是群聊中的无限 bypass。**
+4. **Owner 权限跟随可信身份；群 Conversation 的 Memory、发送目标和长期 capability baseline 仍受 scope 限制。**
 5. **Main/Worker 可以请求 capability，但不能 grant capability。**
 6. **Task capability 不超过 Main Turn capability。**
 7. **Worker capability 不超过 Task capability。**
