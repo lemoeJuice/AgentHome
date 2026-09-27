@@ -10,6 +10,7 @@ import type { AgentEventController } from "./gateway/router.js";
 import { newId, nowIso } from "./shared/ids.js";
 import type { ControlAck, ControllerEventEnvelope } from "./shared/types.js";
 import type { Logger } from "./shared/logger.js";
+import { proxyEnvironment } from "./runtime/network.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -231,7 +232,8 @@ export class PodmanController implements AgentEventController {
     }
     await execFileAsync(this.podman, ["network", "exists", this.network]).catch(async () => { await execFileAsync(this.podman, ["network", "create", this.network]); });
     await execFileAsync(this.podman, ["volume", "exists", this.volume]).catch(async () => { await execFileAsync(this.podman, ["volume", "create", this.volume]); });
-    await execFileAsync(this.podman, ["run", "-d", "--name", this.containerName, "--cap-add", "NET_ADMIN", ...(this.modelProxyUrl ? ["--env", `AGENT_HOME_MODEL_PROXY_URL=${this.modelProxyUrl}`] : []), "--volume", `${this.volume}:/state:Z,U`, "--network", this.network, this.image, "supervise"]);
+    const proxyArgs = Object.entries(proxyEnvironment(this.modelProxyUrl, `localhost,127.0.0.1,::1,host.containers.internal,snowluma,${this.containerName}`)).flatMap(([name, value]) => ["--env", `${name}=${value}`]);
+    await execFileAsync(this.podman, ["run", "-d", "--name", this.containerName, "--cap-add", "NET_ADMIN", "--env", `AGENT_HOME_MODEL_PROXY_URL=${this.modelProxyUrl ?? ""}`, ...(this.modelProxyUrl ? proxyArgs : []), "--volume", `${this.volume}:/state:Z,U`, "--network", this.network, this.image, "supervise"]);
   }
 
   private async validateContainerTopology(): Promise<void> {

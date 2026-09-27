@@ -80,9 +80,9 @@ if "$PODMAN" container exists "$CONTAINER"; then
   expected_env_match=false
   EXISTING_ENV="$existing_env" ACCEPT_EULA="$ACCEPT_EULA" ACCEPT_PRIVACY="$ACCEPT_PRIVACY" node --input-type=module -e '
     const existing = JSON.parse(process.env.EXISTING_ENV || "[]");
-    for (const [name, value] of [["SNOWLUMA_ACCEPT_EULA", process.env.ACCEPT_EULA], ["SNOWLUMA_ACCEPT_PRIVACY", process.env.ACCEPT_PRIVACY]]) {
-      if (!existing.includes(`${name}=${value}`)) process.exit(1);
-    }
+    const expected = new Map([["SNOWLUMA_ACCEPT_EULA", process.env.ACCEPT_EULA], ["SNOWLUMA_ACCEPT_PRIVACY", process.env.ACCEPT_PRIVACY]]);
+    for (const name of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "NO_PROXY", "no_proxy", "NODE_USE_ENV_PROXY"]) if (!expected.has(name) && existing.some((item) => item.startsWith(`${name}=`))) process.exit(1);
+    for (const [name, value] of expected) if (!existing.includes(`${name}=${value}`)) process.exit(1);
   ' && expected_env_match=true
   if [[ "$existing_image_id" != "$target_image_id" || "$expected_ports_match" != true || "$expected_env_match" != true ]]; then
     "$PODMAN" rm -f "$CONTAINER" >/dev/null
@@ -107,8 +107,8 @@ if ! "$PODMAN" container exists "$CONTAINER"; then
     --volume 'snowluma-gateway-data:/app/data:Z,U'
     --volume 'snowluma-client-config:/app/.config:Z,U'
     --volume 'snowluma-client-data:/app/.local/share:Z,U'
-    "$IMAGE"
   )
+  args+=("$IMAGE")
   "$PODMAN" "${args[@]}" >/dev/null
 elif [[ "$("$PODMAN" container inspect -f '{{.State.Running}}' "$CONTAINER")" != true ]]; then
   "$PODMAN" start "$CONTAINER" >/dev/null

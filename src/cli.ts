@@ -13,12 +13,19 @@ import { bootstrapFromStdin } from "./runtime/bootstrap.js";
 import { spawn } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 import { resolveWebSocketEndpoint } from "./qq/onebot.js";
+import { createProxyRelay } from "./proxy-relay.js";
 
 async function main(): Promise<void> {
   const command = process.argv[2] ?? "help";
   if (command === "bootstrap") { await bootstrapFromStdin(process.env.AGENT_HOME_STATE ?? "/state"); return; }
   if (command === "hold") { await holdProcess(); return; }
   if (command === "supervise") { await superviseRuntime(); return; }
+  if (command === "proxy-relay") {
+    const server = createProxyRelay({ listenPort: Number(process.env.AGENT_HOME_PROXY_RELAY_LISTEN_PORT ?? process.env.AGENT_HOME_PROXY_RELAY_PORT ?? 17890), upstreamHost: process.env.AGENT_HOME_PROXY_RELAY_UPSTREAM_HOST ?? "127.0.0.1", upstreamPort: Number(process.env.AGENT_HOME_PROXY_RELAY_UPSTREAM_PORT ?? process.env.AGENT_HOME_PROXY_UPSTREAM_PORT ?? 7890) });
+    await new Promise<void>((resolve, reject) => { server.once("listening", resolve); server.once("error", reject); });
+    await waitForSignal(() => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())));
+    return;
+  }
   if (command === "help") { process.stdout.write("agent-home gateway|runtime|control stream|control ping|control backup-prepare|control backup-finish|control set-pi-model <provider> <model>|bootstrap|doctor|status\n"); return; }
   let config: Awaited<ReturnType<typeof loadConfig>>;
   try { config = await loadConfig(); } catch (error) {

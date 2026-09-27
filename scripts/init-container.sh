@@ -52,8 +52,29 @@ if "$PODMAN" container exists "$CONTAINER"; then
   EXPECTED_VOLUME="$VOLUME" EXPECTED_NETWORK="$NETWORK" MOUNTS_JSON="$mounts" NETWORKS_JSON="$networks" node --input-type=module -e 'const mounts=JSON.parse(process.env.MOUNTS_JSON); const networks=Object.keys(JSON.parse(process.env.NETWORKS_JSON)); if (mounts.length !== 1 || (mounts[0].Name !== process.env.EXPECTED_VOLUME && mounts[0].Source !== process.env.EXPECTED_VOLUME)) process.exit(1); if (networks.length !== 1 || networks[0] !== process.env.EXPECTED_NETWORK) process.exit(1);' || { printf '%s\n' 'existing Agent Home container has mismatched volume or network topology' >&2; exit 2; }
 fi
 
+if "$PODMAN" container exists "$CONTAINER"; then
+  proxy_url="$(agent_home_model_proxy_url)"
+  existing_env="$("$PODMAN" container inspect -f '{{json .Config.Env}}' "$CONTAINER")"
+  EXISTING_ENV="$existing_env" PROXY_URL="$proxy_url" PROXY_BYPASS="$AGENT_HOME_PROXY_BYPASS" node --input-type=module -e '
+    const existing=new Set(JSON.parse(process.env.EXISTING_ENV||"[]"));
+    const expected=new Map();
+    expected.set("AGENT_HOME_MODEL_PROXY_URL",process.env.PROXY_URL);
+    if(process.env.PROXY_URL){for(const name of ["HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy"])expected.set(name,process.env.PROXY_URL);for(const name of ["NO_PROXY","no_proxy"])expected.set(name,process.env.PROXY_BYPASS);expected.set("NODE_USE_ENV_PROXY","1");}
+    for(const name of ["AGENT_HOME_MODEL_PROXY_URL","HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy","NO_PROXY","no_proxy","NODE_USE_ENV_PROXY"]){const value=[...existing].find((item)=>item.startsWith(`${name}=`));if(expected.has(name)?value!==`${name}=${expected.get(name)}`:Boolean(value))process.exit(1);}
+  ' || {
+    printf '%s\n' 'replacing existing Agent Home container to apply the configured outbound proxy (state volume is retained)'
+    "$PODMAN" rm -f "$CONTAINER" >/dev/null
+  }
+fi
+
 if ! "$PODMAN" container exists "$CONTAINER"; then
   run_args=(run -d --name "$CONTAINER" --cap-add NET_ADMIN --volume "${VOLUME}:/state:Z" --network "$NETWORK")
+  proxy_url="$(agent_home_model_proxy_url)"
+  run_args+=(--env "AGENT_HOME_MODEL_PROXY_URL=$proxy_url")
+  if [[ -n "$proxy_url" ]]; then
+    for proxy_name in HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy; do run_args+=(--env "$proxy_name=$proxy_url"); done
+    run_args+=(--env "NO_PROXY=$AGENT_HOME_PROXY_BYPASS" --env "no_proxy=$AGENT_HOME_PROXY_BYPASS" --env NODE_USE_ENV_PROXY=1)
+  fi
   [[ -n "${AGENT_HOME_MCP_URL:-}" ]] && run_args+=(--env "AGENT_HOME_MCP_URL=${AGENT_HOME_MCP_URL}")
   [[ -n "${AGENT_HOME_MCP_CALLER:-}" ]] && run_args+=(--env "AGENT_HOME_MCP_CALLER=${AGENT_HOME_MCP_CALLER}")
   if [[ -z "${AGENT_HOME_MCP_URL:-}" ]]; then run_args+=(--env "AGENT_HOME_MCP_URL=${AGENT_HOME_MCP_DEFAULT_URL:-http://host.containers.internal:8787/mcp}"); fi
