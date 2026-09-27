@@ -105,6 +105,30 @@ test("loadConfig exposes gateway and network endpoints as deployment settings", 
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test("loadConfig derives the container proxy endpoint from configurable relay ports", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-home-proxy-relay-config-"));
+  const configPath = join(root, "agent-home.json");
+  try {
+    await writeFile(configPath, JSON.stringify({ instanceId: "proxy-relay-config", network: { proxyRelay: { enabled: true, listenPort: 18990, upstreamHost: "127.0.0.1", upstreamPort: 7892 } }, snowluma: { endpoint: "ws://snowluma", apiEndpoint: "http://snowluma" } }));
+    const config = await loadConfig(configPath);
+    assert.equal(config.network.modelProxyUrl, "http://host.containers.internal:18990");
+    assert.deepEqual(config.network.proxyRelay, { enabled: true, listenPort: 18990, upstreamHost: "127.0.0.1", upstreamPort: 7892 });
+    await writeFile(configPath, JSON.stringify({ instanceId: "proxy-relay-config", network: { proxyRelay: { enabled: false, listenPort: 18990, upstreamHost: "127.0.0.1", upstreamPort: 7892 } }, snowluma: { endpoint: "ws://snowluma", apiEndpoint: "http://snowluma" } }));
+    assert.equal((await loadConfig(configPath)).network.modelProxyUrl, undefined);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("loadConfig validates proxy relay ports and upstream host", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-home-proxy-relay-invalid-"));
+  const configPath = join(root, "agent-home.json");
+  try {
+    await writeFile(configPath, JSON.stringify({ instanceId: "proxy-relay-invalid", network: { proxyRelay: { listenPort: 70000, upstreamHost: "127.0.0.1", upstreamPort: 7890 } }, snowluma: { endpoint: "ws://snowluma", apiEndpoint: "http://snowluma" } }));
+    await assert.rejects(loadConfig(configPath), /CONFIG_INVALID: network\.proxyRelay\.listenPort/);
+    await writeFile(configPath, JSON.stringify({ instanceId: "proxy-relay-invalid", network: { proxyRelay: { listenPort: 17890, upstreamHost: "bad host", upstreamPort: 7890 } }, snowluma: { endpoint: "ws://snowluma", apiEndpoint: "http://snowluma" } }));
+    await assert.rejects(loadConfig(configPath), /CONFIG_INVALID: network\.proxyRelay\.upstreamHost/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("SnowLuma credentials are read only from private state", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-config-secret-"));
   try {

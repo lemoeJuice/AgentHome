@@ -9,7 +9,10 @@ export interface AppConfig {
   /** @deprecated Use owners. Kept for existing configuration and integrations. */
   owner?: { platform: string; accountId: string; userId: string };
   gateway: { mcpPort: number; mcpHost?: string; mcpActionTimeoutMs: number };
-  network: { modelProxyUrl?: string };
+  network: {
+    modelProxyUrl?: string;
+    proxyRelay: { enabled: boolean; listenPort: number; upstreamHost: string; upstreamPort: number };
+  };
   paths: { gatewayState: string; pluginData: string; backupDir: string; stateRoot: string; runtimeSocket: string };
   snowluma: {
     accountId: string;
@@ -36,7 +39,7 @@ export interface AppConfig {
 const defaults: AppConfig = {
   instanceId: "default",
   gateway: { mcpPort: 8787, mcpActionTimeoutMs: 30_000 },
-  network: { modelProxyUrl: "http://host.containers.internal:7897" },
+  network: { proxyRelay: { enabled: true, listenPort: 17890, upstreamHost: "127.0.0.1", upstreamPort: 7890 } },
   paths: {
     gatewayState: "./runtime-state/gateway.sqlite",
     pluginData: "./runtime-state/plugin-data",
@@ -101,6 +104,7 @@ export async function loadConfig(path = process.env.AGENT_HOME_CONFIG ?? "./conf
   fileConfig = { ...withoutLegacyOwner, ...(fileConfig.owners !== undefined || legacyOwner ? { owners } : {}) };
   if (fileConfig.owners !== undefined) fileConfig.owners = owners;
   const config = merge(defaults, fileConfig);
+  const explicitModelProxy = Boolean(fileConfig.network && Object.prototype.hasOwnProperty.call(fileConfig.network, "modelProxyUrl"));
   for (const key of ["gatewayState", "pluginData", "backupDir"] as const) {
     if (!config.paths[key].startsWith("/")) config.paths[key] = resolve(configDirectory, config.paths[key]);
   }
@@ -116,6 +120,7 @@ export async function loadConfig(path = process.env.AGENT_HOME_CONFIG ?? "./conf
   if (process.env.GATEWAY_MCP_PORT !== undefined) config.gateway.mcpPort = positiveIntegerEnv("GATEWAY_MCP_PORT", config.gateway.mcpPort);
   if (process.env.GATEWAY_MCP_HOST !== undefined) config.gateway.mcpHost = process.env.GATEWAY_MCP_HOST;
   if (process.env.GATEWAY_MCP_ACTION_TIMEOUT_MS !== undefined) config.gateway.mcpActionTimeoutMs = positiveIntegerEnv("GATEWAY_MCP_ACTION_TIMEOUT_MS", config.gateway.mcpActionTimeoutMs);
+  if (!explicitModelProxy && process.env.AGENT_HOME_MODEL_PROXY_URL === undefined) config.network.modelProxyUrl = config.network.proxyRelay.enabled ? `http://host.containers.internal:${config.network.proxyRelay.listenPort}` : undefined;
   if (process.env.AGENT_HOME_LOG_LEVEL) config.logging.level = process.env.AGENT_HOME_LOG_LEVEL as LogLevel;
   delete (config.runtime as AppConfig["runtime"] & { piProvider?: string }).piProvider;
   delete (config.runtime as AppConfig["runtime"] & { piModel?: string }).piModel;
@@ -131,6 +136,9 @@ export function validateConfig(config: AppConfig): void {
   const required = [config.instanceId, config.snowluma.endpoint, config.snowluma.apiEndpoint];
   if (required.some((value) => !value)) throw new Error("CONFIG_MISSING: instance and SnowLuma endpoints are required");
   if (config.owners?.some((owner) => !owner.platform || !owner.accountId || !owner.userId)) throw new Error("CONFIG_INVALID: owners");
+  if (typeof config.network.proxyRelay.enabled !== "boolean") throw new Error("CONFIG_INVALID: network.proxyRelay.enabled");
+  for (const key of ["listenPort", "upstreamPort"] as const) if (!Number.isInteger(config.network.proxyRelay[key]) || config.network.proxyRelay[key] < 1 || config.network.proxyRelay[key] > 65535) throw new Error(`CONFIG_INVALID: network.proxyRelay.${key}`);
+  if (!/^[A-Za-z0-9.:-]+$/.test(config.network.proxyRelay.upstreamHost)) throw new Error("CONFIG_INVALID: network.proxyRelay.upstreamHost");
   if (!Number.isInteger(config.gateway.mcpPort) || config.gateway.mcpPort < 0 || config.gateway.mcpPort > 65535) throw new Error("CONFIG_INVALID: gateway.mcpPort");
   if (!Number.isSafeInteger(config.gateway.mcpActionTimeoutMs) || config.gateway.mcpActionTimeoutMs < 1) throw new Error("CONFIG_INVALID: gateway.mcpActionTimeoutMs");
   if (!Number.isInteger(config.runtime.maxInFlight) || config.runtime.maxInFlight < 1) throw new Error("CONFIG_INVALID: runtime.maxInFlight");

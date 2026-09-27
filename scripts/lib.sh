@@ -94,6 +94,25 @@ for snowluma_consent in "$SNOWLUMA_ACCEPT_EULA" "$SNOWLUMA_ACCEPT_PRIVACY"; do
 done
 export SNOWLUMA_CONFIG_FILE SNOWLUMA_CONTAINER SNOWLUMA_NETWORK SNOWLUMA_SERVICE_BIND_ADDRESS SNOWLUMA_UI_BIND_ADDRESS SNOWLUMA_HTTP_PORT SNOWLUMA_WS_PORT SNOWLUMA_WEBUI_PORT SNOWLUMA_NOVNC_PORT SNOWLUMA_ACCEPT_EULA SNOWLUMA_ACCEPT_PRIVACY
 
+agent_home_model_proxy_url() {
+  if [[ -v AGENT_HOME_MODEL_PROXY_URL ]]; then
+    printf '%s' "$AGENT_HOME_MODEL_PROXY_URL"
+    return
+  fi
+  local config_path="${AGENT_HOME_CONFIG:-$ROOT_DIR/config/agent-home.json}"
+  if [[ "$config_path" != /* ]]; then config_path="$ROOT_DIR/$config_path"; fi
+  CONFIG_PATH="$config_path" node --input-type=module -e 'import fs from "node:fs"; const config=JSON.parse(fs.readFileSync(process.env.CONFIG_PATH,"utf8")); const network=config.network??{}; if(Object.hasOwn(network,"modelProxyUrl")){process.stdout.write(network.modelProxyUrl??"");}else{const relay=network.proxyRelay??{enabled:true,listenPort:17890};process.stdout.write(relay.enabled===false?"":`http://host.containers.internal:${relay.listenPort??17890}`);}'
+}
+
+agent_home_proxy_relay_settings() {
+  local config_path="${AGENT_HOME_CONFIG:-$ROOT_DIR/config/agent-home.json}"
+  if [[ "$config_path" != /* ]]; then config_path="$ROOT_DIR/$config_path"; fi
+  CONFIG_PATH="$config_path" node --input-type=module -e 'import fs from "node:fs";const config=JSON.parse(fs.readFileSync(process.env.CONFIG_PATH,"utf8"));const relay=config.network?.proxyRelay??{enabled:true,listenPort:17890,upstreamHost:"127.0.0.1",upstreamPort:7890};const values=[relay.enabled===false?"0":"1",relay.listenPort??17890,relay.upstreamHost??"127.0.0.1",relay.upstreamPort??7890];if(values.some((value)=>String(value).includes("\n")||String(value).includes("\t")))process.exit(2);process.stdout.write(values.join("\t"));'
+}
+
+AGENT_HOME_PROXY_BYPASS="localhost,127.0.0.1,::1,host.containers.internal,$SNOWLUMA_CONTAINER,$AGENT_HOME_CONTAINER"
+export AGENT_HOME_PROXY_BYPASS
+
 for topology_name in "$AGENT_HOME_VOLUME" "$AGENT_HOME_NETWORK" "$AGENT_HOME_CONTAINER"; do
   if [[ ! "$topology_name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$ ]]; then
     printf '%s\n' "unsafe Podman topology name: $topology_name" >&2
