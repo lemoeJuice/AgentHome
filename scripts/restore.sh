@@ -10,9 +10,7 @@ CONTAINER="$AGENT_HOME_CONTAINER"
 SNOWLUMA_CONTAINER="${SNOWLUMA_CONTAINER:-snowluma}"
 SNOWLUMA_VOLUMES=(snowluma-gateway-data snowluma-client-config snowluma-client-data)
 CONFIG_PATH="${AGENT_HOME_CONFIG:-$ROOT_DIR/config/agent-home.json}"
-OWNER_CONFIG_PATH="${AGENT_HOME_OWNER_CONFIG:-$(dirname "$CONFIG_PATH")/owner.json}"
 if [[ "$CONFIG_PATH" != /* ]]; then CONFIG_PATH="$ROOT_DIR/$CONFIG_PATH"; fi
-if [[ "$OWNER_CONFIG_PATH" != /* ]]; then OWNER_CONFIG_PATH="$ROOT_DIR/$OWNER_CONFIG_PATH"; fi
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 STAGING_VOLUME="${VOLUME}.restore-${STAMP}"
 OLD_VOLUME="${VOLUME}.pre-restore-${STAMP}"
@@ -23,7 +21,7 @@ validate_manifest() {
   node --input-type=module - \
     "$BACKUP/manifest.json" "$BACKUP/state.tar" "$BACKUP/image.tar" "$BACKUP/gateway.sqlite" \
     "$BACKUP/plugin-data.tar.gz" "$BACKUP/gateway-artifacts.tar.gz" "$BACKUP/deployment-secrets.tar.gz" \
-    "$BACKUP/deployment-config.json" "$BACKUP/owner.json" "$BACKUP/snowluma-gateway-data.tar" \
+    "$BACKUP/deployment-config.json" "$BACKUP/snowluma-gateway-data.tar" \
     "$BACKUP/snowluma-client-config.tar" "$BACKUP/snowluma-client-data.tar" <<'NODE'
 import fs from "node:fs";
 import crypto from "node:crypto";
@@ -39,7 +37,7 @@ const check = (field, path) => manifest[field] === undefined || manifest[field] 
 const validSchema = Number.isInteger(runtimeSchema) && runtimeSchema <= runtime
   && Number.isInteger(gatewaySchema) && gatewaySchema <= gateway;
 const valid = manifest.format === "agent-home-deployment"
-  && manifest.version === 4
+  && manifest.version === 5
   && typeof manifest.image === "string"
   && manifest.image.length > 0
   && validSchema
@@ -50,10 +48,9 @@ const valid = manifest.format === "agent-home-deployment"
   && check("gatewayArtifactsSha256", files[4])
   && check("deploymentSecretsSha256", files[5])
   && check("deploymentConfigSha256", files[6])
-  && check("ownerConfigSha256", files[7])
-  && check("snowlumaGatewayDataSha256", files[8])
-  && check("snowlumaClientConfigSha256", files[9])
-  && check("snowlumaClientDataSha256", files[10]);
+  && check("snowlumaGatewayDataSha256", files[7])
+  && check("snowlumaClientConfigSha256", files[8])
+  && check("snowlumaClientDataSha256", files[9]);
 if (!valid) process.exit(1);
 process.stdout.write(String(manifest.version));
 NODE
@@ -85,7 +82,7 @@ STAGING_VOLUME_CREATED=false
 RESTORE_COMMITTED=false
 
 recreate_container() {
-  AGENT_HOME_IMAGE="$CONTAINER_IMAGE" AGENT_HOME_CONFIG="$CONFIG_PATH" AGENT_HOME_OWNER_CONFIG="$OWNER_CONFIG_PATH" bash "$ROOT_DIR/scripts/init-container.sh"
+  AGENT_HOME_IMAGE="$CONTAINER_IMAGE" AGENT_HOME_CONFIG="$CONFIG_PATH" bash "$ROOT_DIR/scripts/init-container.sh"
   if [[ "$CONTAINER_WAS_PRESENT" == true && "$CONTAINER_WAS_RUNNING" != true ]]; then "$PODMAN" stop "$CONTAINER" >/dev/null; fi
 }
 
@@ -139,7 +136,6 @@ if [[ -f "$BACKUP/deployment-secrets.tar.gz" ]]; then
   done
 fi
 if [[ -f "$BACKUP/deployment-config.json" ]]; then mkdir -p "$(dirname "$CONFIG_PATH")"; cp "$BACKUP/deployment-config.json" "$CONFIG_PATH"; chmod 600 "$CONFIG_PATH"; fi
-if [[ -f "$BACKUP/owner.json" ]]; then mkdir -p "$(dirname "$OWNER_CONFIG_PATH")"; cp "$BACKUP/owner.json" "$OWNER_CONFIG_PATH"; chmod 600 "$OWNER_CONFIG_PATH"; fi
 if [[ -f "$BACKUP/snowluma.env" ]]; then mkdir -p "$ROOT_DIR/config"; cp "$BACKUP/snowluma.env" "$ROOT_DIR/config/snowluma.env"; chmod 600 "$ROOT_DIR/config/snowluma.env"; fi
 for snowluma_volume in "${SNOWLUMA_VOLUMES[@]}"; do
   if [[ -f "$BACKUP/$snowluma_volume.tar" ]]; then

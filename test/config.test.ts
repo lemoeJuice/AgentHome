@@ -5,14 +5,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig, snowlumaAccessToken, snowlumaWebSocketAccessToken } from "../src/config.ts";
 
-test("loadConfig reads Bot Owner identity from the separate owner config", async () => {
+test("loadConfig reads multiple Bot Owner identities from the main config", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-config-"));
   const configPath = join(root, "agent-home.json");
   try {
-    await writeFile(configPath, JSON.stringify({ instanceId: "config-test", snowluma: { endpoint: "ws://snowluma", apiEndpoint: "http://snowluma" } }));
-    await writeFile(join(root, "owner.json"), JSON.stringify({ platform: "qq", accountId: "bot-1", userId: "owner-1" }));
+    await writeFile(configPath, JSON.stringify({ instanceId: "config-test", owners: [{ platform: "qq", accountId: "bot-1", userId: "owner-1" }, { platform: "qq", accountId: "bot-1", userId: "owner-2" }], snowluma: { endpoint: "ws://snowluma", apiEndpoint: "http://snowluma" } }));
     const config = await loadConfig(configPath);
-    assert.deepEqual(config.owner, { platform: "qq", accountId: "bot-1", userId: "owner-1" });
+    assert.deepEqual(config.owners, [{ platform: "qq", accountId: "bot-1", userId: "owner-1" }, { platform: "qq", accountId: "bot-1", userId: "owner-2" }]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -24,7 +23,7 @@ test("loadConfig accepts an unconfigured deployment without an Owner", async () 
   try {
     await writeFile(configPath, JSON.stringify({ instanceId: "config-no-owner", snowluma: { endpoint: "ws://snowluma", apiEndpoint: "http://snowluma" } }));
     const config = await loadConfig(configPath);
-    assert.equal(config.owner, undefined);
+    assert.equal(config.owners, undefined);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -93,6 +92,17 @@ test("loadConfig reads the configurable Main persona", async () => {
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("loadConfig exposes gateway and network endpoints as deployment settings", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-home-config-network-"));
+  const configPath = join(root, "agent-home.json");
+  try {
+    await writeFile(configPath, JSON.stringify({ instanceId: "config-network", gateway: { mcpPort: 9123, mcpHost: "127.0.0.1", mcpActionTimeoutMs: 45000 }, network: { modelProxyUrl: "http://proxy.internal:8080" }, snowluma: { endpoint: "ws://snowluma", apiEndpoint: "http://snowluma" } }));
+    const config = await loadConfig(configPath);
+    assert.deepEqual(config.gateway, { mcpPort: 9123, mcpHost: "127.0.0.1", mcpActionTimeoutMs: 45000 });
+    assert.equal(config.network.modelProxyUrl, "http://proxy.internal:8080");
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 test("SnowLuma credentials are read only from private state", async () => {

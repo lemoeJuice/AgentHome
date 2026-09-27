@@ -5,7 +5,11 @@ import type { LogLevel } from "./shared/logger.js";
 
 export interface AppConfig {
   instanceId: string;
+  owners?: Array<{ platform: string; accountId: string; userId: string }>;
+  /** @deprecated Use owners. Kept for existing configuration and integrations. */
   owner?: { platform: string; accountId: string; userId: string };
+  gateway: { mcpPort: number; mcpHost?: string; mcpActionTimeoutMs: number };
+  network: { modelProxyUrl?: string };
   paths: { gatewayState: string; pluginData: string; backupDir: string; stateRoot: string; runtimeSocket: string };
   snowluma: {
     accountId: string;
@@ -31,6 +35,8 @@ export interface AppConfig {
 
 const defaults: AppConfig = {
   instanceId: "default",
+  gateway: { mcpPort: 8787, mcpActionTimeoutMs: 30_000 },
+  network: { modelProxyUrl: "http://host.containers.internal:7897" },
   paths: {
     gatewayState: "./runtime-state/gateway.sqlite",
     pluginData: "./runtime-state/plugin-data",
@@ -87,18 +93,13 @@ export async function loadConfig(path = process.env.AGENT_HOME_CONFIG ?? "./conf
       fileConfig = { ...bootstrap, paths: { ...defaults.paths, stateRoot } };
     } catch { /* doctor will report the missing configuration below */ }
   }
-  const ownerPath = resolve(process.env.AGENT_HOME_OWNER_CONFIG ?? `${configDirectory}/owner.json`);
-  try {
-    const owner = JSON.parse(await readFile(ownerPath, "utf8")) as Partial<NonNullable<AppConfig["owner"]>>;
-    if (owner.platform && owner.accountId && owner.userId && !owner.userId.startsWith("REPLACE_")) {
-      fileConfig = { ...fileConfig, owner: { platform: owner.platform, accountId: owner.accountId, userId: owner.userId } };
-    } else if (fileConfig.owner && (!fileConfig.owner.platform || !fileConfig.owner.accountId || !fileConfig.owner.userId || fileConfig.owner.userId.startsWith("REPLACE_"))) {
-      const { owner: _ignoredOwner, ...withoutOwner } = fileConfig;
-      fileConfig = withoutOwner;
-    }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
+  const legacyOwner = fileConfig.owner;
+  const configuredOwners = fileConfig.owners ?? (legacyOwner ? [legacyOwner] : []);
+  if (!Array.isArray(configuredOwners) || configuredOwners.some((owner) => !owner || typeof owner.platform !== "string" || typeof owner.accountId !== "string" || typeof owner.userId !== "string")) throw new Error("CONFIG_INVALID: owners");
+  const owners = configuredOwners.filter((owner) => owner.platform && owner.accountId && owner.userId && !owner.userId.startsWith("REPLACE_"));
+  const { owner: _legacyOwner, ...withoutLegacyOwner } = fileConfig;
+  fileConfig = { ...withoutLegacyOwner, ...(fileConfig.owners !== undefined || legacyOwner ? { owners } : {}) };
+  if (fileConfig.owners !== undefined) fileConfig.owners = owners;
   const config = merge(defaults, fileConfig);
   for (const key of ["gatewayState", "pluginData", "backupDir"] as const) {
     if (!config.paths[key].startsWith("/")) config.paths[key] = resolve(configDirectory, config.paths[key]);
@@ -111,6 +112,10 @@ export async function loadConfig(path = process.env.AGENT_HOME_CONFIG ?? "./conf
   // space. The former 2 GiB RLIMIT_AS prevented Pi from starting and broke fetch/npm.
   if (config.guest.memoryBytes === 2 * 1024 * 1024 * 1024) config.guest.memoryBytes = 16 * 1024 * 1024 * 1024;
   if (process.env.AGENT_HOME_WORKER_SANDBOX) config.runtime.workerSandboxCommand = process.env.AGENT_HOME_WORKER_SANDBOX;
+  if (process.env.AGENT_HOME_MODEL_PROXY_URL !== undefined) config.network.modelProxyUrl = process.env.AGENT_HOME_MODEL_PROXY_URL || undefined;
+  if (process.env.GATEWAY_MCP_PORT !== undefined) config.gateway.mcpPort = positiveIntegerEnv("GATEWAY_MCP_PORT", config.gateway.mcpPort);
+  if (process.env.GATEWAY_MCP_HOST !== undefined) config.gateway.mcpHost = process.env.GATEWAY_MCP_HOST;
+  if (process.env.GATEWAY_MCP_ACTION_TIMEOUT_MS !== undefined) config.gateway.mcpActionTimeoutMs = positiveIntegerEnv("GATEWAY_MCP_ACTION_TIMEOUT_MS", config.gateway.mcpActionTimeoutMs);
   if (process.env.AGENT_HOME_LOG_LEVEL) config.logging.level = process.env.AGENT_HOME_LOG_LEVEL as LogLevel;
   delete (config.runtime as AppConfig["runtime"] & { piProvider?: string }).piProvider;
   delete (config.runtime as AppConfig["runtime"] & { piModel?: string }).piModel;
@@ -118,9 +123,16 @@ export async function loadConfig(path = process.env.AGENT_HOME_CONFIG ?? "./conf
   return config;
 }
 
+export function configuredOwners(config: Pick<AppConfig, "owners" | "owner">): NonNullable<AppConfig["owners"]> {
+  return config.owners ?? (config.owner ? [config.owner] : []);
+}
+
 export function validateConfig(config: AppConfig): void {
   const required = [config.instanceId, config.snowluma.endpoint, config.snowluma.apiEndpoint];
   if (required.some((value) => !value)) throw new Error("CONFIG_MISSING: instance and SnowLuma endpoints are required");
+  if (config.owners?.some((owner) => !owner.platform || !owner.accountId || !owner.userId)) throw new Error("CONFIG_INVALID: owners");
+  if (!Number.isInteger(config.gateway.mcpPort) || config.gateway.mcpPort < 0 || config.gateway.mcpPort > 65535) throw new Error("CONFIG_INVALID: gateway.mcpPort");
+  if (!Number.isSafeInteger(config.gateway.mcpActionTimeoutMs) || config.gateway.mcpActionTimeoutMs < 1) throw new Error("CONFIG_INVALID: gateway.mcpActionTimeoutMs");
   if (!Number.isInteger(config.runtime.maxInFlight) || config.runtime.maxInFlight < 1) throw new Error("CONFIG_INVALID: runtime.maxInFlight");
   if (!Number.isInteger(config.runtime.maxWorkers) || config.runtime.maxWorkers < 1) throw new Error("CONFIG_INVALID: runtime.maxWorkers");
   for (const key of ["maxWorkersTotal", "maxWorkersPerProject", "maxWorkersPerRequester", "maxTasks", "maxTasksPerRequester", "maxTasksPerPrincipal"] as const) if (!Number.isInteger(config.runtime[key]) || config.runtime[key] < 1) throw new Error(`CONFIG_INVALID: runtime.${key}`);
@@ -132,6 +144,14 @@ export function validateConfig(config: AppConfig): void {
   if (!Number.isInteger(config.memory.maxPromptBytes) || config.memory.maxPromptBytes < 1024) throw new Error("CONFIG_INVALID: memory.maxPromptBytes");
   if (config.chat.qq.naturalLanguageMode !== "observe_all" && config.chat.qq.naturalLanguageMode !== "explicit_wake") throw new Error("CONFIG_INVALID: naturalLanguageMode");
   if (typeof config.agent.persona !== "string" || config.agent.persona.length > 12_000) throw new Error("CONFIG_INVALID: agent.persona");
+}
+
+function positiveIntegerEnv(name: string, fallback: number): number {
+  const value = process.env[name];
+  if (value === undefined) return fallback;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) throw new Error(`${name}_INVALID`);
+  return parsed;
 }
 
 export function snowlumaAccessToken(config: AppConfig): string | undefined {

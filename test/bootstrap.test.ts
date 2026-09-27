@@ -12,11 +12,12 @@ test("bootstrap initializes private state and schema without provider credential
     const child = spawn(process.execPath, ["--experimental-strip-types", "--experimental-loader", "./scripts/ts-loader.mjs", "src/cli.ts", "bootstrap"], { cwd: process.cwd(), env: { ...process.env, AGENT_HOME_STATE: root }, stdio: ["pipe", "pipe", "pipe"] });
     let output = "";
     child.stdout.on("data", (chunk) => { output += String(chunk); });
-    child.stdin.end(JSON.stringify({ format: "agent-home-bootstrap", version: 1, instanceId: "test", owner: { platform: "qq", userId: "owner" }, snowluma: { endpoint: "ws://snowluma:3001" } }));
+    child.stdin.end(JSON.stringify({ format: "agent-home-bootstrap", version: 1, instanceId: "test", owners: [{ platform: "qq", userId: "owner-1" }, { platform: "qq", userId: "owner-2" }], snowluma: { endpoint: "ws://snowluma:3001" } }));
     const exitCode = await new Promise<number>((resolve) => child.once("exit", (code) => resolve(code ?? 1)));
     assert.equal(exitCode, 0);
-    const config = JSON.parse(await readFile(join(root, "config/bootstrap.json"), "utf8")) as { snowluma: { apiEndpoint: string } };
+    const config = JSON.parse(await readFile(join(root, "config/bootstrap.json"), "utf8")) as { snowluma: { apiEndpoint: string }; owners: Array<{ userId: string }> };
     assert.equal(config.snowluma.apiEndpoint, "http://127.0.0.1:3000");
+    assert.deepEqual(config.owners.map((owner) => owner.userId), ["owner-1", "owner-2"]);
     const db = new SqliteStore(join(root, "data/agent.db"));
     assert.equal(db.get<{ version: number }>("SELECT max(version) AS version FROM schema_migrations")?.version, 19);
     db.close();
@@ -32,8 +33,8 @@ test("bootstrap accepts a deployment without an Owner", async () => {
     child.stdin.end(JSON.stringify({ format: "agent-home-bootstrap", version: 1, instanceId: "no-owner", snowluma: { endpoint: "ws://snowluma:3001" } }));
     const exitCode = await new Promise<number>((resolve) => child.once("exit", (code) => resolve(code ?? 1)));
     assert.equal(exitCode, 0);
-    const config = JSON.parse(await readFile(join(root, "config/bootstrap.json"))) as { owner?: unknown };
-    assert.equal(config.owner, undefined);
+    const config = JSON.parse(await readFile(join(root, "config/bootstrap.json"))) as { owners?: unknown };
+    assert.equal(config.owners, undefined);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

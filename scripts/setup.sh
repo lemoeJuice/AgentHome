@@ -12,18 +12,8 @@ mkdir -p config runtime-state/plugin-data backups
 mkdir -p .agent-home
 CONFIG_PATH="${AGENT_HOME_CONFIG:-$ROOT_DIR/config/agent-home.json}"
 if [[ "$CONFIG_PATH" != /* ]]; then CONFIG_PATH="$ROOT_DIR/$CONFIG_PATH"; fi
-OWNER_CONFIG_PATH="${AGENT_HOME_OWNER_CONFIG:-$(dirname "$CONFIG_PATH")/owner.json}"
-if [[ "$OWNER_CONFIG_PATH" != /* ]]; then OWNER_CONFIG_PATH="$ROOT_DIR/$OWNER_CONFIG_PATH"; fi
 case "$CONFIG_PATH" in "$ROOT_DIR"/*) ;; *) printf '%s\n' 'AGENT_HOME_CONFIG must be inside the project directory' >&2; exit 2 ;; esac
-case "$OWNER_CONFIG_PATH" in "$ROOT_DIR"/*) ;; *) printf '%s\n' 'AGENT_HOME_OWNER_CONFIG must be inside the project directory' >&2; exit 2 ;; esac
 mkdir -p "$(dirname "$CONFIG_PATH")"
-if [[ ! -e "$OWNER_CONFIG_PATH" ]]; then
-  mkdir -p "$(dirname "$OWNER_CONFIG_PATH")"
-  cp "$ROOT_DIR/config/owner.example.json" "$OWNER_CONFIG_PATH"
-  chmod 600 "$OWNER_CONFIG_PATH"
-  printf 'created optional Bot Owner config template: %s\n' "$OWNER_CONFIG_PATH" >&2
-fi
-OWNER_CONFIG_PATH="$OWNER_CONFIG_PATH" node --input-type=module -e 'import fs from "node:fs"; const owner=JSON.parse(fs.readFileSync(process.env.OWNER_CONFIG_PATH,"utf8")); const configured=owner.userId && !owner.userId.startsWith("REPLACE_"); if (configured && (!owner.platform || !owner.accountId)) process.exit(1);' || { printf 'invalid Bot Owner config: %s\n' "$OWNER_CONFIG_PATH" >&2; exit 2; }
 if [[ ! -s .agent-home/control-token ]]; then
   node --input-type=module -e 'import crypto from "node:crypto"; process.stdout.write(crypto.randomBytes(32).toString("hex")+"\n")' >.agent-home/control-token
   chmod 600 .agent-home/control-token
@@ -53,7 +43,7 @@ if [[ ! -s .agent-home/mcp-control-token ]]; then
 fi
 export GATEWAY_MCP_TOKEN="$(<.agent-home/mcp-main-token)"
 export GATEWAY_MCP_CONTROL_TOKEN="$(<.agent-home/mcp-control-token)"
-if [[ ! -e "$CONFIG_PATH" ]]; then cp "$ROOT_DIR/config.example.json" "$CONFIG_PATH"; chmod 600 "$CONFIG_PATH"; printf '%s\n' "created $CONFIG_PATH; set SnowLuma endpoints before starting" >&2; fi
+if [[ ! -e "$CONFIG_PATH" ]]; then cp "$ROOT_DIR/config/agent-home.example.json" "$CONFIG_PATH"; chmod 600 "$CONFIG_PATH"; printf '%s\n' "created $CONFIG_PATH; set SnowLuma endpoints before starting" >&2; fi
 
 DEPS_FINGERPRINT="$(node --input-type=module -e 'import fs from "node:fs";import crypto from "node:crypto";const h=crypto.createHash("sha256");for(const p of ["package.json","pnpm-lock.yaml","package-lock.json"]){if(fs.existsSync(p)){h.update(p);h.update("\0");h.update(fs.readFileSync(p));h.update("\0")}}process.stdout.write(h.digest("hex"))')"
 DEPS_STAMP="$ROOT_DIR/.agent-home/host-deps-lock.sha256"

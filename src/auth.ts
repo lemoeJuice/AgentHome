@@ -8,11 +8,12 @@ export interface PluginCapabilityPolicy {
   guestTaskExecutionEnabled?: boolean;
 }
 
-export function deriveCapabilities(requester: RequesterContext, conversation: ConversationAddress, owner: { platform: string; accountId: string; userId: string } | undefined, conversationId: string, policy: PluginCapabilityPolicy = {}): CapabilitySet {
-  const isOwnerIdentity = Boolean(owner && (
-    (requester.platform === owner.platform && requester.accountId === owner.accountId && requester.userId === owner.userId)
-    || requester.principalId === "principal:owner"
-  ));
+export type OwnerIdentity = { platform: string; accountId: string; userId: string };
+
+export function deriveCapabilities(requester: RequesterContext, conversation: ConversationAddress, owners: OwnerIdentity | OwnerIdentity[] | undefined, conversationId: string, policy: PluginCapabilityPolicy = {}): CapabilitySet {
+  const configuredOwners = owners ? (Array.isArray(owners) ? owners : [owners]) : [];
+  const isOwnerIdentity = configuredOwners.some((owner) => requester.platform === owner.platform && requester.accountId === owner.accountId && requester.userId === owner.userId)
+    || Boolean(configuredOwners.length && requester.principalId === "principal:owner");
   const isOwner = requester.trust === "OWNER" && isOwnerIdentity;
   const trust: Trust = isOwner ? "OWNER" : "GUEST";
   const principalScope = requester.principalId ?? requester.userId;

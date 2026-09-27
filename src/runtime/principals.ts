@@ -43,14 +43,14 @@ export class PrincipalService {
     });
   }
 
-  backfillTaskPrincipals(configuredOwner?: { platform: string; accountId: string; userId: string }, guestTaskTimeoutMs = 30 * 60 * 1000): void {
+  backfillTaskPrincipals(configuredOwners?: { platform: string; accountId: string; userId: string } | Array<{ platform: string; accountId: string; userId: string }>, guestTaskTimeoutMs = 30 * 60 * 1000): void {
     const rows = this.db.all<{ id: string; requester_json: string; trust: Trust }>("SELECT id,requester_json,trust FROM tasks WHERE principal_id IS NULL OR principal_id='' ");
     for (const row of rows) {
       let requester: { platform?: string; accountId?: string; userId?: string; principalId?: string; runtimeUid?: number; runtimeGid?: number };
       try { requester = JSON.parse(row.requester_json) as typeof requester; } catch { throw new Error(`TASK_REQUESTER_INVALID:${row.id}`); }
       let principalId = requester.principalId;
       if (!principalId && requester.platform && requester.accountId && requester.userId) {
-        principalId = this.resolveIdentity(requester.platform, requester.accountId, requester.userId, configuredOwner).principalId;
+        principalId = this.resolveIdentity(requester.platform, requester.accountId, requester.userId, configuredOwners).principalId;
       }
       if (!principalId) continue;
       const principal = this.get(principalId);
@@ -83,8 +83,8 @@ export class PrincipalService {
     }
   }
 
-  resolveIdentity(platform: string, accountId: string, externalId: string, configuredOwner?: { platform: string; accountId: string; userId: string }): { principalId: string; trust: Trust } {
-    const isConfiguredOwner = Boolean(configuredOwner && platform === configuredOwner.platform && accountId === configuredOwner.accountId && externalId === configuredOwner.userId);
+  resolveIdentity(platform: string, accountId: string, externalId: string, configuredOwners?: { platform: string; accountId: string; userId: string } | Array<{ platform: string; accountId: string; userId: string }>): { principalId: string; trust: Trust } {
+    const isConfiguredOwner = (configuredOwners ? (Array.isArray(configuredOwners) ? configuredOwners : [configuredOwners]) : []).some((owner) => platform === owner.platform && accountId === owner.accountId && externalId === owner.userId);
     return this.db.transaction(() => {
       if (isConfiguredOwner) {
         this.ensureRuntimeIdentity(OWNER_PRINCIPAL_ID, "OWNER");

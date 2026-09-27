@@ -12,9 +12,7 @@ PODMAN="$PODMAN_COMMAND"
 CONTAINER="$AGENT_HOME_CONTAINER"
 SNOWLUMA_VOLUMES=(snowluma-gateway-data snowluma-client-config snowluma-client-data)
 CONFIG_PATH="${AGENT_HOME_CONFIG:-$ROOT_DIR/config/agent-home.json}"
-OWNER_CONFIG_PATH="${AGENT_HOME_OWNER_CONFIG:-$(dirname "$CONFIG_PATH")/owner.json}"
 if [[ "$CONFIG_PATH" != /* ]]; then CONFIG_PATH="$ROOT_DIR/$CONFIG_PATH"; fi
-if [[ "$OWNER_CONFIG_PATH" != /* ]]; then OWNER_CONFIG_PATH="$ROOT_DIR/$OWNER_CONFIG_PATH"; fi
 GATEWAY_WAS_RUNNING=false
 CONTAINER_WAS_RUNNING=false
 RUNTIME_WAS_QUIESCED=false
@@ -61,7 +59,7 @@ done
 [[ -d runtime-state/plugin-data ]] && tar -czf "$DEST/plugin-data.tar.gz" -C runtime-state plugin-data
 [[ -d runtime-state/gateway-artifacts ]] && tar -czf "$DEST/gateway-artifacts.tar.gz" -C runtime-state gateway-artifacts
 [[ -f "$ROOT_DIR/config/snowluma.env" ]] && cp "$ROOT_DIR/config/snowluma.env" "$DEST/snowluma.env" && chmod 600 "$DEST/snowluma.env"
-cp config.example.json "$DEST/config.example.json"
+cp config/agent-home.example.json "$DEST/config.example.json"
 SECRET_FILES=()
 for secret in .agent-home/control-token .agent-home/artifact-transfer-secret .agent-home/gateway-artifact-transfer-secret .agent-home/mcp-main-token .agent-home/mcp-control-token .agent-home/mcp-worker-bindings.json .agent-home/snowluma-access-token .agent-home/snowluma-websocket-access-token; do
   [[ -f "$ROOT_DIR/$secret" ]] && SECRET_FILES+=("$secret")
@@ -71,9 +69,37 @@ if ((${#SECRET_FILES[@]} > 0)); then
   chmod 600 "$DEST/deployment-secrets.tar.gz"
 fi
 [[ -f "$CONFIG_PATH" ]] && cp "$CONFIG_PATH" "$DEST/deployment-config.json" && chmod 600 "$DEST/deployment-config.json"
-[[ -f "$OWNER_CONFIG_PATH" ]] && cp "$OWNER_CONFIG_PATH" "$DEST/owner.json" && chmod 600 "$DEST/owner.json"
 IMAGE="$AGENT_HOME_IMAGE"
-  IMAGE="$IMAGE" VOLUME="$VOLUME" CONTAINER="$CONTAINER" STAMP="$STAMP" RUNTIME_SCHEMA_VERSION="$RUNTIME_SCHEMA_VERSION" GATEWAY_SCHEMA_VERSION="$GATEWAY_SCHEMA_VERSION" node --input-type=module -e 'import fs from "node:fs"; import crypto from "node:crypto"; const hash=(path)=>fs.existsSync(path)?crypto.createHash("sha256").update(fs.readFileSync(path)).digest("hex"):undefined; const manifest={ format: "agent-home-deployment", version: 4, schemaVersion: Number(process.env.RUNTIME_SCHEMA_VERSION), runtimeSchemaVersion: Number(process.env.RUNTIME_SCHEMA_VERSION), gatewaySchemaVersion: Number(process.env.GATEWAY_SCHEMA_VERSION), createdAt: process.env.STAMP, image: process.env.IMAGE, volume: process.env.VOLUME, container: process.env.CONTAINER, stateTarSha256: hash(process.argv[2]), imageArchiveSha256: hash(process.argv[9]), ...(hash(process.argv[3]) ? { gatewaySqliteSha256: hash(process.argv[3]) } : {}), ...(hash(process.argv[4]) ? { pluginDataSha256: hash(process.argv[4]) } : {}), ...(hash(process.argv[5]) ? { gatewayArtifactsSha256: hash(process.argv[5]) } : {}), ...(hash(process.argv[6]) ? { deploymentSecretsSha256: hash(process.argv[6]) } : {}), ...(hash(process.argv[7]) ? { deploymentConfigSha256: hash(process.argv[7]) } : {}), ...(hash(process.argv[8]) ? { ownerConfigSha256: hash(process.argv[8]) } : {}), ...(hash(process.argv[10]) ? { snowlumaGatewayDataSha256: hash(process.argv[10]) } : {}), ...(hash(process.argv[11]) ? { snowlumaClientConfigSha256: hash(process.argv[11]) } : {}), ...(hash(process.argv[12]) ? { snowlumaClientDataSha256: hash(process.argv[12]) } : {}), providerConfiguration: "SKIPPED_USER_ACTION_REQUIRED" }; fs.writeFileSync(process.argv[1], JSON.stringify(manifest, null, 2)+"\n", { mode: 0o600 });' "$DEST/manifest.json" "$DEST/state.tar" "$DEST/gateway.sqlite" "$DEST/plugin-data.tar.gz" "$DEST/gateway-artifacts.tar.gz" "$DEST/deployment-secrets.tar.gz" "$DEST/deployment-config.json" "$DEST/owner.json" "$DEST/image.tar" "$DEST/snowluma-gateway-data.tar" "$DEST/snowluma-client-config.tar" "$DEST/snowluma-client-data.tar"
+  IMAGE="$IMAGE" VOLUME="$VOLUME" CONTAINER="$CONTAINER" STAMP="$STAMP" RUNTIME_SCHEMA_VERSION="$RUNTIME_SCHEMA_VERSION" GATEWAY_SCHEMA_VERSION="$GATEWAY_SCHEMA_VERSION" node --input-type=module - "$DEST/manifest.json" "$DEST/state.tar" "$DEST/gateway.sqlite" "$DEST/plugin-data.tar.gz" "$DEST/gateway-artifacts.tar.gz" "$DEST/deployment-secrets.tar.gz" "$DEST/deployment-config.json" "$DEST/image.tar" "$DEST/snowluma-gateway-data.tar" "$DEST/snowluma-client-config.tar" "$DEST/snowluma-client-data.tar" <<'NODE'
+import fs from "node:fs";
+import crypto from "node:crypto";
+
+const [manifestPath, ...files] = process.argv.slice(1);
+const hash = (path) => fs.existsSync(path) ? crypto.createHash("sha256").update(fs.readFileSync(path)).digest("hex") : undefined;
+const manifest = {
+  format: "agent-home-deployment",
+  version: 5,
+  schemaVersion: Number(process.env.RUNTIME_SCHEMA_VERSION),
+  runtimeSchemaVersion: Number(process.env.RUNTIME_SCHEMA_VERSION),
+  gatewaySchemaVersion: Number(process.env.GATEWAY_SCHEMA_VERSION),
+  createdAt: process.env.STAMP,
+  image: process.env.IMAGE,
+  volume: process.env.VOLUME,
+  container: process.env.CONTAINER,
+  stateTarSha256: hash(files[0]),
+  imageArchiveSha256: hash(files[6]),
+  ...(hash(files[1]) ? { gatewaySqliteSha256: hash(files[1]) } : {}),
+  ...(hash(files[2]) ? { pluginDataSha256: hash(files[2]) } : {}),
+  ...(hash(files[3]) ? { gatewayArtifactsSha256: hash(files[3]) } : {}),
+  ...(hash(files[4]) ? { deploymentSecretsSha256: hash(files[4]) } : {}),
+  ...(hash(files[5]) ? { deploymentConfigSha256: hash(files[5]) } : {}),
+  ...(hash(files[7]) ? { snowlumaGatewayDataSha256: hash(files[7]) } : {}),
+  ...(hash(files[8]) ? { snowlumaClientConfigSha256: hash(files[8]) } : {}),
+  ...(hash(files[9]) ? { snowlumaClientDataSha256: hash(files[9]) } : {}),
+  providerConfiguration: "SKIPPED_USER_ACTION_REQUIRED",
+};
+fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
+NODE
   DEST="$DEST" node --input-type=module -e 'import fs from "node:fs";const path=`${process.env.DEST}/manifest.json`;const manifest=JSON.parse(fs.readFileSync(path,"utf8"));manifest.providerConfiguration="PI_SETTINGS_IN_STATE_VOLUME";fs.writeFileSync(path,`${JSON.stringify(manifest,null,2)}\n`,{mode:0o600});fs.chmodSync(path,0o600);'
 chmod 600 "$DEST/manifest.json" "$DEST/state.tar"
 printf 'backup created: %s\n' "$DEST"

@@ -74,11 +74,11 @@ const RETRY_DELAYS_MS = [1_000, 5_000, 30_000, 300_000, 900_000];
 
 export class MemoryService {
   private readonly db: SqliteStore;
-  private readonly owner?: { platform: string; accountId: string; userId: string };
+  private readonly owners: Array<{ platform: string; accountId: string; userId: string }>;
   private readonly retention: MemoryRetentionPolicy;
-  constructor(db: SqliteStore, owner?: { platform: string; accountId: string; userId: string }, retention?: Partial<MemoryRetentionPolicy>) {
+  constructor(db: SqliteStore, owners?: { platform: string; accountId: string; userId: string } | Array<{ platform: string; accountId: string; userId: string }>, retention?: Partial<MemoryRetentionPolicy>) {
     this.db = db;
-    this.owner = owner;
+    this.owners = owners ? (Array.isArray(owners) ? owners : [owners]) : [];
     this.retention = { rawEpisodeDays: 30, keepExplicitForever: true, keepProvenanceForActiveFacts: true, maxPromptBytes: 24 * 1024, ...retention };
   }
 
@@ -516,9 +516,9 @@ export class MemoryService {
     const principalScope = access.principalId ?? access.requesterId;
     const canonical: MemoryScope[] = [`user:${principalScope}`, ...((access.projectIds ?? []).filter((id) => typeof id === "string" && id).map((id) => `project:${id}` as MemoryScope))];
     if (access.trust === "OWNER") canonical.push("global_agent");
-    if (this.owner && access.conversationId) {
+    if (this.owners.length && access.conversationId) {
       const conversation = this.db.get<{ kind: "private" | "group"; trust: "OWNER" | "GUEST" }>("SELECT kind,trust FROM conversations WHERE conversation_id=?", access.conversationId);
-      const isOwner = access.principalId ? access.principalId === "principal:owner" : access.requesterId === this.owner.userId;
+      const isOwner = access.principalId ? access.principalId === "principal:owner" : this.owners.some((owner) => access.requesterId === owner.userId);
       if (conversation?.kind === "private" && conversation.trust === "OWNER" && access.trust === "OWNER" && isOwner) canonical.push("owner_private");
     }
     return canonical.filter((scope) => access.allowedScopes.includes(scope));
