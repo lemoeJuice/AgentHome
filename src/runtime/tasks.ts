@@ -2,7 +2,7 @@ import { access, chmod, chown, mkdir, readFile, readdir, realpath, stat } from "
 import { randomBytes } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { dirname, join, relative, resolve } from "node:path";
-import type { AppConfig } from "../config.js";
+import { configuredOwners, type AppConfig } from "../config.js";
 import type { SqliteStore } from "../db.js";
 import { attenuateTask, attenuateWorker, capabilityWithin, deriveCapabilities, validateCapabilitySet, type AuthorizationDecision, authorizeSend } from "../auth.js";
 import { newId, nowIso, messageKey } from "../shared/ids.js";
@@ -1306,10 +1306,11 @@ export class TaskService implements ExecutionBackend {
   }
 
   private canonicalCapabilities(input: { requester: TaskRequester; trust: "OWNER" | "GUEST"; originConversationId: string }): CapabilitySet | undefined {
-    if (!this.config.owner) return undefined;
+    const owners = configuredOwners(this.config);
+    if (!owners.length) return undefined;
     const row = this.db.get<{ platform: string; account_id: string; kind: "private" | "group"; platform_conversation_id: string; thread_id_json: string }>("SELECT platform,account_id,kind,platform_conversation_id,thread_id_json FROM conversations WHERE conversation_id=?", input.originConversationId);
     if (!row) return undefined;
-    return deriveCapabilities({ ...input.requester, trust: input.trust, conversationId: input.originConversationId }, { platform: row.platform, accountId: row.account_id, kind: row.kind, platformConversationId: row.platform_conversation_id, threadId: JSON.parse(row.thread_id_json) }, this.config.owner, input.originConversationId, { ...this.config.plugins, guestTaskExecutionEnabled: this.config.guest?.enabled ?? true });
+    return deriveCapabilities({ ...input.requester, trust: input.trust, conversationId: input.originConversationId }, { platform: row.platform, accountId: row.account_id, kind: row.kind, platformConversationId: row.platform_conversation_id, threadId: JSON.parse(row.thread_id_json) }, owners, input.originConversationId, { ...this.config.plugins, guestTaskExecutionEnabled: this.config.guest?.enabled ?? true });
   }
 }
 

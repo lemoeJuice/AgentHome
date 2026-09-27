@@ -48,9 +48,11 @@ before exporting the state volume.
 
 ## Configuration
 
-`config.example.json` is a committed application template. `config/agent-home.json` is deployment configuration and is ignored by Git. Setup automatically creates the ignored `config/owner.json` from `config/owner.example.json`; it is optional. Until a complete identity is configured, the runtime has no Owner and all Owner-only authorization remains disabled. Podman installation is handled by `scripts/setup-podman-portable.sh` without a user-supplied binary path.
+`config/agent-home.example.json` is the committed application template. `config/agent-home.json` is deployment configuration and is ignored by Git. Configure all authorized Owners in its `owners` array; each identity includes `platform`, `accountId`, and `userId` (for example, two QQ Owners are two entries with `platform: "qq"` and the same `accountId`). With an empty or missing array, Owner-only authorization remains disabled. Podman installation is handled by `scripts/setup-podman-portable.sh` without a user-supplied binary path.
 
 `config/snowluma.env.example` is the committed SnowLuma deployment template. The first setup copies it to the ignored `config/snowluma.env`; it controls service/UI bind addresses, host ports, and declarative EULA/privacy acceptance. `SNOWLUMA_ACCEPT_EULA=1` and `SNOWLUMA_ACCEPT_PRIVACY=1` are passed to the SnowLuma container as ephemeral consent settings; SnowLuma does not persist those environment values as a consent record.
+
+Application endpoints and service settings live in `config/agent-home.json`: `snowluma.endpoint` and `snowluma.apiEndpoint` select OneBot WebSocket/HTTP endpoints, `gateway.mcpPort` and optional `gateway.mcpHost` configure Gateway MCP, `gateway.mcpActionTimeoutMs` sets its action timeout, and `network.modelProxyUrl` configures the optional host model proxy (set it to an empty string to disable it). The corresponding deployment environment overrides are `GATEWAY_MCP_PORT`, `GATEWAY_MCP_HOST`, `GATEWAY_MCP_ACTION_TIMEOUT_MS`, and `AGENT_HOME_MODEL_PROXY_URL`.
 
 ## Deployment Lifecycle
 

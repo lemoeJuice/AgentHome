@@ -56,7 +56,7 @@ export class PodmanController implements AgentEventController {
     this.network = process.env.AGENT_HOME_NETWORK ?? "agent-home-net";
     this.controlToken = process.env.AGENT_HOME_CONTROL_TOKEN ?? (() => { try { return readFileSync(".agent-home/control-token", "utf8").trim() || undefined; } catch { return undefined; } })();
     this.podman = options.podmanCommand ?? process.env.PODMAN_COMMAND ?? "podman";
-    this.modelProxyUrl = options.modelProxyUrl ?? process.env.AGENT_HOME_MODEL_PROXY_URL ?? "http://host.containers.internal:7897";
+    this.modelProxyUrl = options.modelProxyUrl ?? config.network?.modelProxyUrl;
     this.log = logger.child("controller");
   }
 

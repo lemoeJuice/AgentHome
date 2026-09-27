@@ -1,5 +1,19 @@
 {
   "instanceId": "default",
+  "owners": [
+    {
+      "platform": "qq",
+      "accountId": "default",
+      "userId": "123456"
+    }
+  ],
+  "gateway": {
+    "mcpPort": 8787,
+    "mcpActionTimeoutMs": 30000
+  },
+  "network": {
+    "modelProxyUrl": "http://host.containers.internal:7897"
+  },
   "agent": {
     "persona": ""
   },

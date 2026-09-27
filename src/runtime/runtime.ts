@@ -5,7 +5,7 @@ import { unlink } from "node:fs/promises";
 import { createServer, type Server } from "node:net";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import type { AppConfig } from "../config.js";
+import { configuredOwners, type AppConfig } from "../config.js";
 import { migrate, SqliteStore } from "../db.js";
 import { deriveCapabilities, authorizeSend, validateCapabilitySet, type PluginCapabilityPolicy } from "../auth.js";
 import { runtimeMigrations } from "../schema.js";
@@ -77,12 +77,13 @@ export class RuntimeApp {
     this.modelPlane = new ModelPlaneService(this.db, config.paths.stateRoot, config.runtime.piAgentDir);
     this.principals.ensureOwnerPrincipal();
     this.principals.backfillRuntimeIds();
-    if (config.owner) this.principals.resolveIdentity(config.owner.platform, config.owner.accountId, config.owner.userId, config.owner);
-    this.principals.backfillTaskPrincipals(config.owner, config.guest?.taskTimeoutMs);
+    const owners = configuredOwners(config);
+    for (const owner of owners) this.principals.resolveIdentity(owner.platform, owner.accountId, owner.userId, owners);
+    this.principals.backfillTaskPrincipals(owners, config.guest?.taskTimeoutMs);
     this.db.run("UPDATE ingress_events SET status='PENDING',updated_at=? WHERE status='PROCESSING'", nowIso());
     this.db.run("UPDATE main_turn_queue SET status='PENDING',started_at=NULL WHERE status='PROCESSING'");
     this.db.run("UPDATE task_event_outbox SET status='PENDING' WHERE status='ENQUEUED'");
-    this.memory = new MemoryService(this.db, config.owner, config.memory);
+    this.memory = new MemoryService(this.db, owners, config.memory);
     const memoryIsolation = this.memory.isolateLegacyPrincipalScopes();
     if (memoryIsolation.quarantined > 0) this.log.warn("Legacy shared Memory could not be attributed to a single Principal and was quarantined", memoryIsolation);
     this.memory.recover();
@@ -108,7 +109,7 @@ export class RuntimeApp {
   }
 
   async start(): Promise<void> {
-    this.modelProxyUrl = process.env.AGENT_HOME_MODEL_PROXY_URL ?? "http://host.containers.internal:7897";
+    this.modelProxyUrl = this.config.network?.modelProxyUrl;
     await this.modelPlane.ensure();
     if (process.getuid?.() === 0 && process.getgid?.() === 0) {
       await this.principals.ensureOwnerDirectories();
@@ -332,7 +333,7 @@ export class RuntimeApp {
     if (!task.capabilities.qq.sendConversations.includes("*") && !task.capabilities.qq.sendConversations.includes(task.notificationConversationId)) throw new Error("TASK_NOTIFICATION_DENIED");
     const conversation = this.getConversation(task.notificationConversationId);
     const requester = { ...task.requester, conversationId: conversation.id, trust: this.resolvePrincipalIdentity(task.requester.platform, task.requester.accountId, task.requester.userId).trust };
-    const caps = deriveCapabilities(requester, conversation.address, this.config.owner, conversation.id, this.pluginPolicy);
+    const caps = deriveCapabilities(requester, conversation.address, configuredOwners(this.config), conversation.id, this.pluginPolicy);
     const syntheticEvent: ControllerEventEnvelope = {
       protocolVersion: 1, eventId: newId("main-event"), instanceId: this.config.instanceId, type: "chat.message", occurredAt: nowIso(),
       source: { platform: task.requester.platform, accountId: task.requester.accountId, adapter: "runtime" },
@@ -373,14 +374,14 @@ export class RuntimeApp {
     if (replyTo && typeof replyTo === "object" && "messageId" in replyTo) {
       const question = this.db.get<{ binding_id: string }>("SELECT binding_id FROM message_bindings WHERE platform=? AND account_id=? AND platform_conversation_id=? AND thread_id_json=? AND message_id=? AND binding_type='PENDING_QUESTION'", replyTo.platform, replyTo.accountId, replyTo.platformConversationId, JSON.stringify(replyTo.threadId), replyTo.messageId);
       if (question) {
-        await this.tasks.answerQuestion(question.binding_id, String(payload.text ?? ""), { message: event.message?.ref as PlatformMessageRef, conversationId: conversation.id, requester: { platform: event.source.platform, accountId: event.source.accountId, userId: event.trustedIdentity?.userId ?? "unknown", principalId: requesterPrincipal.principalId }, trust: requesterPrincipal.trust, capabilities: deriveCapabilities({ platform: event.source.platform, accountId: event.source.accountId, userId: event.trustedIdentity?.userId ?? "unknown", principalId: requesterPrincipal.principalId, trust: requesterPrincipal.trust, conversationId: conversation.id }, conversation.address, this.config.owner, conversation.id, this.pluginPolicy) });
+        await this.tasks.answerQuestion(question.binding_id, String(payload.text ?? ""), { message: event.message?.ref as PlatformMessageRef, conversationId: conversation.id, requester: { platform: event.source.platform, accountId: event.source.accountId, userId: event.trustedIdentity?.userId ?? "unknown", principalId: requesterPrincipal.principalId }, trust: requesterPrincipal.trust, capabilities: deriveCapabilities({ platform: event.source.platform, accountId: event.source.accountId, userId: event.trustedIdentity?.userId ?? "unknown", principalId: requesterPrincipal.principalId, trust: requesterPrincipal.trust, conversationId: conversation.id }, conversation.address, configuredOwners(this.config), conversation.id, this.pluginPolicy) });
         return;
       }
     }
      const text = String(payload.text ?? "").trim() || (event.message ? "用户发送了一条消息，请通过当前会话能力读取需要的上下文。" : "");
     if (!text) return;
     const requester = { platform: event.source.platform, accountId: event.source.accountId, userId: event.trustedIdentity?.userId ?? "unknown", principalId: requesterPrincipal.principalId, trust: requesterPrincipal.trust, conversationId: conversation.id };
-    const caps = deriveCapabilities(requester, conversation.address, this.config.owner, conversation.id, this.pluginPolicy);
+    const caps = deriveCapabilities(requester, conversation.address, configuredOwners(this.config), conversation.id, this.pluginPolicy);
     const episodeScope: MemoryScope = `user:${requester.principalId ?? requester.userId}`;
     if (caps.memory.allowedScopes.includes(episodeScope)) {
       this.memory.ingestEpisode({
@@ -758,7 +759,7 @@ export class RuntimeApp {
   private async controlCommand(conversationId: string, event: ControllerEventEnvelope, command: string, args: string[]): Promise<void> {
     const conversation = this.getConversation(conversationId);
     const principal = this.resolvePrincipalIdentity(event.source.platform, event.source.accountId, event.trustedIdentity?.userId ?? "unknown");
-    const caps = deriveCapabilities({ platform: event.source.platform, accountId: event.source.accountId, userId: event.trustedIdentity?.userId ?? "unknown", principalId: principal.principalId, trust: principal.trust, conversationId }, conversation.address, this.config.owner, conversationId, this.pluginPolicy);
+    const caps = deriveCapabilities({ platform: event.source.platform, accountId: event.source.accountId, userId: event.trustedIdentity?.userId ?? "unknown", principalId: principal.principalId, trust: principal.trust, conversationId }, conversation.address, configuredOwners(this.config), conversationId, this.pluginPolicy);
     if (command === "help") { await this.sendText(conversation.address, "/status /tasks /stop /new /usage /bind /unbind /help\n自然语言消息会交给 Main。", event.message?.ref, conversationId, caps); return; }
     if (command === "bind" || command === "unbind") {
       if (conversation.address.kind !== "private" || !this.isConfiguredOwner(event.source.platform, event.source.accountId, event.trustedIdentity?.userId ?? "unknown")) throw new Error("IDENTITY_BINDING_DENIED");
@@ -975,13 +976,13 @@ export class RuntimeApp {
   }
 
   private resolvePrincipalIdentity(platform: string, accountId: string, userId: string): { principalId: string; trust: Trust } {
-    return this.principals.resolveIdentity(platform, accountId, userId, this.config.owner);
+    return this.principals.resolveIdentity(platform, accountId, userId, configuredOwners(this.config));
   }
 
   private bindPlatformIdentity(actor: PlatformIdentityRef, target: PlatformIdentityRef): void {
     if (!this.isConfiguredOwner(actor.platform, actor.accountId, actor.userId)) throw new Error("IDENTITY_BINDING_DENIED");
     if (!target.platform || !target.accountId || !target.userId) throw new Error("IDENTITY_BINDING_ARGUMENTS_REQUIRED");
-    this.principals.resolveIdentity(actor.platform, actor.accountId, actor.userId, this.config.owner);
+    this.principals.resolveIdentity(actor.platform, actor.accountId, actor.userId, configuredOwners(this.config));
     this.db.transaction(() => {
       const changed = this.db.run("UPDATE platform_identities SET principal_id=? WHERE platform=? AND account_id=? AND user_id=?", OWNER_PRINCIPAL_ID, target.platform, target.accountId, target.userId);
       if (changed.changes === 0) this.db.run("INSERT INTO platform_identities(platform,account_id,user_id,principal_id) VALUES (?,?,?,?)", target.platform, target.accountId, target.userId, OWNER_PRINCIPAL_ID);
@@ -995,7 +996,7 @@ export class RuntimeApp {
   }
 
   private isConfiguredOwner(platform: string, accountId: string, userId: string): boolean {
-    return Boolean(this.config.owner && platform === this.config.owner.platform && accountId === this.config.owner.accountId && userId === this.config.owner.userId);
+    return configuredOwners(this.config).some((owner) => platform === owner.platform && accountId === owner.accountId && userId === owner.userId);
   }
 
   private conversationTrust(address: ConversationAddress, requesterPrincipal: { trust: Trust } | undefined, fallback: Trust): Trust {

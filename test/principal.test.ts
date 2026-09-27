@@ -16,6 +16,12 @@ test("Principal runtime identities are stable, unique and independent of platfor
     const service = new PrincipalService(db, root);
     service.ensureOwnerPrincipal();
     service.backfillRuntimeIds();
+    const configuredOwners = [{ platform: "qq", accountId: "default", userId: "owner-1" }, { platform: "qq", accountId: "default", userId: "owner-2" }];
+    const ownerOne = service.resolveIdentity("qq", "default", "owner-1", configuredOwners);
+    const ownerTwo = service.resolveIdentity("qq", "default", "owner-2", configuredOwners);
+    assert.equal(ownerOne.principalId, OWNER_PRINCIPAL_ID);
+    assert.equal(ownerTwo.principalId, OWNER_PRINCIPAL_ID);
+    assert.equal(ownerTwo.trust, "OWNER");
     const first = service.resolveIdentity("qq", "account-a", "external-10001");
     const second = service.resolveIdentity("telegram", "bot-b", "external-10001");
     const same = service.resolveIdentity("qq", "account-a", "external-10001");

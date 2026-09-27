@@ -29,7 +29,7 @@ export class GatewayApp {
     this.log = logger.child("gateway");
     this.state = new GatewayState(config.paths.gatewayState);
     this.adapter = new QQChatPlatformAdapter(config, this.log);
-    this.controller = new PodmanController(config, this.state, this.log, { modelProxyUrl: process.env.AGENT_HOME_MODEL_PROXY_URL ?? "http://host.containers.internal:7897" });
+    this.controller = new PodmanController(config, this.state, this.log);
     this.artifacts = new GatewayArtifactService(this.state.store, config.paths.gatewayState, this.log);
     const mcpToken = process.env.GATEWAY_MCP_TOKEN ?? readSecret(".agent-home/mcp-main-token");
     const mcpControlToken = process.env.GATEWAY_MCP_CONTROL_TOKEN ?? readSecret(".agent-home/mcp-control-token");
@@ -38,7 +38,7 @@ export class GatewayApp {
     const workerCapabilityResolver = fileResolver?.resolve.bind(fileResolver);
     const allowedActions = process.env.GATEWAY_MCP_ALLOWED_ACTIONS === undefined ? (config.plugins.allowedActions ?? []) : process.env.GATEWAY_MCP_ALLOWED_ACTIONS.split(",").map((item) => item.trim()).filter(Boolean);
     const allowedPermissions = process.env.GATEWAY_MCP_ALLOWED_PERMISSIONS === undefined ? config.plugins.allowedPermissions : process.env.GATEWAY_MCP_ALLOWED_PERMISSIONS.split(",").map((item) => item.trim()).filter(Boolean);
-     this.mcp = new GatewayMcpServer(this.actions, Number(process.env.GATEWAY_MCP_PORT ?? 8787), this.log, { host: process.env.GATEWAY_MCP_HOST ?? (mcpToken ? "0.0.0.0" : "127.0.0.1"), token: mcpToken, controlToken: mcpControlToken, workerBindingsPath, ...(workerCapabilityResolver ? { workerCapabilityResolver } : { workerBindings: readWorkerBindings() }), allowedActions, ...(allowedPermissions !== undefined ? { allowedPermissions } : {}), actionTimeoutMs: positiveIntegerEnv("GATEWAY_MCP_ACTION_TIMEOUT_MS", 30_000), audit: (event) => this.state.store.run("INSERT INTO authorization_audit_events(id,operation,decision,reason,resource,requester_id,task_id,metadata_json,created_at) VALUES (?,?,?,?,?,?,?,?,?)", newId("authz"), event.operation, event.decision, event.reason ?? null, event.resource, event.requesterId ?? null, event.taskId ?? null, null, nowIso()) });
+     this.mcp = new GatewayMcpServer(this.actions, config.gateway.mcpPort, this.log, { host: config.gateway.mcpHost ?? (mcpToken ? "0.0.0.0" : "127.0.0.1"), token: mcpToken, controlToken: mcpControlToken, workerBindingsPath, ...(workerCapabilityResolver ? { workerCapabilityResolver } : { workerBindings: readWorkerBindings() }), allowedActions, ...(allowedPermissions !== undefined ? { allowedPermissions } : {}), actionTimeoutMs: config.gateway.mcpActionTimeoutMs, audit: (event) => this.state.store.run("INSERT INTO authorization_audit_events(id,operation,decision,reason,resource,requester_id,task_id,metadata_json,created_at) VALUES (?,?,?,?,?,?,?,?,?)", newId("authz"), event.operation, event.decision, event.reason ?? null, event.resource, event.requesterId ?? null, event.taskId ?? null, null, nowIso()) });
   }
 
   async start(): Promise<void> {
@@ -61,14 +61,6 @@ export class GatewayApp {
     return this._router ??= new Router(this.config, this.adapter, this.state, this.commands, this.actions, this.controller, this.log, this.artifacts);
   }
   private _router: Router | undefined;
-}
-
-function positiveIntegerEnv(name: string, fallback: number): number {
-  const value = process.env[name];
-  if (value === undefined) return fallback;
-  const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed) || parsed < 1) throw new Error(`${name}_INVALID`);
-  return parsed;
 }
 
 function readSecret(path: string): string | undefined {

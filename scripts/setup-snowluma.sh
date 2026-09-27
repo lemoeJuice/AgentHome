@@ -20,7 +20,6 @@ ACCEPT_EULA="$SNOWLUMA_ACCEPT_EULA"
 ACCEPT_PRIVACY="$SNOWLUMA_ACCEPT_PRIVACY"
 NOFILE_ULIMIT="${SNOWLUMA_NOFILE_ULIMIT:-65536:524288}"
 CONFIG_PATH="${AGENT_HOME_CONFIG:-$ROOT_DIR/config/agent-home.json}"
-OWNER_CONFIG_PATH="${AGENT_HOME_OWNER_CONFIG:-}"
 
 fail() {
   printf 'SnowLuma setup error: %s\n' "$1" >&2
@@ -31,29 +30,15 @@ command -v node >/dev/null || fail 'missing dependency: node'
 command -v "$PODMAN" >/dev/null || fail "missing dependency: $PODMAN"
 
 if [[ "$CONFIG_PATH" != /* ]]; then CONFIG_PATH="$ROOT_DIR/$CONFIG_PATH"; fi
-if [[ -z "$OWNER_CONFIG_PATH" ]]; then OWNER_CONFIG_PATH="$(dirname "$CONFIG_PATH")/owner.json"; elif [[ "$OWNER_CONFIG_PATH" != /* ]]; then OWNER_CONFIG_PATH="$ROOT_DIR/$OWNER_CONFIG_PATH"; fi
 case "$CONFIG_PATH" in
   "$ROOT_DIR"/*) ;;
   *) fail 'AGENT_HOME_CONFIG must be inside the project directory' ;;
 esac
-case "$OWNER_CONFIG_PATH" in
-  "$ROOT_DIR"/*) ;;
-  *) fail 'AGENT_HOME_OWNER_CONFIG must be inside the project directory' ;;
-esac
-
 mkdir -p "$(dirname "$CONFIG_PATH")"
 if [[ ! -f "$CONFIG_PATH" ]]; then
-  cp "$ROOT_DIR/config.example.json" "$CONFIG_PATH"
+  cp "$ROOT_DIR/config/agent-home.example.json" "$CONFIG_PATH"
   chmod 600 "$CONFIG_PATH"
 fi
-
-if [[ ! -e "$OWNER_CONFIG_PATH" ]]; then
-  mkdir -p "$(dirname "$OWNER_CONFIG_PATH")"
-  cp "$ROOT_DIR/config/owner.example.json" "$OWNER_CONFIG_PATH"
-  chmod 600 "$OWNER_CONFIG_PATH"
-  printf 'created optional Bot Owner config template: %s\n' "$OWNER_CONFIG_PATH" >&2
-fi
-OWNER_CONFIG_PATH="$OWNER_CONFIG_PATH" node --input-type=module -e 'import fs from "node:fs"; const owner=JSON.parse(fs.readFileSync(process.env.OWNER_CONFIG_PATH,"utf8")); const configured=owner.userId && !owner.userId.startsWith("REPLACE_"); if (configured && (!owner.platform || !owner.accountId)) process.exit(1);' || fail "owner config is invalid: $OWNER_CONFIG_PATH"
 
 if [[ "${SNOWLUMA_REFRESH_IMAGE:-0}" == 1 ]]; then
   "$PODMAN" pull "$IMAGE" || { "$PODMAN" image exists "$IMAGE" || exit 1; printf 'SnowLuma refresh failed; using cached image %s\n' "$IMAGE" >&2; }

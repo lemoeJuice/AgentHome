@@ -17,10 +17,7 @@ node -e 'const [major, minor] = process.versions.node.split(".").map(Number); if
 
 CONFIG_PATH="${AGENT_HOME_CONFIG:-$ROOT_DIR/config/agent-home.json}"
 if [[ "$CONFIG_PATH" != /* ]]; then CONFIG_PATH="$ROOT_DIR/$CONFIG_PATH"; fi
-OWNER_CONFIG_PATH="${AGENT_HOME_OWNER_CONFIG:-$(dirname "$CONFIG_PATH")/owner.json}"
-if [[ "$OWNER_CONFIG_PATH" != /* ]]; then OWNER_CONFIG_PATH="$ROOT_DIR/$OWNER_CONFIG_PATH"; fi
 case "$CONFIG_PATH" in "$ROOT_DIR"/*) ;; *) fail 'AGENT_HOME_CONFIG must be inside the project directory' ;; esac
-case "$OWNER_CONFIG_PATH" in "$ROOT_DIR"/*) ;; *) fail 'AGENT_HOME_OWNER_CONFIG must be inside the project directory' ;; esac
 export AGENT_HOME_CONFIG="$CONFIG_PATH"
 
 printf '%s\n' '== Environment and update check =='
@@ -66,7 +63,7 @@ validate_migration_backup() {
     for(const file of ["manifest.json","state.tar","image.tar"])if(!fs.existsSync(path.join(dir,file)))missing.push(file);
     try {
       const m=JSON.parse(fs.readFileSync(path.join(dir,"manifest.json"),"utf8"));
-      const optional=[["gatewaySqliteSha256","gateway.sqlite"],["pluginDataSha256","plugin-data.tar.gz"],["gatewayArtifactsSha256","gateway-artifacts.tar.gz"],["deploymentSecretsSha256","deployment-secrets.tar.gz"],["deploymentConfigSha256","deployment-config.json"],["ownerConfigSha256","owner.json"],["snowlumaGatewayDataSha256","snowluma-gateway-data.tar"],["snowlumaClientConfigSha256","snowluma-client-config.tar"],["snowlumaClientDataSha256","snowluma-client-data.tar"]];
+      const optional=[["gatewaySqliteSha256","gateway.sqlite"],["pluginDataSha256","plugin-data.tar.gz"],["gatewayArtifactsSha256","gateway-artifacts.tar.gz"],["deploymentSecretsSha256","deployment-secrets.tar.gz"],["deploymentConfigSha256","deployment-config.json"],["snowlumaGatewayDataSha256","snowluma-gateway-data.tar"],["snowlumaClientConfigSha256","snowluma-client-config.tar"],["snowlumaClientDataSha256","snowluma-client-data.tar"]];
       for(const [hash,file] of optional)if(m[hash]&&!fs.existsSync(path.join(dir,file)))missing.push(file);
     } catch { if(fs.existsSync(path.join(dir,"manifest.json")))missing.push("manifest.json (invalid JSON)"); }
     process.stdout.write(missing.join("\n"));

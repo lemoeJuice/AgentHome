@@ -8,12 +8,12 @@ import { join } from "node:path";
 
 const execFileAsync = promisify(execFile);
 
-test("restore rejects legacy manifests that cannot provide a portable image", async () => {
+test("restore rejects version-4 deployment backups", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-restore-manifest-"));
   try {
     await writeFile(join(root, "manifest.json"), JSON.stringify({
       format: "agent-home-deployment",
-      version: 3,
+      version: 4,
       image: "agent-home:latest",
       runtimeSchemaVersion: 18,
       gatewaySchemaVersion: 6,
