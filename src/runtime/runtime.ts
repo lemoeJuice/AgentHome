@@ -404,7 +404,7 @@ export class RuntimeApp {
     this.mainToolContexts.set(toolToken, {
       conversationId,
       requesterId: event.trustedIdentity?.userId ?? "unknown",
-      requester: { platform: event.source.platform, accountId: event.source.accountId, userId: event.trustedIdentity?.userId ?? "unknown", ...(event.trustedIdentity?.principalId ? { principalId: event.trustedIdentity.principalId } : {}) },
+      requester: { platform: event.source.platform, accountId: event.source.accountId, userId: event.trustedIdentity?.userId ?? "unknown", principalId: requesterPrincipal.principalId },
       trust: requesterPrincipal.trust,
       address,
       capabilities: caps,

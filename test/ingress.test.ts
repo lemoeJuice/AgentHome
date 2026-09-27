@@ -101,7 +101,7 @@ test("main turns are durable and serialized per conversation", async () => {
   const prompts: string[] = [];
   let activeTurns = 0;
   let maxActiveTurns = 0;
-  const internals = runtime as unknown as { pi: { createSession: (path: string) => Promise<{ sessionId: string; sessionPath: string }>; send: (session: { sessionId: string; sessionPath: string }, prompt: string) => Promise<string>; stop: () => Promise<void> }; qq: { sendMessage: (target: unknown, message: { text: string }) => Promise<unknown> } };
+  const internals = runtime as unknown as { pi: { createSession: (path: string) => Promise<{ sessionId: string; sessionPath: string }>; send: (session: { sessionId: string; sessionPath: string }, prompt: string) => Promise<string>; stop: () => Promise<void> }; qq: { sendMessage: (target: unknown, message: { text: string }) => Promise<unknown> }; mainToolContexts: Map<string, { conversationId: string; requesterId: string; requester: { platform: string; accountId: string; userId: string; principalId?: string }; capabilities: CapabilitySet }> };
   internals.pi = { createSession: async (path) => ({ sessionId: `main-session-${path}`, sessionPath: path }), send: async (_session, prompt) => { prompts.push(prompt); activeTurns += 1; maxActiveTurns = Math.max(maxActiveTurns, activeTurns); await new Promise((resolve) => setTimeout(resolve, 10)); activeTurns -= 1; return `response-${prompts.length}`; }, stop: async () => {} };
   internals.qq = { sendMessage: async (_target, message) => ({ message: { platform: "qq", accountId: "a", platformConversationId: "owner", threadId: null, messageId: `out-${prompts.length}` }, accepted: true, echoedText: message.text }) };
   const event = (eventId: string, text: string, group = false) => ({ protocolVersion: 1 as const, eventId, instanceId: "main-queue", type: "chat.message" as const, occurredAt: new Date().toISOString(), source: { platform: "qq", accountId: "a", adapter: "test" }, trustedIdentity: { userId: group ? "guest" : "owner" }, conversation: { conversationId: "external", address: { platform: "qq", accountId: "a", kind: group ? "group" as const : "private" as const, platformConversationId: group ? "group-1" : "owner", threadId: null } }, message: { ref: { platform: "qq", accountId: "a", platformConversationId: group ? "group-1" : "owner", threadId: null, messageId: eventId }, replyTo: null }, payload: { text } });
@@ -118,6 +118,11 @@ test("main turns are durable and serialized per conversation", async () => {
     assert.match(prompts[0] ?? "", /Current message reference \(trusted routing metadata, not message content\)/);
     assert.ok(maxActiveTurns >= 2);
     assert.equal(runtime.db.get<{ count: number }>("SELECT count(*) AS count FROM main_turn_queue WHERE status='DONE'")?.count, 3);
+    const ownerContext = [...internals.mainToolContexts.values()].find((context) => context.requesterId === "owner");
+    assert.equal(ownerContext?.requester.principalId, "principal:owner");
+    assert.ok(ownerContext);
+    const task = runtime.tasks.createTask({ title: "visible task", goal: "visible task", requester: ownerContext.requester, trust: "OWNER", originConversationId: ownerContext.conversationId, notificationConversationId: ownerContext.conversationId, parentCapabilities: ownerContext.capabilities });
+    assert.ok(runtime.tasks.listTasks(ownerContext.conversationId, ownerContext.capabilities, ownerContext.requesterId, ownerContext.requester.principalId).some((item) => item.id === task.id));
   } finally {
     await runtime.stop();
     await rm(root, { recursive: true, force: true });
