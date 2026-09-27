@@ -25,14 +25,14 @@ export function createPiModelCommand(config: AppConfig, logger: Logger, runner?:
 
   async function readSelection(): Promise<PiSelection> {
     const output = await exec([
-      "exec", "--env", `PI_CODING_AGENT_DIR=${piAgentDir}`, container, "node", "--input-type=module", "-e",
-      'import fs from "node:fs";const dir=process.env.PI_CODING_AGENT_DIR||"/state/home/.pi/agent";try{const s=JSON.parse(fs.readFileSync(`${dir}/settings.json`,"utf8"));process.stdout.write(JSON.stringify({provider:s.defaultProvider||null,model:s.defaultModel||null}))}catch{process.stdout.write(JSON.stringify({provider:null,model:null}))}',
+      "exec", "--user", "10002:10002", "--env", "HOME=/state/model/home", "--env", `PI_CODING_AGENT_DIR=${piAgentDir}`, container, "node", "--input-type=module", "-e",
+      'import fs from "node:fs";const dir=process.env.PI_CODING_AGENT_DIR||"/state/model/pi/agent";try{const s=JSON.parse(fs.readFileSync(`${dir}/settings.json`,"utf8"));process.stdout.write(JSON.stringify({provider:s.defaultProvider||null,model:s.defaultModel||null}))}catch{process.stdout.write(JSON.stringify({provider:null,model:null}))}',
     ]);
     return JSON.parse(output) as PiSelection;
   }
 
   async function readPiModelList(search?: string): Promise<string> {
-    return exec(["exec", "--env", `PI_CODING_AGENT_DIR=${piAgentDir}`, container, pi, "--list-models", ...(search ? [search] : [])], 30_000);
+    return exec(["exec", "--user", "10002:10002", "--env", "HOME=/state/model/home", "--env", `PI_CODING_AGENT_DIR=${piAgentDir}`, container, pi, "--list-models", ...(search ? [search] : [])], 30_000);
   }
 
   async function setSelection(provider: string, model: string): Promise<{ activeSessionsUpdated?: number; activeSessionFailures?: number }> {

@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { RuntimeToolServer } from "../src/runtime/tools.ts";
 import type { RuntimeToolContext } from "../src/runtime/tools.ts";
 import registerAgentHomeTools from "../src/runtime/pi-tools.ts";
+import registerWorkerTools from "../src/runtime/worker-tools.ts";
 
 const context: RuntimeToolContext = {
   conversationId: "conversation-1",
@@ -86,3 +87,66 @@ test("Main Pi exposes only service tools and prompt text cannot add a shell acti
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("Worker Pi exposes only Runtime-brokered Principal execution and workspace tools", () => {
+  const previousSocket = process.env.AGENT_HOME_RUNTIME_TOOL_SOCKET;
+  const previousToken = process.env.AGENT_HOME_RUNTIME_TOOL_TOKEN;
+  process.env.AGENT_HOME_RUNTIME_TOOL_SOCKET = "/run/agent-home/tools.sock";
+  process.env.AGENT_HOME_RUNTIME_TOOL_TOKEN = "worker-token";
+  const names: string[] = [];
+  try {
+    registerWorkerTools({ registerTool: (definition) => { names.push(definition.name); } });
+  } finally {
+    if (previousSocket === undefined) delete process.env.AGENT_HOME_RUNTIME_TOOL_SOCKET; else process.env.AGENT_HOME_RUNTIME_TOOL_SOCKET = previousSocket;
+    if (previousToken === undefined) delete process.env.AGENT_HOME_RUNTIME_TOOL_TOKEN; else process.env.AGENT_HOME_RUNTIME_TOOL_TOKEN = previousToken;
+  }
+  assert.ok(names.includes("worker_exec"));
+  assert.ok(names.includes("workspace_read"));
+  assert.ok(names.includes("workspace_write"));
+  assert.ok(names.includes("workspace_edit"));
+  assert.ok(names.includes("workspace_mkdir"));
+  assert.ok(names.includes("workspace_remove"));
+  assert.ok(names.includes("workspace_list"));
+  assert.ok(names.includes("workspace_stat"));
+  assert.equal(names.includes("bash"), false);
+  assert.equal(names.includes("read"), false);
+  assert.equal(names.includes("write"), false);
+});
+
+test("Worker Gateway actions return through the authenticated Runtime tool socket", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-home-worker-tool-proxy-"));
+  const socketPath = join(root, "tools.sock");
+  const context = { ...contextBase(), taskId: "task-1", workerId: "worker-1", executionContextId: "task-1:worker-1:principal:owner" };
+  const calls: string[] = [];
+  const server = new RuntimeToolServer(socketPath, (token) => token === "context-token" ? context : undefined, async (action) => { calls.push(action); return { action }; });
+  const previousSocket = process.env.AGENT_HOME_RUNTIME_TOOL_SOCKET;
+  const previousToken = process.env.AGENT_HOME_RUNTIME_TOOL_TOKEN;
+  await server.start();
+  process.env.AGENT_HOME_RUNTIME_TOOL_SOCKET = socketPath;
+  process.env.AGENT_HOME_RUNTIME_TOOL_TOKEN = "context-token";
+  const definitions = new Map<string, Parameters<Parameters<typeof registerWorkerTools>[0]["registerTool"]>[0]>();
+  try {
+    registerWorkerTools({ registerTool: (definition) => { definitions.set(definition.name, definition); } });
+    const invoke = definitions.get("invoke_gateway_action");
+    assert.ok(invoke);
+    const result = await invoke.execute("tool-call", { name: "allowed_action" }, new AbortController().signal);
+    assert.deepEqual(calls, ["invoke_action"]);
+    assert.match(result.content[0]?.text ?? "", /invoke_action/);
+  } finally {
+    await server.stop();
+    await rm(root, { recursive: true, force: true });
+    if (previousSocket === undefined) delete process.env.AGENT_HOME_RUNTIME_TOOL_SOCKET; else process.env.AGENT_HOME_RUNTIME_TOOL_SOCKET = previousSocket;
+    if (previousToken === undefined) delete process.env.AGENT_HOME_RUNTIME_TOOL_TOKEN; else process.env.AGENT_HOME_RUNTIME_TOOL_TOKEN = previousToken;
+  }
+});
+
+function contextBase(): RuntimeToolContext {
+  return {
+    conversationId: "conversation-1",
+    requesterId: "owner",
+    requester: { platform: "qq", accountId: "default", userId: "owner", principalId: "principal:owner" },
+    trust: "OWNER",
+    address: { platform: "qq", accountId: "default", kind: "private", platformConversationId: "owner", threadId: null },
+    capabilities: { memory: { allowedScopes: ["global_agent"] }, projects: [{ projectId: "*", access: "WRITE" }], qq: { readConversations: ["conversation-1"], sendConversations: ["conversation-1"] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: ["agent-home"], publishTaskIds: [], allowedDestinations: ["conversation-1"] }, tasks: { canCreate: true, visibleTaskIds: [], canCancel: true, canFollowUp: true } },
+  };
+}

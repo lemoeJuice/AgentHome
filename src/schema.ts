@@ -261,6 +261,29 @@ export const runtimeMigrations = [
       CREATE INDEX IF NOT EXISTS idx_authorization_audit_resource ON authorization_audit_events(resource, operation);
     `,
   },
+  {
+    version: 19,
+    sql: `
+      ALTER TABLE principals ADD COLUMN runtime_uid INTEGER;
+      ALTER TABLE principals ADD COLUMN runtime_gid INTEGER;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_principals_runtime_uid ON principals(runtime_uid) WHERE runtime_uid IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_principals_runtime_gid ON principals(runtime_gid) WHERE runtime_gid IS NOT NULL;
+      ALTER TABLE tasks ADD COLUMN principal_id TEXT;
+      ALTER TABLE worker_executions ADD COLUMN principal_id TEXT;
+      ALTER TABLE worker_executions ADD COLUMN runtime_uid INTEGER;
+      ALTER TABLE worker_executions ADD COLUMN runtime_gid INTEGER;
+      ALTER TABLE worker_executions ADD COLUMN workspace_scope_id TEXT;
+      ALTER TABLE worker_executions ADD COLUMN process_mode TEXT NOT NULL DEFAULT 'PI';
+      ALTER TABLE owned_processes ADD COLUMN process_kind TEXT NOT NULL DEFAULT 'PI';
+      ALTER TABLE artifacts ADD COLUMN source_principal_id TEXT;
+      CREATE INDEX IF NOT EXISTS idx_tasks_principal_status ON tasks(principal_id,status,updated_at);
+      CREATE INDEX IF NOT EXISTS idx_artifacts_principal ON artifacts(source_principal_id,status);
+      CREATE INDEX IF NOT EXISTS idx_owned_processes_worker_kind ON owned_processes(worker_id,process_kind);
+      CREATE INDEX IF NOT EXISTS idx_workers_workspace_scope ON worker_executions(workspace_scope_id,status);
+      ALTER TABLE tasks ADD COLUMN deadline_at TEXT;
+      UPDATE worker_executions SET workspace_scope_id=workspace_id WHERE workspace_scope_id IS NULL AND workspace_id IS NOT NULL;
+    `,
+  },
 ];
 
 export function ensureRuntimeSchema(store: SqliteStore): void {

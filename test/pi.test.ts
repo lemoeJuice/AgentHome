@@ -10,13 +10,15 @@ test("PiCliHarness drives a persistent RPC session", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-pi-"));
   const command = join(root, "fake-pi.mjs");
   const sessionPath = join(root, "session.jsonl");
+  const networkRetryPath = join(root, "network-retry-count.txt");
+  const networkExitRetryPath = join(root, "network-exit-retry-count.txt");
   await writeFile(command, `#!/usr/bin/env node
-    import { appendFileSync, writeFileSync } from "node:fs";
+    import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
      writeFileSync(process.argv[process.argv.length - 1], JSON.stringify({ booted: true, args: process.argv.slice(2) }) + "\\n");
     let buffer = "";
     let transientAttempts = 0;
     let repeatedTransientAttempts = 0;
-    const maxTransientAttempts = ${PI_MAX_NETWORK_RETRIES};
+    const maxTransientAttempts = ${Math.min(3, PI_MAX_NETWORK_RETRIES)};
     process.stdin.setEncoding("utf8");
     process.stdin.on("data", (chunk) => {
       buffer += chunk;
@@ -30,13 +32,25 @@ test("PiCliHarness drives a persistent RPC session", async () => {
           else if (command.type === "prompt" || command.type === "steer") {
             response();
             if (command.message === "timeout") return;
-            if (command.message === "exit") { setTimeout(() => process.exit(2), 20); return; }
+             if (command.message === "exit") { setTimeout(() => process.exit(2), 20); return; }
+             if (command.message === "network-transient-exit") {
+              let attempts = 0;
+              try { attempts = Number(readFileSync(${JSON.stringify(networkRetryPath)}, "utf8")); } catch {}
+              writeFileSync(${JSON.stringify(networkRetryPath)}, String(attempts + 1));
+              if (attempts === 0) { process.stderr.write("TypeError: fetch failed ECONNRESET\\n"); setTimeout(() => process.exit(1), 10); return; }
+            }
+            if (command.message === "network-agent-exit") {
+              let attempts = 0;
+              try { attempts = Number(readFileSync(${JSON.stringify(networkExitRetryPath)}, "utf8")); } catch {}
+              writeFileSync(${JSON.stringify(networkExitRetryPath)}, String(attempts + 1));
+              if (attempts === 0) { process.stdout.write(JSON.stringify({ type: "agent_error", error: { message: "fetch failed ECONNRESET" } }) + "\\n"); setTimeout(() => process.exit(1), 10); return; }
+            }
             if (command.message === "transient" && transientAttempts++ === 0) {
               process.stdout.write(JSON.stringify({ type: "agent_end", messages: [{ role: "assistant", content: [], stopReason: "error", errorMessage: "provider_transport_failure: fetch failed" }] }) + "\\n");
               process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
               return;
             }
-            if (command.message === "transient-five" && repeatedTransientAttempts++ < maxTransientAttempts) {
+            if (command.message === "transient-retries" && repeatedTransientAttempts++ < maxTransientAttempts) {
               process.stdout.write(JSON.stringify({ type: "agent_end", messages: [{ role: "assistant", content: [], stopReason: "error", errorMessage: "fetch failed: ECONNRESET" }] }) + "\\n");
               process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
               return;
@@ -74,7 +88,11 @@ test("PiCliHarness drives a persistent RPC session", async () => {
     assert.equal(await harness.resumeSession(session), true);
     assert.equal(await harness.send(session, "hello"), "reply:hello");
     assert.equal(await harness.send(session, "transient"), "reply:transient");
-    assert.equal(await harness.send(session, "transient-five"), "reply:transient-five");
+    assert.equal(await harness.send(session, "transient-retries"), "reply:transient-retries");
+    assert.equal(await harness.send(session, "network-transient-exit"), "reply:network-transient-exit");
+    assert.equal(await readFile(networkRetryPath, "utf8"), "2");
+    assert.equal(await harness.send(session, "network-agent-exit"), "reply:network-agent-exit");
+    assert.equal(await readFile(networkExitRetryPath, "utf8"), "2");
     await assert.rejects(harness.send(session, "empty"), /PI_EMPTY_RESPONSE/);
     assert.equal(await harness.steer(session, "follow up"), "reply:follow up");
     const long = harness.send(session, "long");
@@ -122,8 +140,9 @@ test("PiCliHarness drives a persistent RPC session", async () => {
 });
 
 test("Pi network failures produce actionable categories", () => {
-  assert.equal(PI_MAX_NETWORK_RETRIES, 5);
+  assert.equal(PI_MAX_NETWORK_RETRIES, 10);
   assert.equal(piNetworkFailureHint(new Error("fetch failed: ECONNRESET")), "与模型服务的连接被重置");
   assert.equal(piNetworkFailureHint(new Error("fetch failed")), "模型服务网络请求失败（fetch failed）");
+  assert.equal(piNetworkFailureHint(new Error("PI_EXIT:1:ECONNRESET")), "与模型服务的连接被重置");
   assert.equal(piNetworkFailureHint(new Error("PI_TIMEOUT")), undefined);
 });

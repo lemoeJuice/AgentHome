@@ -5,6 +5,7 @@ export interface PluginCapabilityPolicy {
   allowedPermissions?: string[];
   guestAllowedActions?: string[];
   guestAllowedPermissions?: string[];
+  guestTaskExecutionEnabled?: boolean;
 }
 
 export function deriveCapabilities(requester: RequesterContext, conversation: ConversationAddress, owner: { platform: string; accountId: string; userId: string } | undefined, conversationId: string, policy: PluginCapabilityPolicy = {}): CapabilitySet {
@@ -15,20 +16,21 @@ export function deriveCapabilities(requester: RequesterContext, conversation: Co
   const isOwner = requester.trust === "OWNER" && isOwnerIdentity;
   const trust: Trust = isOwner ? "OWNER" : "GUEST";
   const principalScope = requester.principalId ?? requester.userId;
-  const baseScopes: MemoryScope[] = ["global_agent", conversation.kind === "group" ? `group:${conversationId}` : `user:${principalScope}`];
+  const baseScopes: MemoryScope[] = [`user:${principalScope}`];
+  if (trust === "OWNER") baseScopes.push("global_agent");
   if (trust === "OWNER" && conversation.kind === "private") baseScopes.push("owner_private");
-  const canCreate = trust === "OWNER";
+  const canCreate = trust === "OWNER" || policy.guestTaskExecutionEnabled === true;
   const allowedActions = trust === "OWNER" ? policy.allowedActions : policy.guestAllowedActions;
   const allowedPermissions = trust === "OWNER" ? policy.allowedPermissions : policy.guestAllowedPermissions;
   return {
     memory: { allowedScopes: baseScopes },
     // Requester permissions follow the authenticated identity. Conversation-scoped
     // Memory and chat destinations remain bounded separately below.
-    projects: trust === "OWNER" ? [{ projectId: "*", access: "WRITE" }] : [],
+    projects: canCreate ? [{ projectId: "*", access: "WRITE" }] : [],
     qq: { readConversations: [conversationId], sendConversations: [conversationId] },
     plugins: { allowedActions: [...new Set(allowedActions ?? [])], ...(allowedPermissions ? { allowedPermissions: [...new Set(allowedPermissions)] } : {}) },
-    artifacts: { readableArtifactAuthorities: ["agent-home"], publishTaskIds: isOwner ? ["*"] : [], allowedDestinations: [conversationId] },
-    tasks: { canCreate, visibleTaskIds: [], canCancel: trust === "OWNER", canFollowUp: true },
+    artifacts: { readableArtifactAuthorities: ["agent-home"], publishTaskIds: canCreate ? ["*"] : [], allowedDestinations: [conversationId] },
+    tasks: { canCreate, visibleTaskIds: [], canCancel: trust === "OWNER" || canCreate, canFollowUp: true },
   };
 }
 

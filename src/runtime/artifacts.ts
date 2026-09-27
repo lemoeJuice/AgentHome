@@ -13,6 +13,7 @@ export interface ArtifactMetadata {
   producerWorkerId?: string;
   sourceConversationId?: string;
   sourceRequesterId?: string;
+  sourcePrincipalId?: string;
   sourceEventId?: string;
   filename: string;
   mime?: string;
@@ -52,6 +53,8 @@ export class ArtifactService {
     retentionClass?: ArtifactMetadata["retentionClass"];
     ownerInvocationId?: string;
     ownerPluginId?: string;
+    sourcePrincipalId?: string;
+    principalQuotaBytes?: number;
   }): Promise<ArtifactMetadata> {
     if (!input.capability.publishTaskIds.includes(input.taskId) && !input.capability.publishTaskIds.includes("*")) {
       this.audit("artifact.publish", "DENY", "ARTIFACT_PUBLISH_DENIED", input.taskId, input.workerId ? `worker:${input.workerId}` : undefined, input.taskId);
@@ -65,6 +68,7 @@ export class ArtifactService {
     const info = await stat(candidate);
     if (!info.isFile()) throw new Error("ARTIFACT_NOT_REGULAR_FILE");
     if (info.size > input.maxBytes) throw new Error("ARTIFACT_SIZE_LIMIT");
+    if (input.sourcePrincipalId && input.principalQuotaBytes !== undefined && this.principalArtifactBytes(input.sourcePrincipalId) + info.size > input.principalQuotaBytes) throw new Error("PRINCIPAL_ARTIFACT_QUOTA_EXCEEDED");
     const id = newId("artifact");
     const filename = basename(candidate).replace(/[\u0000-\u001f]/g, "_").slice(0, 180) || "artifact";
     const retentionClass = input.retentionClass ?? "task-lifetime";
@@ -76,13 +80,20 @@ export class ArtifactService {
     const digest = await this.sha256(target);
     const createdAt = nowIso();
     const expiresAt = input.expiresAt ?? (retentionClass === "temporary" ? new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() : undefined);
-    this.db.run("INSERT INTO artifacts(id,owner_task_id,producer_worker_id,source_type,canonical_path,filename,mime,size,sha256,status,created_at,expires_at,retention_class,owner_invocation_id,owner_plugin_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", id, input.taskId, input.workerId ?? null, input.sourceType ?? "WORKER_OUTPUT", target, filename, input.mime ?? null, targetInfo.size, digest, "AVAILABLE", createdAt, expiresAt ?? null, retentionClass, input.ownerInvocationId ?? null, input.ownerPluginId ?? null);
+    try {
+      this.db.transaction(() => {
+        if (input.sourcePrincipalId && input.principalQuotaBytes !== undefined) this.assertPrincipalQuota(input.sourcePrincipalId, input.principalQuotaBytes, targetInfo.size);
+        this.db.run("INSERT INTO artifacts(id,owner_task_id,producer_worker_id,source_type,canonical_path,filename,mime,size,sha256,status,created_at,expires_at,retention_class,owner_invocation_id,owner_plugin_id,source_principal_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", id, input.taskId, input.workerId ?? null, input.sourceType ?? "WORKER_OUTPUT", target, filename, input.mime ?? null, targetInfo.size, digest, "AVAILABLE", createdAt, expiresAt ?? null, retentionClass, input.ownerInvocationId ?? null, input.ownerPluginId ?? null, input.sourcePrincipalId ?? null);
+      });
+    } catch (error) { await unlink(target).catch(() => undefined); throw error; }
     this.audit("artifact.publish", "ALLOW", undefined, id, input.workerId ? `worker:${input.workerId}` : undefined, input.taskId);
-    return { ref: { authority: "agent-home", artifactId: id }, ownerTaskId: input.taskId, ...(input.workerId ? { producerWorkerId: input.workerId } : {}), filename, ...(input.mime ? { mime: input.mime } : {}), size: targetInfo.size, sha256: digest, status: "AVAILABLE", retentionClass, ...(input.ownerInvocationId ? { ownerInvocationId: input.ownerInvocationId } : {}), ...(input.ownerPluginId ? { ownerPluginId: input.ownerPluginId } : {}), ...(expiresAt ? { expiresAt } : {}) };
+    return { ref: { authority: "agent-home", artifactId: id }, ownerTaskId: input.taskId, ...(input.workerId ? { producerWorkerId: input.workerId } : {}), ...(input.sourcePrincipalId ? { sourcePrincipalId: input.sourcePrincipalId } : {}), filename, ...(input.mime ? { mime: input.mime } : {}), size: targetInfo.size, sha256: digest, status: "AVAILABLE", retentionClass, ...(input.ownerInvocationId ? { ownerInvocationId: input.ownerInvocationId } : {}), ...(input.ownerPluginId ? { ownerPluginId: input.ownerPluginId } : {}), ...(expiresAt ? { expiresAt } : {}) };
   }
 
-  async ingestAttachment(input: { stream: AsyncIterable<Uint8Array>; filename?: string; mime?: string; size?: number; conversationId: string; requesterId?: string; eventId?: string; maxBytes: number }): Promise<ArtifactMetadata> {
+  async ingestAttachment(input: { stream: AsyncIterable<Uint8Array>; filename?: string; mime?: string; size?: number; conversationId: string; requesterId?: string; principalId?: string; principalQuotaBytes?: number; eventId?: string; maxBytes: number }): Promise<ArtifactMetadata> {
     if (input.size !== undefined && input.size > input.maxBytes) throw new Error("ARTIFACT_SIZE_LIMIT");
+    const currentPrincipalBytes = input.principalId ? this.principalArtifactBytes(input.principalId) : 0;
+    if (input.principalQuotaBytes !== undefined && currentPrincipalBytes + (input.size ?? 0) > input.principalQuotaBytes) throw new Error("PRINCIPAL_ARTIFACT_QUOTA_EXCEEDED");
     const id = newId("artifact");
     const safeName = (basename(input.filename ?? "attachment").replace(/[\u0000-\u001f]/g, "_") || "attachment").slice(0, 180);
     const target = resolve(this.stateRoot, "inbox", `${id}-${safeName}`);
@@ -94,6 +105,7 @@ export class ArtifactService {
       for await (const chunk of input.stream) {
         size += chunk.byteLength;
         if (size > input.maxBytes) throw new Error("ARTIFACT_SIZE_LIMIT");
+        if (input.principalQuotaBytes !== undefined && currentPrincipalBytes + size > input.principalQuotaBytes) throw new Error("PRINCIPAL_ARTIFACT_QUOTA_EXCEEDED");
         hash.update(chunk);
         if (!output.write(chunk)) await once(output, "drain");
       }
@@ -109,15 +121,20 @@ export class ArtifactService {
     }
     const createdAt = nowIso();
     const digest = hash.digest("hex");
-    this.db.run("INSERT INTO artifacts(id,owner_task_id,producer_worker_id,source_type,canonical_path,filename,mime,size,sha256,status,created_at,source_conversation_id,source_requester_id,source_event_id,retention_class,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", id, null, null, "QQ_INBOUND", target, safeName, input.mime ?? null, size, digest, "AVAILABLE", createdAt, input.conversationId, input.requesterId ?? null, input.eventId ?? null, "task-lifetime", null);
-    return { ref: { authority: "agent-home", artifactId: id }, filename: safeName, ...(input.mime ? { mime: input.mime } : {}), size, sha256: digest, status: "AVAILABLE", retentionClass: "task-lifetime" };
+    try {
+      this.db.transaction(() => {
+        if (input.principalId && input.principalQuotaBytes !== undefined) this.assertPrincipalQuota(input.principalId, input.principalQuotaBytes, size);
+        this.db.run("INSERT INTO artifacts(id,owner_task_id,producer_worker_id,source_type,canonical_path,filename,mime,size,sha256,status,created_at,source_conversation_id,source_requester_id,source_event_id,retention_class,expires_at,source_principal_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", id, null, null, "QQ_INBOUND", target, safeName, input.mime ?? null, size, digest, "AVAILABLE", createdAt, input.conversationId, input.requesterId ?? null, input.eventId ?? null, "task-lifetime", null, input.principalId ?? null);
+      });
+    } catch (error) { await unlink(target).catch(() => undefined); throw error; }
+    return { ref: { authority: "agent-home", artifactId: id }, ...(input.principalId ? { sourcePrincipalId: input.principalId } : {}), filename: safeName, ...(input.mime ? { mime: input.mime } : {}), size, sha256: digest, status: "AVAILABLE", retentionClass: "task-lifetime" };
   }
 
   get(ref: ArtifactRef): ArtifactMetadata & { path: string } {
     if (ref.authority !== "agent-home") throw new Error("ARTIFACT_AUTHORITY_MISMATCH");
-    const row = this.db.get<{ id: string; owner_task_id: string | null; producer_worker_id: string | null; source_conversation_id: string | null; source_requester_id: string | null; source_event_id: string | null; filename: string; mime: string | null; size: number; sha256: string; status: ArtifactMetadata["status"]; canonical_path: string; expires_at: string | null; retention_class: ArtifactMetadata["retentionClass"]; owner_invocation_id: string | null; owner_plugin_id: string | null }>("SELECT id,owner_task_id,producer_worker_id,source_conversation_id,source_requester_id,source_event_id,filename,mime,size,sha256,status,canonical_path,expires_at,retention_class,owner_invocation_id,owner_plugin_id FROM artifacts WHERE id=?", ref.artifactId);
+    const row = this.db.get<{ id: string; owner_task_id: string | null; producer_worker_id: string | null; source_conversation_id: string | null; source_requester_id: string | null; source_principal_id: string | null; source_event_id: string | null; filename: string; mime: string | null; size: number; sha256: string; status: ArtifactMetadata["status"]; canonical_path: string; expires_at: string | null; retention_class: ArtifactMetadata["retentionClass"]; owner_invocation_id: string | null; owner_plugin_id: string | null }>("SELECT id,owner_task_id,producer_worker_id,source_conversation_id,source_requester_id,source_principal_id,source_event_id,filename,mime,size,sha256,status,canonical_path,expires_at,retention_class,owner_invocation_id,owner_plugin_id FROM artifacts WHERE id=?", ref.artifactId);
     if (!row) throw new Error("ARTIFACT_NOT_FOUND");
-    return { ref, ...(row.owner_task_id ? { ownerTaskId: row.owner_task_id } : {}), ...(row.producer_worker_id ? { producerWorkerId: row.producer_worker_id } : {}), ...(row.source_conversation_id ? { sourceConversationId: row.source_conversation_id } : {}), ...(row.source_requester_id ? { sourceRequesterId: row.source_requester_id } : {}), ...(row.source_event_id ? { sourceEventId: row.source_event_id } : {}), filename: row.filename, ...(row.mime ? { mime: row.mime } : {}), size: row.size, sha256: row.sha256, status: row.status, retentionClass: row.retention_class, ...(row.owner_invocation_id ? { ownerInvocationId: row.owner_invocation_id } : {}), ...(row.owner_plugin_id ? { ownerPluginId: row.owner_plugin_id } : {}), path: row.canonical_path, ...(row.expires_at ? { expiresAt: row.expires_at } : {}) };
+    return { ref, ...(row.owner_task_id ? { ownerTaskId: row.owner_task_id } : {}), ...(row.producer_worker_id ? { producerWorkerId: row.producer_worker_id } : {}), ...(row.source_conversation_id ? { sourceConversationId: row.source_conversation_id } : {}), ...(row.source_requester_id ? { sourceRequesterId: row.source_requester_id } : {}), ...(row.source_principal_id ? { sourcePrincipalId: row.source_principal_id } : {}), ...(row.source_event_id ? { sourceEventId: row.source_event_id } : {}), filename: row.filename, ...(row.mime ? { mime: row.mime } : {}), size: row.size, sha256: row.sha256, status: row.status, retentionClass: row.retention_class, ...(row.owner_invocation_id ? { ownerInvocationId: row.owner_invocation_id } : {}), ...(row.owner_plugin_id ? { ownerPluginId: row.owner_plugin_id } : {}), path: row.canonical_path, ...(row.expires_at ? { expiresAt: row.expires_at } : {}) };
   }
 
   bindToTask(ref: ArtifactRef, input: { taskId: string; conversationId: string; requesterId: string }): void {
@@ -228,6 +245,14 @@ export class ArtifactService {
     const hash = createHash("sha256");
     for await (const chunk of createReadStream(path)) hash.update(chunk);
     return hash.digest("hex");
+  }
+
+  private principalArtifactBytes(principalId: string): number {
+    return Number(this.db.get<{ bytes: number }>("SELECT COALESCE(SUM(size),0) AS bytes FROM artifacts WHERE source_principal_id=? AND status IN ('AVAILABLE','PUBLISHED')", principalId)?.bytes ?? 0);
+  }
+
+  private assertPrincipalQuota(principalId: string, quotaBytes: number, addedBytes: number): void {
+    if (this.principalArtifactBytes(principalId) + addedBytes > quotaBytes) throw new Error("PRINCIPAL_ARTIFACT_QUOTA_EXCEEDED");
   }
 
   private audit(operation: string, decision: "ALLOW" | "DENY", reason: string | undefined, resource: string, requesterId?: string, taskId?: string): void {

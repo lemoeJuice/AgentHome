@@ -22,7 +22,8 @@ export interface AppConfig {
     accountOverrides?: Record<string, Partial<{ commandRequireMention: boolean; naturalLanguageMode: "observe_all" | "explicit_wake" }>>;
   };
   agent: { persona: string };
-  runtime: { maxInFlight: number; maxWorkers: number; maxWorkersTotal: number; maxWorkersPerProject: number; maxWorkersPerRequester: number; maxTasks: number; maxArtifactBytes: number; piCommand: string; piTimeoutMs: number; workerSandboxCommand: string; piAgentDir: string };
+  runtime: { maxInFlight: number; maxWorkers: number; maxWorkersTotal: number; maxWorkersPerProject: number; maxWorkersPerRequester: number; maxTasks: number; maxTasksPerRequester: number; maxTasksPerPrincipal: number; maxArtifactBytes: number; piCommand: string; piTimeoutMs: number; workerSandboxCommand: string; piAgentDir: string };
+  guest: { enabled: boolean; maxWorkersPerPrincipal: number; taskTimeoutMs: number; commandTimeoutMs: number; cpuSeconds: number; memoryBytes: number; pids: number; maxFileBytes: number; workspaceQuotaBytes: number; cacheQuotaBytes: number; artifactQuotaBytes: number };
   memory: { rawEpisodeDays: number | null; keepExplicitForever: boolean; keepProvenanceForActiveFacts: boolean; maxPromptBytes: number };
   plugins: { enabled: string[]; allowedActions?: string[]; allowedPermissions?: string[]; guestAllowedActions?: string[]; guestAllowedPermissions?: string[] };
   logging: { level: LogLevel };
@@ -52,7 +53,8 @@ const defaults: AppConfig = {
     accountOverrides: {},
   },
   agent: { persona: "" },
-  runtime: { maxInFlight: 16, maxWorkers: 2, maxWorkersTotal: 8, maxWorkersPerProject: 2, maxWorkersPerRequester: 4, maxTasks: 32, maxArtifactBytes: 50 * 1024 * 1024, piCommand: "pi", piTimeoutMs: 60 * 60 * 1000, workerSandboxCommand: "bwrap", piAgentDir: "/state/home/.pi/agent" },
+  runtime: { maxInFlight: 16, maxWorkers: 2, maxWorkersTotal: 8, maxWorkersPerProject: 2, maxWorkersPerRequester: 4, maxTasks: 32, maxTasksPerRequester: 8, maxTasksPerPrincipal: 8, maxArtifactBytes: 50 * 1024 * 1024, piCommand: "pi", piTimeoutMs: 60 * 60 * 1000, workerSandboxCommand: "bwrap", piAgentDir: "/state/model/pi/agent" },
+  guest: { enabled: false, maxWorkersPerPrincipal: 1, taskTimeoutMs: 30 * 60 * 1000, commandTimeoutMs: 10 * 60 * 1000, cpuSeconds: 600, memoryBytes: 16 * 1024 * 1024 * 1024, pids: 128, maxFileBytes: 512 * 1024 * 1024, workspaceQuotaBytes: 2 * 1024 * 1024 * 1024, cacheQuotaBytes: 1024 * 1024 * 1024, artifactQuotaBytes: 512 * 1024 * 1024 },
   memory: { rawEpisodeDays: 30, keepExplicitForever: true, keepProvenanceForActiveFacts: true, maxPromptBytes: 24 * 1024 },
   plugins: { enabled: [], allowedActions: [], allowedPermissions: [], guestAllowedActions: [], guestAllowedPermissions: [] },
   logging: { level: "info" },
@@ -103,6 +105,11 @@ export async function loadConfig(path = process.env.AGENT_HOME_CONFIG ?? "./conf
   }
   if (process.env.PI_COMMAND) config.runtime.piCommand = process.env.PI_COMMAND;
   if (process.env.PI_AGENT_DIR) config.runtime.piAgentDir = process.env.PI_AGENT_DIR;
+  if (resolve(config.runtime.piAgentDir) === resolve("/state/model/pi/agent")) config.runtime.piAgentDir = join(config.paths.stateRoot, "model", "pi", "agent");
+  if (resolve(config.runtime.piAgentDir) === resolve(config.paths.stateRoot, "home", ".pi", "agent")) config.runtime.piAgentDir = join(config.paths.stateRoot, "model", "pi", "agent");
+  // Node 22's bundled undici reserves substantial WebAssembly virtual address
+  // space. The former 2 GiB RLIMIT_AS prevented Pi from starting and broke fetch/npm.
+  if (config.guest.memoryBytes === 2 * 1024 * 1024 * 1024) config.guest.memoryBytes = 16 * 1024 * 1024 * 1024;
   if (process.env.AGENT_HOME_WORKER_SANDBOX) config.runtime.workerSandboxCommand = process.env.AGENT_HOME_WORKER_SANDBOX;
   if (process.env.AGENT_HOME_LOG_LEVEL) config.logging.level = process.env.AGENT_HOME_LOG_LEVEL as LogLevel;
   delete (config.runtime as AppConfig["runtime"] & { piProvider?: string }).piProvider;
@@ -116,7 +123,10 @@ export function validateConfig(config: AppConfig): void {
   if (required.some((value) => !value)) throw new Error("CONFIG_MISSING: instance and SnowLuma endpoints are required");
   if (!Number.isInteger(config.runtime.maxInFlight) || config.runtime.maxInFlight < 1) throw new Error("CONFIG_INVALID: runtime.maxInFlight");
   if (!Number.isInteger(config.runtime.maxWorkers) || config.runtime.maxWorkers < 1) throw new Error("CONFIG_INVALID: runtime.maxWorkers");
-  for (const key of ["maxWorkersTotal", "maxWorkersPerProject", "maxWorkersPerRequester", "maxTasks"] as const) if (!Number.isInteger(config.runtime[key]) || config.runtime[key] < 1) throw new Error(`CONFIG_INVALID: runtime.${key}`);
+  for (const key of ["maxWorkersTotal", "maxWorkersPerProject", "maxWorkersPerRequester", "maxTasks", "maxTasksPerRequester", "maxTasksPerPrincipal"] as const) if (!Number.isInteger(config.runtime[key]) || config.runtime[key] < 1) throw new Error(`CONFIG_INVALID: runtime.${key}`);
+  if (typeof config.guest.enabled !== "boolean") throw new Error("CONFIG_INVALID: guest.enabled");
+  for (const key of ["maxWorkersPerPrincipal", "taskTimeoutMs", "commandTimeoutMs", "cpuSeconds", "memoryBytes", "pids", "maxFileBytes", "workspaceQuotaBytes", "cacheQuotaBytes", "artifactQuotaBytes"] as const) if (!Number.isSafeInteger(config.guest[key]) || config.guest[key] < 1) throw new Error(`CONFIG_INVALID: guest.${key}`);
+  if (config.guest.enabled && config.guest.memoryBytes < 16 * 1024 * 1024 * 1024) throw new Error("CONFIG_INVALID: guest.memoryBytes must be at least 16 GiB for Node 22 Pi/npm WebAssembly address space");
   if (config.memory.rawEpisodeDays !== null && (!Number.isInteger(config.memory.rawEpisodeDays) || config.memory.rawEpisodeDays < 1)) throw new Error("CONFIG_INVALID: memory.rawEpisodeDays");
   if (typeof config.memory.keepExplicitForever !== "boolean" || typeof config.memory.keepProvenanceForActiveFacts !== "boolean") throw new Error("CONFIG_INVALID: memory.retention");
   if (!Number.isInteger(config.memory.maxPromptBytes) || config.memory.maxPromptBytes < 1024) throw new Error("CONFIG_INVALID: memory.maxPromptBytes");

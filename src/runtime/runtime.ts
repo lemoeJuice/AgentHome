@@ -1,4 +1,5 @@
-import { chmod, mkdir } from "node:fs/promises";
+import { chmod, chown, mkdir } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { unlink } from "node:fs/promises";
 import { createServer, type Server } from "node:net";
@@ -15,6 +16,9 @@ import { PiCliHarness, PI_MAX_NETWORK_RETRIES, piNetworkFailureHint } from "./pi
 import { ArtifactService } from "./artifacts.js";
 import { MemoryService } from "./memory.js";
 import { TaskService, type RuntimeEvent } from "./tasks.js";
+import { PrincipalService, OWNER_PRINCIPAL_ID, PRINCIPAL_UID_MAX, PRINCIPAL_UID_MIN } from "./principals.js";
+import { MODEL_RUNTIME_GID, MODEL_RUNTIME_UID, ModelPlaneService } from "./model-plane.js";
+import { installGuestEgressFilter } from "./guest-network.js";
 import { SnowLumaQQCapability } from "../qq/capability.js";
 import { GatewayMcpClient } from "./mcp.js";
 import { checkSnowLumaMcpInstallation, SnowLumaMcpClient } from "./snowluma-mcp.js";
@@ -29,6 +33,11 @@ export class RuntimeApp {
   readonly memory: MemoryService;
   readonly artifacts: ArtifactService;
   readonly tasks: TaskService;
+  private readonly principals: PrincipalService;
+  private readonly modelPlane: ModelPlaneService;
+  private modelProxyUrl: string | undefined;
+  private readonly modelRuntimeUid: number;
+  private readonly modelRuntimeGid: number;
   readonly mcp?: GatewayMcpClient;
   private readonly pi: PiCliHarness;
   private readonly qq: SnowLumaQQCapability;
@@ -39,6 +48,7 @@ export class RuntimeApp {
   private readonly workerToolsPath: string;
   private readonly mcpControl?: GatewayMcpClient;
   private readonly mainToolContexts = new Map<string, RuntimeToolContext>();
+  private readonly workerToolContexts = new Map<string, RuntimeToolContext>();
   private readonly mainSessions = new Map<string, import("./pi.js").PiSession>();
   private readonly log: Logger;
   private readonly controlToken: string | undefined;
@@ -56,18 +66,28 @@ export class RuntimeApp {
   constructor(config: AppConfig, logger: Logger) {
     this.config = config;
     this.log = logger.child("runtime");
-    this.pluginPolicy = { allowedActions: config.plugins.allowedActions, allowedPermissions: config.plugins.allowedPermissions, guestAllowedActions: config.plugins.guestAllowedActions, guestAllowedPermissions: config.plugins.guestAllowedPermissions };
+    this.modelRuntimeUid = process.getuid?.() === 0 ? MODEL_RUNTIME_UID : process.getuid?.() ?? MODEL_RUNTIME_UID;
+    this.modelRuntimeGid = process.getgid?.() === 0 ? MODEL_RUNTIME_GID : process.getgid?.() ?? MODEL_RUNTIME_GID;
+    this.pluginPolicy = { allowedActions: config.plugins.allowedActions, allowedPermissions: config.plugins.allowedPermissions, guestAllowedActions: config.plugins.guestAllowedActions, guestAllowedPermissions: config.plugins.guestAllowedPermissions, guestTaskExecutionEnabled: config.guest?.enabled ?? true };
     const readSecret = (name: string): string | undefined => { try { return readFileSync(join(config.paths.stateRoot, "secrets", name), "utf8").trim() || undefined; } catch { return undefined; } };
     this.controlToken = readSecret("control-token") ?? process.env.AGENT_HOME_CONTROL_TOKEN;
     this.db = new SqliteStore(join(config.paths.stateRoot, "data", "agent.db"));
     migrate(this.db, runtimeMigrations);
+    this.principals = new PrincipalService(this.db, config.paths.stateRoot);
+    this.modelPlane = new ModelPlaneService(this.db, config.paths.stateRoot, config.runtime.piAgentDir);
+    this.principals.ensureOwnerPrincipal();
+    this.principals.backfillRuntimeIds();
+    if (config.owner) this.principals.resolveIdentity(config.owner.platform, config.owner.accountId, config.owner.userId, config.owner);
+    this.principals.backfillTaskPrincipals(config.owner, config.guest?.taskTimeoutMs);
     this.db.run("UPDATE ingress_events SET status='PENDING',updated_at=? WHERE status='PROCESSING'", nowIso());
     this.db.run("UPDATE main_turn_queue SET status='PENDING',started_at=NULL WHERE status='PROCESSING'");
     this.db.run("UPDATE task_event_outbox SET status='PENDING' WHERE status='ENQUEUED'");
     this.memory = new MemoryService(this.db, config.owner, config.memory);
+    const memoryIsolation = this.memory.isolateLegacyPrincipalScopes();
+    if (memoryIsolation.quarantined > 0) this.log.warn("Legacy shared Memory could not be attributed to a single Principal and was quarantined", memoryIsolation);
     this.memory.recover();
     this.artifacts = new ArtifactService(this.db, config.paths.stateRoot);
-      this.pi = new PiCliHarness(config.runtime.piCommand, this.log, config.runtime.workerSandboxCommand, undefined, { agentDir: config.runtime.piAgentDir });
+      this.pi = new PiCliHarness(config.runtime.piCommand, this.log, config.runtime.workerSandboxCommand, undefined, { agentDir: config.runtime.piAgentDir, launcherUid: this.modelRuntimeUid, launcherGid: this.modelRuntimeGid });
     this.toolSocketPath = `${config.paths.runtimeSocket}.tools`;
     const toolExtension = import.meta.url.endsWith(".ts") ? "pi-tools.ts" : "pi-tools.js";
     this.piToolsPath = fileURLToPath(new URL(`./${toolExtension}`, import.meta.url));
@@ -83,11 +103,23 @@ export class RuntimeApp {
      }
      this.snowlumaMcp = new SnowLumaMcpClient(config, this.log);
      this.qq = new SnowLumaQQCapability(config, this.artifacts, this.log, this.snowlumaMcp);
-    this.tasks = new TaskService(this.db, this.pi, this.artifacts, config, { workerRoot: config.paths.stateRoot, ...(this.mcpControl ? { mcpControl: this.mcpControl, mcpEndpoint: process.env.AGENT_HOME_MCP_URL, workerToolExtensionPath: this.workerToolsPath } : {}), onEvent: (event, task) => this.onTaskEvent(event, task) }, this.log);
-    this.toolServer = new RuntimeToolServer(this.toolSocketPath, (token) => this.mainToolContexts.get(token), (action, input, context) => this.handleMainTool(action, input, context));
+    this.tasks = new TaskService(this.db, this.pi, this.artifacts, config, { workerRoot: config.paths.stateRoot, modelSessionsRoot: this.modelPlane.paths.workerSessions, modelRuntimeUid: this.modelRuntimeUid, modelRuntimeGid: this.modelRuntimeGid, principals: this.principals, guestExecCommand: "/usr/local/bin/agent-home-guest-exec", workerToolExtensionPath: this.workerToolsPath, getModelProxyUrl: () => this.modelProxyUrl, ...(this.mcpControl ? { mcpControl: this.mcpControl, mcpEndpoint: process.env.AGENT_HOME_MCP_URL } : {}), createWorkerToolContext: (worker, task) => this.createWorkerToolContext(worker, task), onEvent: (event, task) => this.onTaskEvent(event, task) }, this.log);
+    this.toolServer = new RuntimeToolServer(this.toolSocketPath, (token) => this.resolveRuntimeToolContext(token), (action, input, context) => this.handleMainTool(action, input, context), { ...(process.getuid?.() === 0 ? { socketGroupId: this.modelRuntimeGid } : {}) });
   }
 
   async start(): Promise<void> {
+    this.modelProxyUrl = process.env.AGENT_HOME_MODEL_PROXY_URL ?? "http://host.containers.internal:7897";
+    await this.modelPlane.ensure();
+    if (process.getuid?.() === 0 && process.getgid?.() === 0) {
+      await this.principals.ensureOwnerDirectories();
+      const toolDirectory = dirname(this.toolSocketPath);
+      await mkdir(toolDirectory, { recursive: true });
+      await chown(toolDirectory, 0, this.modelRuntimeGid);
+      await chmod(toolDirectory, 0o710);
+      installGuestEgressFilter(PRINCIPAL_UID_MIN, PRINCIPAL_UID_MAX);
+    } else if (this.config.guest?.enabled) {
+      throw new Error("GUEST_EXECUTION_REQUIRES_ROOTFUL_OUTER_CONTAINER_USERNS");
+    }
     await this.toolServer.start();
     this.artifactMaintenance = setInterval(() => { void this.artifacts.cleanupExpired().catch((error) => this.log.warn("Artifact cleanup failed", { error: String(error) })); }, 60_000).unref();
     this.runMemoryMaintenance();
@@ -128,6 +160,7 @@ export class RuntimeApp {
     await this.snowlumaMcp.stop();
     await this.toolServer.stop();
     this.mainToolContexts.clear();
+    this.workerToolContexts.clear();
     if (this.artifactMaintenance) clearInterval(this.artifactMaintenance);
     if (this.memoryMaintenance) clearInterval(this.memoryMaintenance);
     await new Promise<void>((resolve) => this.server?.close(() => resolve()) ?? resolve());
@@ -340,7 +373,7 @@ export class RuntimeApp {
     if (replyTo && typeof replyTo === "object" && "messageId" in replyTo) {
       const question = this.db.get<{ binding_id: string }>("SELECT binding_id FROM message_bindings WHERE platform=? AND account_id=? AND platform_conversation_id=? AND thread_id_json=? AND message_id=? AND binding_type='PENDING_QUESTION'", replyTo.platform, replyTo.accountId, replyTo.platformConversationId, JSON.stringify(replyTo.threadId), replyTo.messageId);
       if (question) {
-        await this.tasks.answerQuestion(question.binding_id, String(payload.text ?? ""), { message: event.message?.ref as PlatformMessageRef, conversationId: conversation.id, capabilities: deriveCapabilities({ platform: event.source.platform, accountId: event.source.accountId, userId: event.trustedIdentity?.userId ?? "unknown", principalId: requesterPrincipal.principalId, trust: requesterPrincipal.trust, conversationId: conversation.id }, conversation.address, this.config.owner, conversation.id, this.pluginPolicy) });
+        await this.tasks.answerQuestion(question.binding_id, String(payload.text ?? ""), { message: event.message?.ref as PlatformMessageRef, conversationId: conversation.id, requester: { platform: event.source.platform, accountId: event.source.accountId, userId: event.trustedIdentity?.userId ?? "unknown", principalId: requesterPrincipal.principalId }, trust: requesterPrincipal.trust, capabilities: deriveCapabilities({ platform: event.source.platform, accountId: event.source.accountId, userId: event.trustedIdentity?.userId ?? "unknown", principalId: requesterPrincipal.principalId, trust: requesterPrincipal.trust, conversationId: conversation.id }, conversation.address, this.config.owner, conversation.id, this.pluginPolicy) });
         return;
       }
     }
@@ -348,11 +381,11 @@ export class RuntimeApp {
     if (!text) return;
     const requester = { platform: event.source.platform, accountId: event.source.accountId, userId: event.trustedIdentity?.userId ?? "unknown", principalId: requesterPrincipal.principalId, trust: requesterPrincipal.trust, conversationId: conversation.id };
     const caps = deriveCapabilities(requester, conversation.address, this.config.owner, conversation.id, this.pluginPolicy);
-    const episodeScope: MemoryScope = conversation.address.kind === "group" ? `group:${conversation.id}` : `user:${requester.principalId ?? requester.userId}`;
+    const episodeScope: MemoryScope = `user:${requester.principalId ?? requester.userId}`;
     if (caps.memory.allowedScopes.includes(episodeScope)) {
       this.memory.ingestEpisode({
-        access: { requesterId: requester.userId, ...(requester.principalId ? { principalId: requester.principalId } : {}), trust: caps.memory.allowedScopes.includes("owner_private") ? "OWNER" : "GUEST", allowedScopes: caps.memory.allowedScopes, conversationId: conversation.id },
-        episode: { scope: episodeScope, source: { type: "chat.message", platform: event.source.platform, sourceId: event.eventId }, actor: { type: "user", id: requester.userId }, content: text, occurredAt: event.occurredAt, trust: caps.memory.allowedScopes.includes("owner_private") ? "owner" : "guest" },
+        access: { requesterId: requester.userId, ...(requester.principalId ? { principalId: requester.principalId } : {}), trust: requesterPrincipal.trust, allowedScopes: caps.memory.allowedScopes, conversationId: conversation.id },
+        episode: { scope: episodeScope, source: { type: "chat.message", platform: event.source.platform, sourceId: event.eventId }, actor: { type: "user", id: requester.userId }, content: text, occurredAt: event.occurredAt, trust: requesterPrincipal.trust === "OWNER" ? "owner" : "guest" },
       });
     }
       this.enqueueMainTurn({ kind: "MESSAGE", conversationId: conversation.id, address: conversation.address, event, text, payload, capabilities: caps });
@@ -361,11 +394,9 @@ export class RuntimeApp {
   private async mainTurn(conversationId: string, address: ConversationAddress, event: ControllerEventEnvelope, text: string, payload: Record<string, unknown>, caps: ReturnType<typeof deriveCapabilities>, delivery?: { kind: string; relatedId?: string }): Promise<import("../shared/types.js").SendResult> {
     const sendAuthorization = authorizeSend(caps, conversationId);
     if (!sendAuthorization.allowed) throw new Error(`SEND_DENIED:${sendAuthorization.reason}`);
-    const mainWorkspace = join(this.config.paths.stateRoot, "home", ".pi", "main", "workspaces", conversationId.replaceAll("\u001f", "_"));
-    await mkdir(mainWorkspace, { recursive: true });
     let session = this.db.get<{ main_session_id: string | null; main_session_path: string | null }>("SELECT main_session_id,main_session_path FROM conversations WHERE conversation_id=?", conversationId);
-    const mainSessionRoot = session?.main_session_path ? dirname(session.main_session_path) : join(this.config.paths.stateRoot, "home", ".pi", "main", "sessions", conversationId.replaceAll("\u001f", "_"));
-    await mkdir(mainSessionRoot, { recursive: true });
+    const mainSessionRoot = session?.main_session_path ? dirname(session.main_session_path) : join(this.modelPlane.paths.mainSessions, safePathSegment(conversationId));
+    await this.modelPlane.ensureSessionDirectory(mainSessionRoot);
     const conversation = this.getConversation(conversationId);
     const requesterPrincipal = this.resolvePrincipalIdentity(event.source.platform, event.source.accountId, event.trustedIdentity?.userId ?? "unknown");
     const toolToken = [...this.mainToolContexts.entries()].find(([, context]) => context.conversationId === conversationId)?.[0] ?? newId("main-tool");
@@ -381,10 +412,10 @@ export class RuntimeApp {
        ...(this.messageRef(event.message?.replyTo) ? { replyTo: this.messageRef(event.message?.replyTo) } : {}),
         ...(typeof payload.taskId === "string" ? { taskId: payload.taskId } : {}),
     });
-    const mainSandbox = { workspaceRoot: mainWorkspace, sessionRoot: mainSessionRoot, writeAccess: true, toolSocket: this.toolSocketPath, toolToken } as const;
+    const mainSandbox = { sessionRoot: mainSessionRoot, modelProxyUrl: this.modelProxyUrl, toolSocket: this.toolSocketPath, toolToken, launcherUid: this.modelRuntimeUid, launcherGid: this.modelRuntimeGid } as const;
     if (!session?.main_session_path || !session.main_session_id) {
       const path = join(mainSessionRoot, "session.jsonl");
-      const created = await this.pi.createSession(path, { cwd: mainWorkspace, sandbox: mainSandbox, mainTools: true, extensionPath: this.piToolsPath });
+      const created = await this.pi.createSession(path, { cwd: mainSessionRoot, sandbox: mainSandbox, mainTools: true, extensionPath: this.piToolsPath });
       this.db.run("UPDATE conversations SET main_session_id=?,main_session_path=?,updated_at=? WHERE conversation_id=?", created.sessionId, created.sessionPath, nowIso(), conversationId);
       session = { main_session_id: created.sessionId, main_session_path: created.sessionPath };
     }
@@ -407,7 +438,7 @@ export class RuntimeApp {
         this.log.warn("Inbound artifact was not made available to Main", { artifactId: ref.artifactId, conversationId, error: String(error) });
       }
     }
-    const memory = this.memory.promptContext(this.memory.retrieve({ text, access: { requesterId: event.trustedIdentity?.userId ?? "unknown", ...(event.trustedIdentity?.principalId ? { principalId: event.trustedIdentity.principalId } : {}), trust: caps.memory.allowedScopes.includes("owner_private") ? "OWNER" : "GUEST", allowedScopes: caps.memory.allowedScopes, conversationId }, limit: 8 }), this.config.memory?.maxPromptBytes);
+    const memory = this.memory.promptContext(this.memory.retrieve({ text, access: { requesterId: event.trustedIdentity?.userId ?? "unknown", ...(requesterPrincipal.principalId ? { principalId: requesterPrincipal.principalId } : {}), trust: requesterPrincipal.trust, allowedScopes: caps.memory.allowedScopes, conversationId }, limit: 8 }), this.config.memory?.maxPromptBytes);
     const persona = (this.config.agent?.persona ?? "").trim();
     const currentMessageInstruction = event.message
       ? `The trigger summary intentionally omits platform message details. Always call get_current_message before answering any user-triggered message. If the returned message contains an attachment and its content is needed, call get_attachment for it before answering; never infer omitted content or claim an attachment is missing without using these tools. Current message reference (trusted routing metadata, not message content): ${JSON.stringify(event.message.ref)}${event.message.replyTo && typeof event.message.replyTo === "object" && "messageId" in event.message.replyTo ? `\nReply reference: ${JSON.stringify(event.message.replyTo)}` : ""}`
@@ -428,7 +459,7 @@ export class RuntimeApp {
     ].filter(Boolean).join("\n\n");
     try {
       const mainSession = { sessionId: session.main_session_id as string, sessionPath: session.main_session_path as string };
-      const response = await this.pi.send(mainSession, prompt, { cwd: mainWorkspace, sandbox: mainSandbox, timeoutMs: this.config.runtime.piTimeoutMs, mainTools: true, extensionPath: this.piToolsPath });
+      const response = await this.pi.send(mainSession, prompt, { cwd: mainSessionRoot, sandbox: mainSandbox, timeoutMs: this.config.runtime.piTimeoutMs, mainTools: true, extensionPath: this.piToolsPath });
       if (!response.trim()) throw new Error("PI_EMPTY_RESPONSE");
       return await this.sendText(address, response, event.message?.ref, conversationId, caps, delivery);
     } catch (error) {
@@ -436,6 +467,8 @@ export class RuntimeApp {
       const networkFailure = piNetworkFailureHint(error);
       const reply = networkFailure
         ? `模型服务网络错误：${networkFailure}。已自动重试 ${PI_MAX_NETWORK_RETRIES} 次仍失败，请检查宿主机 TUN/网络连接后重新发送。`
+        : String(error).includes("PI_PROVIDER_AUTH_FAILURE")
+          ? "Pi 模型认证失败，请运行 scripts/pi-login.sh 重新完成 provider 登录后再试。"
         : "Main 当前不可用，Runtime 已保留这条消息；请稍后重试。";
       return await this.sendText(address, reply, event.message?.ref, conversationId, caps, delivery);
     }
@@ -481,7 +514,7 @@ export class RuntimeApp {
         const source = await this.qq.getMessage(ref, context.address.kind, { conversationId: context.conversationId, capabilities: context.capabilities, target: context.address });
         if (!source || ("kind" in source && source.kind === "NOT_IMPLEMENTED") || !source.message.attachments.some((item) => item.id && item.id === attachment.id)) throw new Error("ATTACHMENT_NOT_IN_MESSAGE");
         const transfer = await this.qq.fetchAttachment(attachment, { conversationId: context.conversationId, capabilities: context.capabilities, target: context.address });
-        const artifact = await this.artifacts.ingestAttachment({ ...transfer, conversationId: context.conversationId, requesterId: context.requesterId, ...(context.eventId ? { eventId: context.eventId } : {}), maxBytes: this.config.runtime.maxArtifactBytes });
+        const artifact = await this.artifacts.ingestAttachment({ ...transfer, conversationId: context.conversationId, requesterId: context.requesterId, ...(context.requester.principalId ? { principalId: context.requester.principalId } : {}), ...(context.trust === "GUEST" ? { principalQuotaBytes: this.config.guest.artifactQuotaBytes } : {}), ...(context.eventId ? { eventId: context.eventId } : {}), maxBytes: this.config.runtime.maxArtifactBytes });
         return artifact as never;
       }
       case "list_tasks": {
@@ -513,18 +546,20 @@ export class RuntimeApp {
            ...(Array.isArray(values.artifactRefs) ? { artifactRefs: values.artifactRefs.map(readArtifactRef) } : {}),
           ...(values.requestedCapabilities && typeof values.requestedCapabilities === "object" ? { requestedCapabilities: values.requestedCapabilities as Partial<CapabilitySet> } : {}),
           actor: context.capabilities,
+          actorPrincipalId: context.requester.principalId,
+          actorRequester: context.requester,
         });
         return { id: worker.id, taskId: worker.taskId, status: worker.status, workspaceId: worker.workspaceId ?? null };
       }
       case "cancel_task": {
         const task = this.visibleTask(String(values.taskId ?? ""), context);
-        await this.tasks.requestCancel(task.id, context.capabilities);
+        await this.tasks.requestCancel(task.id, context.capabilities, context.requester.principalId, context.requester);
         return { taskId: task.id, status: "CANCEL_REQUESTED" };
       }
       case "follow_up_task": {
         const task = this.visibleTask(String(values.taskId ?? ""), context);
         if (!context.message) throw new Error("TOOL_MESSAGE_CONTEXT_REQUIRED");
-        await this.tasks.addFollowUp(task.id, requiredText(values.content, "content"), { conversationId: context.conversationId, message: context.message, capabilities: context.capabilities });
+        await this.tasks.addFollowUp(task.id, requiredText(values.content, "content"), { conversationId: context.conversationId, message: context.message, requester: context.requester, capabilities: context.capabilities });
         return { taskId: task.id, status: "FOLLOW_UP_ACCEPTED" };
       }
       case "finish_task": {
@@ -548,6 +583,33 @@ export class RuntimeApp {
       case "send_message": {
         const sent = await this.sendText(context.address, requiredText(values.text, "text"), context.message, context.conversationId, context.capabilities, { kind: "MAIN_TOOL" });
         return sent.message as never;
+      }
+      case "worker_exec":
+      case "workspace_read":
+      case "workspace_write":
+      case "workspace_edit":
+      case "workspace_mkdir":
+      case "workspace_remove":
+      case "workspace_list":
+      case "workspace_stat": {
+        const executionContext = await this.resolveWorkerExecutionContext(context);
+        if (action === "worker_exec") {
+          const command = requiredText(values.command, "command");
+          const cwd = typeof values.cwd === "string" ? values.cwd : undefined;
+          const timeoutMs = typeof values.timeoutMs === "number" ? values.timeoutMs : undefined;
+          return await this.tasks.execute(executionContext, { command, cwd, timeoutMs }) as never;
+        }
+        const path = action === "workspace_list" && values.path === undefined ? "" : requiredText(values.path, "path");
+        if (action === "workspace_read") return await this.tasks.readFile(executionContext, path) as never;
+        if (action === "workspace_write") return await this.tasks.writeFile(executionContext, path, requiredText(values.content, "content")) as never;
+        if (action === "workspace_edit") {
+          if (typeof values.newText !== "string") throw new Error("TOOL_INPUT_REQUIRED:newText");
+          return await this.tasks.editFile(executionContext, path, requiredText(values.oldText, "oldText"), values.newText) as never;
+        }
+        if (action === "workspace_mkdir") return await this.tasks.makeDirectory(executionContext, path) as never;
+        if (action === "workspace_remove") return await this.tasks.removePath(executionContext, path) as never;
+        if (action === "workspace_list") return await this.tasks.listDirectory(executionContext, path) as never;
+        return await this.tasks.statPath(executionContext, path) as never;
       }
       case "list_snowluma_actions":
         return await this.snowlumaMcp.listActions(typeof values.category === "string" ? values.category : undefined) as never;
@@ -610,6 +672,44 @@ export class RuntimeApp {
       default:
         throw new Error("TOOL_NOT_FOUND");
     }
+  }
+
+  private createWorkerToolContext(worker: import("../shared/types.js").WorkerExecutionRecord, task: TaskRecord): { token: string; socketPath: string } {
+    if (!task.requester.principalId) throw new Error("WORKER_PRINCIPAL_REQUIRED");
+    const conversation = this.getConversation(task.originConversationId);
+    const token = newId("worker-tool");
+    this.workerToolContexts.set(token, {
+      conversationId: task.originConversationId,
+      requesterId: task.requester.userId,
+      requester: task.requester,
+      trust: task.trust,
+      address: conversation.address,
+      capabilities: worker.capabilities ?? task.capabilities,
+      taskId: task.id,
+      workerId: worker.id,
+      executionContextId: `${task.id}:${worker.id}:${task.requester.principalId}`,
+    });
+    return { token, socketPath: this.toolSocketPath };
+  }
+
+  private resolveRuntimeToolContext(token: string): RuntimeToolContext | undefined {
+    const main = this.mainToolContexts.get(token);
+    if (main) return main;
+    const worker = this.workerToolContexts.get(token);
+    if (!worker?.workerId) return undefined;
+    try {
+      const status = this.tasks.getWorker(worker.workerId).status;
+      if (["STARTING", "RUNNING", "WAITING_USER"].includes(status)) return worker;
+    } catch { /* stale token */ }
+    this.workerToolContexts.delete(token);
+    return undefined;
+  }
+
+  private async resolveWorkerExecutionContext(context: RuntimeToolContext): Promise<import("./execution.js").ExecutionContext> {
+    if (!context.workerId || !context.taskId || !context.executionContextId) throw new Error("WORKER_EXEC_CONTEXT_REQUIRED");
+    const executionContext = await this.tasks.executionContext(context.workerId);
+    if (executionContext.executionContextId !== context.executionContextId || executionContext.taskId !== context.taskId) throw new Error("EXECUTION_CONTEXT_STALE_OR_FORGED");
+    return executionContext;
   }
 
   private visibleTask(taskId: string, context: RuntimeToolContext): TaskRecord {
@@ -678,9 +778,8 @@ export class RuntimeApp {
         await this.pi.abort(previousSession);
         this.mainSessions.delete(conversationId);
       }
-      const sessionRoot = join(this.config.paths.stateRoot, "home", ".pi", "main", "sessions", conversationId.replaceAll("\u001f", "_"));
-      const workspace = join(this.config.paths.stateRoot, "home", ".pi", "main", "workspaces", conversationId.replaceAll("\u001f", "_"));
-      await mkdir(sessionRoot, { recursive: true }); await mkdir(workspace, { recursive: true });
+       const sessionRoot = join(this.modelPlane.paths.mainSessions, safePathSegment(conversationId));
+       await this.modelPlane.ensureSessionDirectory(sessionRoot);
       const path = join(sessionRoot, `${Date.now()}.jsonl`);
       for (const [token, context] of this.mainToolContexts) if (context.conversationId === conversationId) this.mainToolContexts.delete(token);
       const toolToken = newId("main-tool");
@@ -694,8 +793,8 @@ export class RuntimeApp {
         ...(event.message?.ref ? { message: event.message.ref } : {}),
         ...(this.messageRef(event.message?.replyTo) ? { replyTo: this.messageRef(event.message?.replyTo) } : {}),
       });
-       const sandbox = { workspaceRoot: workspace, sessionRoot, writeAccess: true, toolSocket: this.toolSocketPath, toolToken } as const;
-       const session = await this.pi.createSession(path, { cwd: workspace, sandbox, mainTools: true, extensionPath: this.piToolsPath });
+        const sandbox = { sessionRoot, modelProxyUrl: this.modelProxyUrl, toolSocket: this.toolSocketPath, toolToken, launcherUid: this.modelRuntimeUid, launcherGid: this.modelRuntimeGid } as const;
+        const session = await this.pi.createSession(path, { cwd: sessionRoot, sandbox, mainTools: true, extensionPath: this.piToolsPath });
        this.mainSessions.set(conversationId, session);
        this.db.run("UPDATE conversations SET main_session_id=?,main_session_path=?,updated_at=? WHERE conversation_id=?", session.sessionId, session.sessionPath, nowIso(), conversationId);
        await this.sendText(conversation.address, "当前对话已开启新的 Main Session；长期记忆和运行中的任务未删除。", event.message?.ref, conversationId, caps); return;
@@ -708,7 +807,7 @@ export class RuntimeApp {
       const selected = requested ? tasks.find((task) => task.id === requested || task.id.endsWith(requested)) : tasks.filter((task) => ["CREATED", "QUEUED", "RUNNING", "WAITING_USER", "INTERRUPTED"].includes(task.status));
        if (!selected || Array.isArray(selected)) { await this.sendText(conversation.address, "请使用 /stop <task-id> 指定要停止的任务。", event.message?.ref, conversationId, caps); return; }
         if (!caps.tasks.canCancel) { await this.sendText(conversation.address, "当前身份没有取消任务的权限。", event.message?.ref, conversationId, caps); return; }
-         await this.tasks.requestCancel(selected.id, caps); await this.sendText(conversation.address, `任务 ${selected.id.slice(-8)} 已确认取消。`, event.message?.ref, conversationId, caps); return;
+          await this.tasks.requestCancel(selected.id, caps, principal.principalId, { platform: event.source.platform, accountId: event.source.accountId, userId: event.trustedIdentity?.userId ?? "unknown", principalId: principal.principalId }); await this.sendText(conversation.address, `任务 ${selected.id.slice(-8)} 已确认取消。`, event.message?.ref, conversationId, caps); return;
     }
      if (command === "usage") { await this.sendText(conversation.address, `Pi command: ${this.config.runtime.piCommand}\nSnowLuma API: ${this.config.snowluma.apiEndpoint}`, event.message?.ref, conversationId, caps); return; }
      await this.sendText(conversation.address, `未知控制命令 /${command}。`, event.message?.ref, conversationId, caps);
@@ -817,6 +916,7 @@ export class RuntimeApp {
     } catch (error) {
       this.log.warn("Memory maintenance failed", { error: String(error) });
     }
+    void this.tasks.expireGuestTasks().catch((error) => this.log.warn("Guest task deadline enforcement failed", { error: String(error) }));
   }
 
   private claimOutboundIntent(intentId: string): void {
@@ -875,39 +975,16 @@ export class RuntimeApp {
   }
 
   private resolvePrincipalIdentity(platform: string, accountId: string, userId: string): { principalId: string; trust: Trust } {
-    const owner = this.isConfiguredOwner(platform, accountId, userId);
-    const identity = this.db.get<{ principalId: string; trust: Trust | null }>("SELECT i.principal_id AS principalId,p.trust FROM platform_identities i LEFT JOIN principals p ON p.principal_id=i.principal_id WHERE i.platform=? AND i.account_id=? AND i.user_id=?", platform, accountId, userId);
-    if (owner) {
-      this.db.transaction(() => {
-        this.db.run("INSERT OR IGNORE INTO principals(principal_id,trust,created_at) VALUES (?,?,?)", "principal:owner", "OWNER", nowIso());
-        this.db.run("UPDATE principals SET trust='OWNER' WHERE principal_id=?", "principal:owner");
-        if (identity) {
-          this.db.run("UPDATE platform_identities SET principal_id=? WHERE platform=? AND account_id=? AND user_id=?", "principal:owner", platform, accountId, userId);
-        } else {
-          this.db.run("INSERT INTO platform_identities(platform,account_id,user_id,principal_id) VALUES (?,?,?,?)", platform, accountId, userId, "principal:owner");
-        }
-      });
-      return { principalId: "principal:owner", trust: "OWNER" };
-    }
-    if (identity) {
-      if (!identity.trust) throw new Error("PRINCIPAL_MAPPING_INVALID");
-      return { principalId: identity.principalId, trust: identity.trust };
-    }
-    const principalId = newId("principal");
-    this.db.transaction(() => {
-      this.db.run("INSERT INTO principals(principal_id,trust,created_at) VALUES (?,?,?)", principalId, "GUEST", nowIso());
-      this.db.run("INSERT INTO platform_identities(platform,account_id,user_id,principal_id) VALUES (?,?,?,?)", platform, accountId, userId, principalId);
-    });
-    return { principalId, trust: "GUEST" };
+    return this.principals.resolveIdentity(platform, accountId, userId, this.config.owner);
   }
 
   private bindPlatformIdentity(actor: PlatformIdentityRef, target: PlatformIdentityRef): void {
     if (!this.isConfiguredOwner(actor.platform, actor.accountId, actor.userId)) throw new Error("IDENTITY_BINDING_DENIED");
     if (!target.platform || !target.accountId || !target.userId) throw new Error("IDENTITY_BINDING_ARGUMENTS_REQUIRED");
+    this.principals.resolveIdentity(actor.platform, actor.accountId, actor.userId, this.config.owner);
     this.db.transaction(() => {
-      this.db.run("INSERT OR IGNORE INTO principals(principal_id,trust,created_at) VALUES (?,?,?)", "principal:owner", "OWNER", nowIso());
-      const changed = this.db.run("UPDATE platform_identities SET principal_id=? WHERE platform=? AND account_id=? AND user_id=?", "principal:owner", target.platform, target.accountId, target.userId);
-      if (changed.changes === 0) this.db.run("INSERT INTO platform_identities(platform,account_id,user_id,principal_id) VALUES (?,?,?,?)", target.platform, target.accountId, target.userId, "principal:owner");
+      const changed = this.db.run("UPDATE platform_identities SET principal_id=? WHERE platform=? AND account_id=? AND user_id=?", OWNER_PRINCIPAL_ID, target.platform, target.accountId, target.userId);
+      if (changed.changes === 0) this.db.run("INSERT INTO platform_identities(platform,account_id,user_id,principal_id) VALUES (?,?,?,?)", target.platform, target.accountId, target.userId, OWNER_PRINCIPAL_ID);
     });
   }
 
@@ -932,8 +1009,10 @@ export class RuntimeApp {
   }
 
   private conversationScopes(conversationId: string, address: ConversationAddress, principalId: string, trust: Trust): string[] {
-    if (address.kind === "group") return [`group:${conversationId}`, "global_agent"];
-    return trust === "OWNER" ? ["owner_private", `user:${principalId}`, "global_agent"] : [`user:${principalId}`, "global_agent"];
+    const scopes = [`user:${principalId}`];
+    if (trust === "OWNER") scopes.push("global_agent");
+    if (trust === "OWNER" && address.kind === "private") scopes.push("owner_private");
+    return scopes;
   }
 
 }
@@ -950,6 +1029,10 @@ function optionalInputObject(input: JsonValue | undefined): Record<string, JsonV
 function requiredText(value: JsonValue | undefined, field: string): string {
   if (typeof value !== "string" || !value.trim()) throw new Error(`TOOL_INPUT_REQUIRED:${field}`);
   return value.trim();
+}
+
+function safePathSegment(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
 }
 
 function readArtifactRef(value: JsonValue | undefined): ArtifactRef {

@@ -42,6 +42,26 @@ test("loadConfig preserves array values while merging defaults", async () => {
   }
 });
 
+test("Pi auth default follows stateRoot and migrates the legacy Owner auth path", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-home-config-model-plane-"));
+  const configPath = join(root, "agent-home.json");
+  try {
+    await writeFile(configPath, JSON.stringify({ instanceId: "model-plane-config", paths: { stateRoot: root }, snowluma: { endpoint: "ws://snowluma", apiEndpoint: "http://snowluma" } }));
+    assert.equal((await loadConfig(configPath)).runtime.piAgentDir, join(root, "model", "pi", "agent"));
+    await writeFile(configPath, JSON.stringify({ instanceId: "model-plane-config", paths: { stateRoot: root }, runtime: { piAgentDir: join(root, "home", ".pi", "agent") }, snowluma: { endpoint: "ws://snowluma", apiEndpoint: "http://snowluma" } }));
+    assert.equal((await loadConfig(configPath)).runtime.piAgentDir, join(root, "model", "pi", "agent"));
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("legacy 2 GiB guest address-space default is raised for Node 22 WebAssembly", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-home-config-node-rlimit-"));
+  const configPath = join(root, "agent-home.json");
+  try {
+    await writeFile(configPath, JSON.stringify({ instanceId: "node-rlimit", paths: { stateRoot: root }, guest: { enabled: true, memoryBytes: 2147483648 }, snowluma: { endpoint: "ws://snowluma", apiEndpoint: "http://snowluma" } }));
+    assert.equal((await loadConfig(configPath)).guest.memoryBytes, 17179869184);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("Pi provider and model remain Pi-managed instead of host config overrides", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-config-model-"));
   const configPath = join(root, "agent-home.json");

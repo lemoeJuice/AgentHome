@@ -156,6 +156,8 @@ export interface TaskRequester {
   accountId: string;
   userId: string;
   principalId?: string;
+  runtimeUid?: number;
+  runtimeGid?: number;
 }
 
 export interface TaskRecord {
@@ -172,6 +174,7 @@ export interface TaskRecord {
   createdAt: string;
   updatedAt: string;
   completedAt?: string;
+  deadlineAt?: string;
 }
 
 export interface WorkerExecutionRecord {
@@ -183,6 +186,11 @@ export interface WorkerExecutionRecord {
   harnessSessionId?: string;
   workspaceId?: string;
   workspaceAccess?: "READ" | "WRITE";
+  workspaceScopeId?: string;
+  principalId?: string;
+  runtimeUid?: number;
+  runtimeGid?: number;
+  processMode?: "PI" | "GUEST_BROKERED" | "PRINCIPAL_BROKERED";
   artifactRefs?: ArtifactRef[];
   capabilities?: CapabilitySet;
   processId?: number;

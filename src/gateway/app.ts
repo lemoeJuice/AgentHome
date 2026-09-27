@@ -29,7 +29,7 @@ export class GatewayApp {
     this.log = logger.child("gateway");
     this.state = new GatewayState(config.paths.gatewayState);
     this.adapter = new QQChatPlatformAdapter(config, this.log);
-    this.controller = new PodmanController(config, this.state, this.log);
+    this.controller = new PodmanController(config, this.state, this.log, { modelProxyUrl: process.env.AGENT_HOME_MODEL_PROXY_URL ?? "http://host.containers.internal:7897" });
     this.artifacts = new GatewayArtifactService(this.state.store, config.paths.gatewayState, this.log);
     const mcpToken = process.env.GATEWAY_MCP_TOKEN ?? readSecret(".agent-home/mcp-main-token");
     const mcpControlToken = process.env.GATEWAY_MCP_CONTROL_TOKEN ?? readSecret(".agent-home/mcp-control-token");

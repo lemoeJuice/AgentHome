@@ -1,4 +1,4 @@
-import { chmod, unlink } from "node:fs/promises";
+import { chmod, chown, unlink } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import type { CapabilitySet, ConversationAddress, JsonValue, PlatformMessageRef, TaskRequester, Trust } from "../shared/types.js";
 
@@ -13,6 +13,8 @@ export interface RuntimeToolContext {
   message?: PlatformMessageRef;
   replyTo?: PlatformMessageRef;
   taskId?: string;
+  workerId?: string;
+  executionContextId?: string;
 }
 
 export type RuntimeToolHandler = (action: string, input: JsonValue, context: RuntimeToolContext) => Promise<JsonValue>;
@@ -23,12 +25,14 @@ export class RuntimeToolServer {
   private readonly socketPath: string;
   private readonly resolveContext: ContextResolver;
   private readonly handler: RuntimeToolHandler;
+  private readonly socketGroupId?: number;
   private server: Server | undefined;
 
-  constructor(socketPath: string, resolveContext: ContextResolver, handler: RuntimeToolHandler) {
+  constructor(socketPath: string, resolveContext: ContextResolver, handler: RuntimeToolHandler, options: { socketGroupId?: number } = {}) {
     this.socketPath = socketPath;
     this.resolveContext = resolveContext;
     this.handler = handler;
+    this.socketGroupId = options.socketGroupId;
   }
 
   async start(): Promise<void> {
@@ -38,7 +42,10 @@ export class RuntimeToolServer {
       this.server?.once("error", reject);
       this.server?.listen(this.socketPath, resolve);
     });
-    await chmod(this.socketPath, 0o600);
+    if (this.socketGroupId !== undefined) {
+      await chown(this.socketPath, 0, this.socketGroupId);
+      await chmod(this.socketPath, 0o660);
+    } else await chmod(this.socketPath, 0o600);
   }
 
   async stop(): Promise<void> {
