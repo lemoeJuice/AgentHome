@@ -1,7 +1,9 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { chown, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
+import { relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Logger } from "../shared/logger.js";
 import { newId } from "../shared/ids.js";
@@ -20,17 +22,20 @@ export interface PiProcessIdentity {
 export type PiProcessInspection = "OWNED" | "NOT_FOUND" | "FOREIGN" | "UNKNOWN";
 
 export interface PiSandbox {
-  workspaceRoot: string;
   sessionRoot: string;
-  writeAccess: boolean;
+  modelProxyUrl?: string;
   toolSocket?: string;
   toolToken?: string;
-  mcpEndpoint?: string;
-  mcpToken?: string;
+  launcherUid?: number;
+  launcherGid?: number;
+  launcherCpuSeconds?: number;
+  launcherMemoryBytes?: number;
+  launcherPids?: number;
+  launcherMaxFileBytes?: number;
 }
 
 type PiLaunchOptions = { cwd?: string; sandbox?: PiSandbox; mainTools?: boolean; extensionPath?: string };
-type PiDefaults = { agentDir?: string };
+type PiDefaults = { agentDir?: string; launcherUid?: number; launcherGid?: number };
 
 export interface PiHarness {
   createSession(sessionPath: string, options?: PiLaunchOptions): Promise<PiSession>;
@@ -66,9 +71,11 @@ type RpcProcess = {
   sandbox?: PiSandbox;
   mainTools: boolean;
   extensionPath?: string;
+  stderrFailure?: string;
+  lastRpcEventType?: string;
 };
 
-export const PI_MAX_NETWORK_RETRIES = 5;
+export const PI_MAX_NETWORK_RETRIES = 10;
 
 export class PiCliHarness implements PiHarness {
   private readonly command: string;
@@ -77,8 +84,11 @@ export class PiCliHarness implements PiHarness {
   private readonly log: Logger;
   private readonly settledEvent: string;
   private readonly agentDir: string;
+  private readonly launcherUid?: number;
+  private readonly launcherGid?: number;
+  private readonly trustedExtensionRoot: string;
 
-  constructor(command: string, logger: Logger, sandboxCommand = process.env.AGENT_HOME_WORKER_SANDBOX ?? "bwrap", settledEvent = process.env.AGENT_HOME_PI_SETTLED_EVENT ?? "agent_settled", defaults: PiDefaults = {}) { this.command = command; this.sandboxCommand = sandboxCommand; this.settledEvent = settledEvent; this.agentDir = defaults.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? join(process.env.AGENT_HOME_STATE ?? "/state", "home/.pi/agent"); this.log = logger.child("pi"); }
+  constructor(command: string, logger: Logger, sandboxCommand = process.env.AGENT_HOME_WORKER_SANDBOX ?? "bwrap", settledEvent = process.env.AGENT_HOME_PI_SETTLED_EVENT ?? "agent_settled", defaults: PiDefaults = {}) { this.command = command; this.sandboxCommand = sandboxCommand; this.settledEvent = settledEvent; this.agentDir = defaults.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? join(process.env.AGENT_HOME_STATE ?? "/state", "model/pi/agent"); this.launcherUid = defaults.launcherUid; this.launcherGid = defaults.launcherGid; this.trustedExtensionRoot = dirname(fileURLToPath(import.meta.url)); this.log = logger.child("pi"); }
 
   async createSession(sessionPath: string, options: PiLaunchOptions = {}): Promise<PiSession> {
     await mkdir(dirname(sessionPath), { recursive: true });
@@ -161,6 +171,7 @@ export class PiCliHarness implements PiHarness {
     settings.defaultModel = modelId;
     const tempPath = `${settingsPath}.tmp-${process.pid}`;
     await writeFile(tempPath, `${JSON.stringify(settings, null, 2)}\n`, { mode: 0o600 });
+    if (process.getuid?.() === 0 && this.launcherUid !== undefined && this.launcherGid !== undefined) await chown(tempPath, this.launcherUid, this.launcherGid);
     await rename(tempPath, settingsPath);
 
     let activeSessionsUpdated = 0;
@@ -279,15 +290,30 @@ export class PiCliHarness implements PiHarness {
       if (options.extensionPath !== undefined && options.extensionPath !== existing.extensionPath) throw new Error("PI_EXTENSION_BOUNDARY_MISMATCH");
       return existing;
     }
+    if (options.sandbox && options.extensionPath && !isWithin(this.trustedExtensionRoot, resolve(options.extensionPath))) throw new Error("PI_UNTRUSTED_EXTENSION_PATH");
     const invocation = options.sandbox ? this.sandboxInvocation(session, options.sandbox, options) : this.localInvocation(session, options);
-    const child = spawn(invocation.command, invocation.args, { cwd: invocation.cwd, env: invocation.env, detached: true, stdio: ["pipe", "pipe", "pipe"] });
+      const launcherUid = options.sandbox?.launcherUid ?? this.launcherUid;
+      const launcherGid = options.sandbox?.launcherGid ?? this.launcherGid;
+      // Node 22's bundled Pi undici/llhttp WebAssembly parser needs a 128 GiB
+      // virtual-address ceiling at full CLI startup; this is RLIMIT_AS, not an RSS cap.
+      const guestExec = launcherUid !== undefined && launcherGid !== undefined && (launcherUid !== globalThis.process.getuid?.() || launcherGid !== globalThis.process.getgid?.());
+      const command = guestExec ? globalThis.process.env.AGENT_HOME_GUEST_EXEC_COMMAND ?? "/usr/local/bin/agent-home-guest-exec" : invocation.command;
+      const args = guestExec
+        ? [String(launcherUid), String(launcherGid), String(options.sandbox?.launcherCpuSeconds ?? 3600), String(options.sandbox?.launcherMemoryBytes ?? 128 * 1024 * 1024 * 1024), String(options.sandbox?.launcherPids ?? 512), String(options.sandbox?.launcherMaxFileBytes ?? 2 * 1024 * 1024 * 1024), "--", invocation.command, ...invocation.args]
+        : invocation.args;
+      const env = guestExec ? { PATH: globalThis.process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" } : invocation.env;
+      const child = spawn(command, args, { cwd: invocation.cwd, env, detached: true, stdio: ["pipe", "pipe", "pipe"] });
     const process: RpcProcess = { child, sessionPath: session.sessionPath, pending: new Map(), buffer: "", mainTools: Boolean(options.mainTools), ...(options.extensionPath ? { extensionPath: options.extensionPath } : {}), ...(options.sandbox ? { sandbox: options.sandbox } : {}) };
     this.active.set(session.sessionId, process);
     child.stdout.on("data", (chunk) => this.handleOutput(process, String(chunk)));
-    child.stderr.on("data", (chunk) => this.log.debug("Pi RPC stderr", { output: String(chunk).trim(), sessionId: session.sessionId }));
+    child.stderr.on("data", (chunk) => {
+      const category = classifyPiStderr(String(chunk));
+      if (category) process.stderrFailure = category;
+      this.log.debug("Pi RPC stderr", { category: category ?? "unclassified", sessionId: session.sessionId });
+    });
     child.stdin.on("error", (error) => this.failProcess(process, error instanceof Error ? error : new Error(String(error))));
     child.on("error", (error) => this.failProcess(process, error instanceof Error ? error : new Error(String(error))));
-    child.on("exit", (code, signal) => this.failProcess(process, new Error(`PI_EXIT:${code ?? signal ?? "unknown"}`)));
+    child.on("exit", (code, signal) => this.failProcess(process, new Error(piExitError(process, code, signal))));
     await new Promise<void>((resolve, reject) => {
       let settled = false;
       const timer = setTimeout(() => finish(new Error("PI_RPC_START_TIMEOUT")), 5000);
@@ -301,7 +327,7 @@ export class PiCliHarness implements PiHarness {
         if (error) reject(error); else resolve();
       };
       const onError = (error: Error) => finish(error);
-      const onExit = (code: number | null, signal: NodeJS.Signals | null) => finish(new Error(`PI_EXIT:${code ?? signal ?? "unknown"}`));
+      const onExit = (code: number | null, signal: NodeJS.Signals | null) => finish(new Error(piExitError(process, code, signal)));
       const onSpawn = () => finish();
       child.once("error", onError);
       child.once("exit", onExit);
@@ -335,21 +361,20 @@ export class PiCliHarness implements PiHarness {
     }
     const commandRoots = this.sandboxCommandRoots();
     const authDirectory = existsSync(this.agentDir) ? [this.agentDir] : [];
-    for (const path of this.sandboxDirectories([sandbox.workspaceRoot, sandbox.sessionRoot, ...authDirectory, ...commandRoots, ...(sandbox.toolSocket ? [sandbox.toolSocket] : []), ...(options.extensionPath ? [options.extensionPath] : [])])) args.push("--dir", path);
+    for (const path of this.sandboxDirectories([sandbox.sessionRoot, ...authDirectory, ...commandRoots, ...(sandbox.toolSocket ? [sandbox.toolSocket] : []), ...(options.extensionPath ? [options.extensionPath] : [])])) args.push("--dir", path);
     for (const path of commandRoots) args.push("--ro-bind", path, path);
     args.push("--bind", sandbox.sessionRoot, sandbox.sessionRoot);
-    args.push(sandbox.writeAccess ? "--bind" : "--ro-bind", sandbox.workspaceRoot, sandbox.workspaceRoot);
     if (sandbox.toolSocket) args.push("--ro-bind", sandbox.toolSocket, sandbox.toolSocket);
     // Pi refreshes native OAuth credentials in place, so this directory must
     // remain writable inside the sandbox. The container volume is still the
     // only backing store; no Host path is mounted.
     if (authDirectory.length) args.push("--bind", this.agentDir, this.agentDir);
     if (options.extensionPath) args.push("--ro-bind", options.extensionPath, options.extensionPath);
-    args.push("--chdir", sandbox.workspaceRoot, "--clearenv", "--setenv", "HOME", "/tmp/agent-home-worker", "--setenv", "XDG_CONFIG_HOME", "/tmp/agent-home-worker/.config", "--setenv", "XDG_DATA_HOME", "/tmp/agent-home-worker/.local/share", "--setenv", "XDG_STATE_HOME", "/tmp/agent-home-worker/.local/state", "--setenv", "TMPDIR", "/tmp", "--setenv", "PI_CODING_AGENT_DIR", this.agentDir, "--setenv", "PATH", process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+    args.push("--chdir", sandbox.sessionRoot, "--clearenv", "--setenv", "HOME", "/tmp/agent-home-model", "--setenv", "XDG_CONFIG_HOME", "/tmp/agent-home-model/.config", "--setenv", "XDG_DATA_HOME", "/tmp/agent-home-model/.local/share", "--setenv", "XDG_STATE_HOME", "/tmp/agent-home-model/.local/state", "--setenv", "TMPDIR", "/tmp", "--setenv", "PI_CODING_AGENT_DIR", this.agentDir, "--setenv", "PATH", process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+    if (sandbox.modelProxyUrl) args.push("--setenv", "HTTP_PROXY", sandbox.modelProxyUrl, "--setenv", "HTTPS_PROXY", sandbox.modelProxyUrl, "--setenv", "http_proxy", sandbox.modelProxyUrl, "--setenv", "https_proxy", sandbox.modelProxyUrl, "--setenv", "NODE_USE_ENV_PROXY", "1", "--setenv", "NODE_OPTIONS", "--tls-max-v1.2");
     if (sandbox.toolSocket && sandbox.toolToken) args.push("--setenv", "AGENT_HOME_RUNTIME_TOOL_SOCKET", sandbox.toolSocket, "--setenv", "AGENT_HOME_RUNTIME_TOOL_TOKEN", sandbox.toolToken);
     if (options.mainTools) args.push("--", this.command, "--no-builtin-tools", "--no-extensions", "--no-skills", "--no-context-files", ...(options.extensionPath ? ["--extension", options.extensionPath] : []), "--mode", "rpc", "--session", session.sessionPath);
     else args.push("--", this.command, ...(options.extensionPath ? ["--extension", options.extensionPath] : []), "--mode", "rpc", "--session", session.sessionPath);
-    if (sandbox.mcpEndpoint && sandbox.mcpToken) args.splice(args.indexOf("--"), 0, "--setenv", "AGENT_HOME_MCP_URL", sandbox.mcpEndpoint, "--setenv", "AGENT_HOME_MCP_TOKEN", sandbox.mcpToken);
     return { command: this.sandboxCommand, args, env: {} };
   }
 
@@ -403,6 +428,11 @@ export class PiCliHarness implements PiHarness {
       if (!line) continue;
       let value: RpcValue;
       try { value = JSON.parse(line) as RpcValue; } catch { this.log.warn("Ignoring invalid Pi RPC frame", { line: line.slice(0, 200) }); continue; }
+      if (typeof value.type === "string") process.lastRpcEventType = value.type;
+      if (isFailureRpcFrame(value)) {
+        const frameFailure = classifyPiStderr(JSON.stringify(value));
+        if (frameFailure) process.stderrFailure = frameFailure;
+      }
       if (value.type === "response" && typeof value.id === "string") {
         const pending = process.pending.get(value.id);
         if (!pending) continue;
@@ -464,7 +494,7 @@ export class PiCliHarness implements PiHarness {
   private failProcess(process: RpcProcess, error: Error): void {
     for (const pending of process.pending.values()) pending.reject(error);
     process.pending.clear();
-    this.rejectTurn(process, error);
+    this.rejectTurn(process, process.turn?.failure ?? error);
     for (const [id, value] of this.active) if (value === process) this.active.delete(id);
   }
 
@@ -518,6 +548,30 @@ function rpcError(value: unknown): Error {
   return new Error("PI_PROVIDER_ERROR");
 }
 
+function classifyPiStderr(value: string): string | undefined {
+  const message = value.toLowerCase();
+  if (["econnreset", "connection reset", "network socket disconnected", "socket hang up", "fetch failed", "etimedout", "eai_again", "enotfound", "unexpected eof"].some((marker) => message.includes(marker))) {
+    if (message.includes("econnreset") || message.includes("connection reset")) return "ECONNRESET";
+    if (message.includes("etimedout")) return "ETIMEDOUT";
+    if (message.includes("eai_again") || message.includes("enotfound")) return "DNS_FAILURE";
+    return "fetch failed";
+  }
+  if (["unauthorized", "invalid_grant", "authentication failed", "token expired"].some((marker) => message.includes(marker))) return "PI_PROVIDER_AUTH_FAILURE";
+  if (["webassembly.instantiate", "out of memory", "wasm memory"].some((marker) => message.includes(marker))) return "PI_RUNTIME_MEMORY_FAILURE";
+  return undefined;
+}
+
+function isFailureRpcFrame(value: RpcValue): boolean {
+  if (value.type === "agent_error" || value.stopReason === "error" || typeof value.errorMessage === "string") return true;
+  const messages = Array.isArray(value.messages) ? value.messages : value.message ? [value.message] : [];
+  return messages.some((message) => message && typeof message === "object" && ((message as RpcValue).stopReason === "error" || typeof (message as RpcValue).errorMessage === "string"));
+}
+
+function piExitError(process: RpcProcess, code: number | null, signal: NodeJS.Signals | null): string {
+  const detail = process.stderrFailure ?? (process.lastRpcEventType ? `LAST_RPC_EVENT:${process.lastRpcEventType}` : undefined);
+  return `PI_EXIT:${code ?? signal ?? "unknown"}${detail ? `:${detail}` : ""}`;
+}
+
 function isRetryablePiFailure(error: Error): boolean {
   const message = errorMessages(error).toLowerCase();
   if (message === "pi_empty_response") return true;
@@ -567,5 +621,10 @@ function errorMessages(error: unknown): string {
 }
 
 function sameSandbox(left: PiSandbox, right: PiSandbox): boolean {
-  return left.workspaceRoot === right.workspaceRoot && left.sessionRoot === right.sessionRoot && left.writeAccess === right.writeAccess && left.toolSocket === right.toolSocket && left.toolToken === right.toolToken && left.mcpEndpoint === right.mcpEndpoint && left.mcpToken === right.mcpToken;
+  return left.sessionRoot === right.sessionRoot && left.modelProxyUrl === right.modelProxyUrl && left.toolSocket === right.toolSocket && left.toolToken === right.toolToken && left.launcherUid === right.launcherUid && left.launcherGid === right.launcherGid && left.launcherCpuSeconds === right.launcherCpuSeconds && left.launcherMemoryBytes === right.launcherMemoryBytes && left.launcherPids === right.launcherPids && left.launcherMaxFileBytes === right.launcherMaxFileBytes;
+}
+
+function isWithin(root: string, path: string): boolean {
+  const child = relative(resolve(root), resolve(path));
+  return child === "" || (child !== ".." && !child.startsWith(`..${path.includes("\\") ? "\\" : "/"}`));
 }

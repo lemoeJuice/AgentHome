@@ -31,6 +31,7 @@ test("Pi model command reads Pi's current settings and CLI model catalog", async
   const list = await command(context(["list"]));
   assert.match(list.text ?? "", /anthropic\s+claude-sonnet-4-5/);
   assert.equal(calls.some((args) => args.includes("--list-models")), true);
+  assert.equal(calls.filter((args) => args[0] === "exec").every((args) => args.includes("10002:10002") && args.includes("HOME=/state/model/home")), true);
 });
 
 test("Pi model command switches a model Pi reports and hot-switches sessions without Runtime restart", async () => {

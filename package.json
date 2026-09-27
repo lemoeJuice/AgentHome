@@ -19,6 +19,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --test --experimental-strip-types --experimental-loader ./scripts/ts-loader.mjs test/**/*.test.ts",
     "integration:e2e": "AGENT_HOME_RUN_INTEGRATION=1 bash scripts/integration-e2e.sh",
+    "test:guest-isolation": "bash scripts/test-guest-isolation.sh",
     "lint": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

@@ -1,12 +1,13 @@
 import { chmod, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import type { AppConfig } from "../config.js";
 import { migrate, SqliteStore } from "../db.js";
 import { runtimeMigrations } from "../schema.js";
 
 export async function bootstrapFromStdin(stateRoot: string): Promise<void> {
   let input = "";
   for await (const chunk of process.stdin) input += String(chunk);
-  const value = JSON.parse(input) as { format?: string; version?: number; instanceId?: string; owner?: { platform?: string; accountId?: string; userId?: string }; snowluma?: { endpoint?: string; apiEndpoint?: string; reverseWebSocketPath?: string; credential?: unknown; websocketCredential?: unknown }; internal?: { controlToken?: unknown; mcpToken?: unknown; mcpControlToken?: unknown; artifactTransferSecret?: unknown }; plugins?: { allowedActions?: string[]; allowedPermissions?: string[]; guestAllowedActions?: string[]; guestAllowedPermissions?: string[] } };
+  const value = JSON.parse(input) as { format?: string; version?: number; instanceId?: string; owner?: { platform?: string; accountId?: string; userId?: string }; snowluma?: { endpoint?: string; apiEndpoint?: string; reverseWebSocketPath?: string; credential?: unknown; websocketCredential?: unknown }; internal?: { controlToken?: unknown; mcpToken?: unknown; mcpControlToken?: unknown; artifactTransferSecret?: unknown }; plugins?: { allowedActions?: string[]; allowedPermissions?: string[]; guestAllowedActions?: string[]; guestAllowedPermissions?: string[] }; runtime?: Partial<AppConfig["runtime"]>; guest?: Partial<AppConfig["guest"]> };
   if (value.format !== "agent-home-bootstrap" || value.version !== 1 || !value.instanceId || !value.snowluma?.endpoint) throw new Error("BOOTSTRAP_INVALID");
   const credential = value.snowluma.credential;
   const websocketCredential = value.snowluma.websocketCredential;
@@ -25,7 +26,7 @@ export async function bootstrapFromStdin(stateRoot: string): Promise<void> {
   const owner = value.owner?.platform && value.owner.userId ? { platform: value.owner.platform, accountId: value.owner.accountId ?? "default", userId: value.owner.userId } : undefined;
   const allowedActions = value.plugins?.allowedActions?.filter((action): action is string => typeof action === "string" && Boolean(action)) ?? [];
   const readActions = (actions: unknown): string[] => Array.isArray(actions) ? [...new Set(actions.filter((action): action is string => typeof action === "string" && Boolean(action)))] : [];
-  const config = { instanceId: value.instanceId, ...(owner ? { owner } : {}), snowluma: { endpoint: value.snowluma.endpoint, apiEndpoint: value.snowluma.apiEndpoint ?? "http://127.0.0.1:3000", reverseWebSocketPath: value.snowluma.reverseWebSocketPath ?? "/onebot/v11/ws" }, plugins: { allowedActions: [...new Set(allowedActions)], allowedPermissions: readActions(value.plugins?.allowedPermissions), guestAllowedActions: readActions(value.plugins?.guestAllowedActions), guestAllowedPermissions: readActions(value.plugins?.guestAllowedPermissions) } };
+  const config = { instanceId: value.instanceId, ...(owner ? { owner } : {}), snowluma: { endpoint: value.snowluma.endpoint, apiEndpoint: value.snowluma.apiEndpoint ?? "http://127.0.0.1:3000", reverseWebSocketPath: value.snowluma.reverseWebSocketPath ?? "/onebot/v11/ws" }, ...(value.runtime ? { runtime: value.runtime } : {}), ...(value.guest ? { guest: value.guest } : {}), plugins: { allowedActions: [...new Set(allowedActions)], allowedPermissions: readActions(value.plugins?.allowedPermissions), guestAllowedActions: readActions(value.plugins?.guestAllowedActions), guestAllowedPermissions: readActions(value.plugins?.guestAllowedPermissions) } };
   await writeFile(join(stateRoot, "config", "bootstrap.json"), `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
   await chmod(join(stateRoot, "config", "bootstrap.json"), 0o600);
   const database = new SqliteStore(join(stateRoot, "data", "agent.db"));

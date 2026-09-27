@@ -88,6 +88,52 @@ export class MemoryService {
     this.db.run("UPDATE memory_index_queue SET status='pending',next_attempt_at=NULL,updated_at=? WHERE status='processing'", timestamp);
   }
 
+  isolateLegacyPrincipalScopes(): { moved: number; quarantined: number } {
+    if (this.db.get("SELECT 1 AS applied FROM runtime_meta WHERE key='principal_memory_isolation_v1'")) return { moved: 0, quarantined: 0 };
+    let moved = 0;
+    let quarantined = 0;
+    const episodePrincipals = new Map<string, string>();
+    const episodeRows = this.db.all<{ id: string; scope: string; source_json: string; actor_json: string | null; trust: string }>("SELECT id,scope,source_json,actor_json,trust FROM memory_episodes WHERE scope='global_agent' OR scope LIKE 'group:%'");
+    this.db.transaction(() => {
+      for (const row of episodeRows) {
+        if (row.trust === "system") continue;
+        const principalId = this.resolveLegacyEpisodePrincipal(row.source_json, row.actor_json);
+        const scope = principalId ? `user:${principalId}` : `legacy_quarantine:${row.id}`;
+        if (principalId) { episodePrincipals.set(row.id, principalId); moved += 1; } else quarantined += 1;
+        this.db.run("UPDATE memory_episodes SET scope=? WHERE id=?", scope, row.id);
+      }
+      for (const table of ["memory_facts", "memory_episodic", "memory_explicit"] as const) {
+        const rows = this.db.all<{ id: string; scope: string; provenance_json: string }>(`SELECT id,scope,provenance_json FROM ${table} WHERE scope='global_agent' OR scope LIKE 'group:%'`);
+        for (const row of rows) {
+          let provenance: string[] = [];
+          try { provenance = JSON.parse(row.provenance_json) as string[]; } catch { /* quarantine malformed history */ }
+          const principals = [...new Set(provenance.map((id) => episodePrincipals.get(id)).filter((id): id is string => Boolean(id)))];
+          const allResolved = provenance.length > 0 && principals.length === 1 && provenance.every((id) => episodePrincipals.has(id));
+          const scope = allResolved ? `user:${principals[0]}` : `legacy_quarantine:${row.id}`;
+          if (allResolved) moved += 1; else quarantined += 1;
+          this.db.run(`UPDATE ${table} SET scope=? WHERE id=?`, scope, row.id);
+        }
+      }
+      for (const row of this.db.all<{ id: string; source_memory_ids_json: string }>("SELECT id,source_memory_ids_json FROM memory_profiles WHERE scope='global_agent' OR scope LIKE 'group:%'")) {
+        let sources: string[] = [];
+        try { sources = JSON.parse(row.source_memory_ids_json) as string[]; } catch { /* quarantine malformed history */ }
+        const scopes = new Set<string>();
+        for (const sourceId of sources) {
+          const source = this.db.get<{ scope: string }>("SELECT scope FROM memory_episodes WHERE id=? UNION ALL SELECT scope FROM memory_facts WHERE id=? UNION ALL SELECT scope FROM memory_episodic WHERE id=? UNION ALL SELECT scope FROM memory_explicit WHERE id=? LIMIT 1", sourceId, sourceId, sourceId, sourceId);
+          if (source) scopes.add(source.scope);
+        }
+        const userScopes = [...scopes].filter((scope) => scope.startsWith("user:"));
+        const safeScope = sources.length > 0 && userScopes.length === 1 && userScopes.length === scopes.size ? (userScopes[0] ?? `legacy_quarantine:${row.id}`) : `legacy_quarantine:${row.id}`;
+        if (safeScope.startsWith("user:")) moved += 1; else quarantined += 1;
+        this.db.run("UPDATE memory_profiles SET scope=? WHERE id=?", safeScope, row.id);
+      }
+      this.db.run("UPDATE memory_tombstones SET scope=? WHERE scope='global_agent' OR scope LIKE 'group:%'", "legacy_quarantine");
+    });
+    this.rebuildDerivedIndexes();
+    this.db.run("INSERT INTO runtime_meta(key,value) VALUES ('principal_memory_isolation_v1','1') ON CONFLICT(key) DO UPDATE SET value='1'");
+    return { moved, quarantined };
+  }
+
   cleanupRetention(reference = new Date()): number {
     if (this.retention.rawEpisodeDays === null) return 0;
     const cutoff = new Date(reference.getTime() - this.retention.rawEpisodeDays * 24 * 60 * 60 * 1000).toISOString();
@@ -468,14 +514,45 @@ export class MemoryService {
   private authorizedScopes(access: MemoryAccessContext): MemoryScope[] {
     if (!access.requesterId || !["OWNER", "GUEST"].includes(access.trust) || !Array.isArray(access.allowedScopes)) throw new Error("MEMORY_ACCESS_INVALID");
     const principalScope = access.principalId ?? access.requesterId;
-    const canonical: MemoryScope[] = ["global_agent", `user:${principalScope}`, ...((access.projectIds ?? []).filter((id) => typeof id === "string" && id).map((id) => `project:${id}` as MemoryScope))];
+    const canonical: MemoryScope[] = [`user:${principalScope}`, ...((access.projectIds ?? []).filter((id) => typeof id === "string" && id).map((id) => `project:${id}` as MemoryScope))];
+    if (access.trust === "OWNER") canonical.push("global_agent");
     if (this.owner && access.conversationId) {
       const conversation = this.db.get<{ kind: "private" | "group"; trust: "OWNER" | "GUEST" }>("SELECT kind,trust FROM conversations WHERE conversation_id=?", access.conversationId);
-      if (conversation?.kind === "group") canonical.push(`group:${access.conversationId}`);
       const isOwner = access.principalId ? access.principalId === "principal:owner" : access.requesterId === this.owner.userId;
       if (conversation?.kind === "private" && conversation.trust === "OWNER" && access.trust === "OWNER" && isOwner) canonical.push("owner_private");
     }
     return canonical.filter((scope) => access.allowedScopes.includes(scope));
+  }
+
+  private resolveLegacyEpisodePrincipal(sourceJson: string, actorJson: string | null): string | undefined {
+    let source: Record<string, unknown> = {};
+    let actor: Record<string, unknown> = {};
+    try { source = JSON.parse(sourceJson) as Record<string, unknown>; } catch { /* quarantine below */ }
+    try { actor = actorJson ? JSON.parse(actorJson) as Record<string, unknown> : {}; } catch { /* quarantine below */ }
+    const eventId = typeof source.sourceId === "string" ? source.sourceId : undefined;
+    if (eventId) {
+      const row = this.db.get<{ envelope_json: string }>("SELECT envelope_json FROM ingress_events WHERE event_id=?", eventId);
+      if (row) {
+        try {
+          const envelope = JSON.parse(row.envelope_json) as { source?: { platform?: string; accountId?: string }; trustedIdentity?: { userId?: string; principalId?: string } };
+          if (envelope.trustedIdentity?.principalId) {
+            const principal = this.db.get<{ principal_id: string }>("SELECT principal_id FROM principals WHERE principal_id=?", envelope.trustedIdentity.principalId);
+            if (principal) return principal.principal_id;
+          }
+          if (envelope.source?.platform && envelope.source.accountId && envelope.trustedIdentity?.userId) {
+            const identity = this.db.get<{ principal_id: string }>("SELECT principal_id FROM platform_identities WHERE platform=? AND account_id=? AND user_id=?", envelope.source.platform, envelope.source.accountId, envelope.trustedIdentity.userId);
+            if (identity) return identity.principal_id;
+          }
+        } catch { /* quarantine below */ }
+      }
+    }
+    const platform = typeof source.platform === "string" ? source.platform : undefined;
+    const userId = typeof actor.id === "string" ? actor.id : undefined;
+    if (platform && userId) {
+      const identities = this.db.all<{ principal_id: string }>("SELECT DISTINCT principal_id FROM platform_identities WHERE platform=? AND user_id=?", platform, userId);
+      if (identities.length === 1) return identities[0]?.principal_id;
+    }
+    return undefined;
   }
 
   private assertScope(access: MemoryAccessContext, scope: MemoryScope): void {

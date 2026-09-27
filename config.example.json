@@ -37,11 +37,26 @@
     "maxWorkersPerProject": 2,
     "maxWorkersPerRequester": 4,
     "maxTasks": 32,
+    "maxTasksPerRequester": 8,
+    "maxTasksPerPrincipal": 8,
     "maxArtifactBytes": 52428800,
     "piCommand": "pi",
     "piTimeoutMs": 3600000,
     "workerSandboxCommand": "bwrap",
-    "piAgentDir": "/state/home/.pi/agent"
+    "piAgentDir": "/state/model/pi/agent"
+  },
+  "guest": {
+    "enabled": true,
+    "maxWorkersPerPrincipal": 1,
+    "taskTimeoutMs": 1800000,
+    "commandTimeoutMs": 600000,
+    "cpuSeconds": 600,
+    "memoryBytes": 17179869184,
+    "pids": 128,
+    "maxFileBytes": 536870912,
+    "workspaceQuotaBytes": 2147483648,
+    "cacheQuotaBytes": 1073741824,
+    "artifactQuotaBytes": 536870912
   },
   "memory": {
     "rawEpisodeDays": 30,

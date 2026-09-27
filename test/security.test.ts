@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { SqliteStore, migrate } from "../src/db.js";
 import { runtimeMigrations } from "../src/schema.js";
 import { MemoryService } from "../src/runtime/memory.js";
+import { PrincipalService } from "../src/runtime/principals.js";
 import { authorizeMemory, attenuateTask, attenuateWorker, capabilityWithin, CapabilityRequestDeniedError, deriveCapabilities } from "../src/auth.js";
 import { messageKey, namespaceKey } from "../src/shared/ids.js";
 import { NOT_IMPLEMENTED } from "../src/shared/types.js";
@@ -99,7 +100,7 @@ test("derived private conversation scopes do not fall back to a group scope", ()
   const conversation = { platform: "qq", accountId: "a", kind: "private" as const, platformConversationId: "guest", threadId: null };
   const guest = deriveCapabilities({ platform: "qq", accountId: "a", userId: "guest", trust: "GUEST", conversationId: "conv" }, conversation, { platform: "qq", accountId: "a", userId: "owner" }, "conv");
   const owner = deriveCapabilities({ platform: "qq", accountId: "a", userId: "owner", trust: "OWNER", conversationId: "conv" }, conversation, { platform: "qq", accountId: "a", userId: "owner" }, "conv");
-  assert.deepEqual(guest.memory.allowedScopes, ["global_agent", "user:guest"]);
+  assert.deepEqual(guest.memory.allowedScopes, ["user:guest"]);
   assert.ok(owner.memory.allowedScopes.includes("owner_private"));
   assert.ok(!guest.memory.allowedScopes.some((scope) => scope.startsWith("group:")));
 });
@@ -110,9 +111,9 @@ test("private Memory scope follows explicit Principal identity", () => {
   const first = deriveCapabilities({ platform: "qq", accountId: "a", userId: "qq-user", principalId: "principal:shared", trust: "GUEST", conversationId: "conv-1" }, conversation, owner, "conv-1");
   const second = deriveCapabilities({ platform: "telegram", accountId: "b", userId: "tg-user", principalId: "principal:shared", trust: "GUEST", conversationId: "conv-2" }, { ...conversation, platform: "telegram", accountId: "b", platformConversationId: "tg-user" }, owner, "conv-2");
   const unbound = deriveCapabilities({ platform: "telegram", accountId: "b", userId: "tg-user", trust: "GUEST", conversationId: "conv-3" }, { ...conversation, platform: "telegram", accountId: "b", platformConversationId: "tg-user" }, owner, "conv-3");
-  assert.deepEqual(first.memory.allowedScopes, ["global_agent", "user:principal:shared"]);
-  assert.deepEqual(second.memory.allowedScopes, ["global_agent", "user:principal:shared"]);
-  assert.deepEqual(unbound.memory.allowedScopes, ["global_agent", "user:tg-user"]);
+  assert.deepEqual(first.memory.allowedScopes, ["user:principal:shared"]);
+  assert.deepEqual(second.memory.allowedScopes, ["user:principal:shared"]);
+  assert.deepEqual(unbound.memory.allowedScopes, ["user:tg-user"]);
 });
 
 test("MemoryService shares explicitly bound user scope but isolates unbound identity", () => {
@@ -143,15 +144,44 @@ test("Principal-scoped Memory survives reopening the canonical database", async 
   await rm(root, { recursive: true, force: true });
 });
 
-test("Owner permissions follow identity in groups while Memory stays conversation-scoped", () => {
+test("legacy shared Guest Memory is moved to its Principal or quarantined", () => {
+  const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
+  const principals = new PrincipalService(db, "/tmp/principal-memory-migration");
+  principals.ensureOwnerPrincipal();
+  const guest = principals.resolveIdentity("qq", "account-a", "guest-1");
+  principals.resolveIdentity("qq", "account-a", "guest-2");
+  const timestamp = new Date().toISOString();
+  const envelope = { protocolVersion: 1, eventId: "guest-event", instanceId: "migrate", type: "chat.message", occurredAt: timestamp, source: { platform: "qq", accountId: "account-a", adapter: "test" }, trustedIdentity: { userId: "guest-1" }, payload: {} };
+  db.run("INSERT INTO ingress_events(event_id,event_type,envelope_json,status,attempts,received_at,updated_at) VALUES (?,?,?,?,?,?,?)", "guest-event", "chat.message", JSON.stringify(envelope), "DONE", 1, timestamp, timestamp);
+  db.run("INSERT INTO memory_episodes(id,scope,source_json,actor_json,content,occurred_at,ingested_at,trust,metadata_json) VALUES (?,?,?,?,?,?,?,?,?)", "guest-episode", "global_agent", JSON.stringify({ type: "chat.message", platform: "qq", sourceId: "guest-event" }), JSON.stringify({ type: "user", id: "guest-1" }), "private guest fact", timestamp, timestamp, "guest", null);
+  db.run("INSERT INTO memory_facts(id,scope,subject,predicate,object_json,confidence,status,provenance_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)", "guest-fact", "global_agent", "guest", "preference", JSON.stringify("tea"), 0.9, "active", JSON.stringify(["guest-episode"]), timestamp, timestamp);
+  db.run("INSERT INTO memory_explicit(id,scope,content,provenance_json,created_at,updated_at) VALUES (?,?,?,?,?,?)", "unattributed-shared", "global_agent", "ambiguous legacy data", "[]", timestamp, timestamp);
+  try {
+    const memory = new MemoryService(db, { platform: "qq", accountId: "account-a", userId: "owner" });
+    assert.deepEqual(memory.isolateLegacyPrincipalScopes(), { moved: 2, quarantined: 1 });
+    assert.equal(db.get<{ scope: string }>("SELECT scope FROM memory_episodes WHERE id=?", "guest-episode")?.scope, `user:${guest.principalId}`);
+    assert.equal(db.get<{ scope: string }>("SELECT scope FROM memory_facts WHERE id=?", "guest-fact")?.scope, `user:${guest.principalId}`);
+    assert.equal(db.get<{ scope: string }>("SELECT scope FROM memory_explicit WHERE id=?", "unattributed-shared")?.scope, "legacy_quarantine:unattributed-shared");
+    const own = memory.retrieve({ text: "private guest fact", access: { requesterId: "guest-1", principalId: guest.principalId, trust: "GUEST", allowedScopes: [`user:${guest.principalId}`] } });
+    const other = memory.retrieve({ text: "private guest fact", access: { requesterId: "guest-2", trust: "GUEST", allowedScopes: ["user:other"] } });
+    assert.ok(own.items.some((item) => item.id === "guest-episode"));
+    assert.equal(other.items.some((item) => item.id === "guest-episode"), false);
+    assert.equal(memory.retrieve({ text: "ambiguous legacy data", access: { requesterId: "owner", trust: "OWNER", allowedScopes: ["global_agent"] } }).items.some((item) => item.id === "unattributed-shared"), false);
+  } finally { db.close(); }
+});
+
+test("Guest Task execution can be enabled without sharing Principal Memory", () => {
   const group = { platform: "qq", accountId: "a", kind: "group" as const, platformConversationId: "g", threadId: null };
   const owner = deriveCapabilities({ platform: "qq", accountId: "a", userId: "owner", trust: "OWNER", conversationId: "group-conv" }, group, { platform: "qq", accountId: "a", userId: "owner" }, "group-conv");
-  const guest = deriveCapabilities({ platform: "qq", accountId: "a", userId: "guest", trust: "GUEST", conversationId: "group-conv" }, group, { platform: "qq", accountId: "a", userId: "owner" }, "group-conv");
+  const guest = deriveCapabilities({ platform: "qq", accountId: "a", userId: "guest", trust: "GUEST", conversationId: "group-conv" }, group, { platform: "qq", accountId: "a", userId: "owner" }, "group-conv", { guestTaskExecutionEnabled: true });
   const privateOwner = deriveCapabilities({ platform: "qq", accountId: "a", userId: "owner", trust: "OWNER", conversationId: "private-conv" }, { ...group, kind: "private", platformConversationId: "owner" }, { platform: "qq", accountId: "a", userId: "owner" }, "private-conv");
   assert.deepEqual(owner.projects, [{ projectId: "*", access: "WRITE" }]);
   assert.equal(owner.tasks.canCreate, true);
   assert.equal(owner.memory.allowedScopes.includes("owner_private"), false);
-  assert.equal(guest.tasks.canCreate, false);
+  assert.equal(guest.tasks.canCreate, true);
+  assert.equal(guest.tasks.canCancel, true);
+  assert.deepEqual(guest.projects, [{ projectId: "*", access: "WRITE" }]);
+  assert.deepEqual(guest.memory.allowedScopes, ["user:guest"]);
   assert.deepEqual(privateOwner.projects, owner.projects);
   assert.equal(privateOwner.tasks.canCreate, true);
 });

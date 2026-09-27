@@ -11,6 +11,7 @@ import { ArtifactService } from "../src/runtime/artifacts.js";
 import type { PiHarness, PiProcessIdentity, PiProcessInspection, PiSandbox, PiSession } from "../src/runtime/pi.js";
 import type { AppConfig } from "../src/config.js";
 import type { Logger } from "../src/shared/logger.js";
+import type { PrincipalService } from "../src/runtime/principals.js";
 
 class TestPi implements PiHarness {
   readonly steers: string[] = [];
@@ -271,6 +272,34 @@ test("WorkerControl persists progress, publishes artifacts, and explicitly finis
   db.close(); await rm(root, { recursive: true, force: true });
 });
 
+test("Owner and Guest Workers persist the same Principal-brokered execution mode", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-home-principal-worker-mode-"));
+  const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
+  const caps = { memory: { allowedScopes: ["user:principal"] }, projects: [{ projectId: "*", access: "WRITE" as const }], qq: { readConversations: ["c"], sendConversations: ["c"] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: ["agent-home"], publishTaskIds: ["*"], allowedDestinations: ["c"] }, tasks: { canCreate: true, visibleTaskIds: [], canCancel: true, canFollowUp: true } };
+  const principals = {
+    get(principalId: string) { return { principalId, runtimeUid: principalId === "principal:owner" ? 10001 : 20001, runtimeGid: principalId === "principal:owner" ? 10001 : 20001, role: principalId === "principal:owner" ? "OWNER" as const : "GUEST" as const }; },
+    async ensurePrincipalDirectories(principalId: string) { const base = join(root, "principals", principalId); return { root: base, home: join(base, "home"), projects: join(base, "projects"), cache: join(base, "cache"), artifacts: join(base, "artifacts"), agent: join(base, "agent") }; },
+    async workspacePath(principalId: string, workspaceId: string) { return join(root, "principals", principalId, "projects", workspaceId); },
+    workspacePathSync(principalId: string, workspaceId: string) { return join(root, "principals", principalId, "projects", workspaceId); },
+  } as unknown as PrincipalService;
+  const config = { owner: { platform: "qq", accountId: "a", userId: "owner" }, guest: { enabled: true, maxWorkersPerPrincipal: 1, taskTimeoutMs: 30_000, commandTimeoutMs: 5000, cpuSeconds: 60, memoryBytes: 100_000_000, pids: 20, maxFileBytes: 10_000_000, workspaceQuotaBytes: 10_000_000, cacheQuotaBytes: 10_000_000, artifactQuotaBytes: 10_000_000 }, runtime: { maxWorkers: 2, maxArtifactBytes: 100_000, piCommand: "pi", piTimeoutMs: 1000 } } as AppConfig;
+  const service = new TaskService(db, new TestPi(), new ArtifactService(db, root), config, { workerRoot: root, principals }, logger);
+  try {
+    const modes: string[] = [];
+    for (const principalId of ["principal:owner", "principal:guest"]) {
+      const trust = principalId === "principal:owner" ? "OWNER" : "GUEST";
+      const task = service.createTask({ title: trust, goal: trust, requester: { platform: "qq", accountId: "a", userId: principalId, principalId }, trust, originConversationId: "c", notificationConversationId: "c", parentCapabilities: caps });
+      const worker = await service.createWorker({ taskId: task.id, objective: "verify execution plane", actor: caps, actorPrincipalId: principalId });
+      const durable = db.get<{ process_mode: string; runtime_uid: number; workspace_id: string; workspace_access: string }>("SELECT process_mode,runtime_uid,workspace_id,workspace_access FROM worker_executions WHERE id=?", worker.id);
+      modes.push(durable?.process_mode ?? "missing");
+      assert.equal(durable?.runtime_uid, principalId === "principal:owner" ? 10001 : 20001);
+      assert.equal(durable?.workspace_id, "default");
+      assert.equal(durable?.workspace_access, "WRITE");
+    }
+    assert.deepEqual(modes, ["PRINCIPAL_BROKERED", "PRINCIPAL_BROKERED"]);
+  } finally { db.close(); await rm(root, { recursive: true, force: true }); }
+});
+
 test("recovery verifies process ownership before termination and preserves unknown locks", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-recovery-"));
   const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
@@ -316,7 +345,8 @@ test("recovery resumes a question session and replays its pending mailbox", asyn
   db.run("INSERT INTO task_mailbox(id,task_id,type,source_conversation_id,source_message_key,content,status,created_at,worker_id,question_id) VALUES (?,?,?,?,?,?,?,?,?,?)", "mail-1", "task-mail", "FOLLOW_UP", "c", "message", "staging", "PENDING", timestamp, "worker-mail", "question-mail");
   await tasks.recover();
   assert.equal(pi.resumed, 1);
-  assert.equal(pi.resumeOptions?.sandbox?.workspaceRoot, join(root, "scratch", "worker-mail"));
+  assert.equal(pi.resumeOptions?.sandbox?.sessionRoot, join(root, "model", "sessions", "workers", "worker-mail"));
+  assert.equal("workspaceRoot" in (pi.resumeOptions?.sandbox ?? {}), false);
   assert.equal(db.get<{ status: string }>("SELECT status FROM task_mailbox WHERE id='mail-1'")?.status, "CONSUMED");
   assert.equal(db.get<{ status: string }>("SELECT status FROM pending_questions WHERE id='question-mail'")?.status, "CLOSED");
   assert.equal(tasks.getWorker("worker-mail").status, "RUNNING");
