@@ -1134,27 +1134,29 @@ Durable Task capability 应使用：
 
 ---
 
-# 42. Future Guest Sandbox
+# 42. Principal Execution Boundary
 
-未来 Guest Sandbox 的存在不会改变授权模型。
+Owner 与 Guest 共用 Trusted Pi Model Plane 和同一个 Principal ExecutionBackend。授权仍然由 Task capability attenuation 决定，Linux UID/GID 则约束实际文件访问。
 
 流程仍是：
 
 ```text
-Guest authority
+Authenticated Principal authority
 ↓
 Task capability
 ↓
 Worker capability
 ↓
-Guest Sandbox execution
+Runtime-created ExecutionContext
+↓
+Principal UID/GID execution
 ```
 
-Sandbox 是 execution isolation。
+Model Plane 的 provider credentials 不属于 Owner 或 Guest capability：它们只由 Model Plane Pi 进程读取。当前没有通用 Principal secret read/export 工具，也不能通过 `worker_exec` 读取 `/state/model/pi/agent`。
 
-Capability 是 logical authorization。
+未来若加入其他服务凭据，必须显式区分 `secret.use`（服务在授权 operation 内代用 credential）和 `secret.export`（返回 raw secret）。Guest 两者默认关闭；Owner 也不默认获得 raw export。
 
-两者互补，不能替代。
+Pi 请求的 task/worker/principal/ExecutionContext identity 均由 Runtime tool token 绑定；模型参数不能选 UID、Principal 或 workspace。
 
 ---
 
