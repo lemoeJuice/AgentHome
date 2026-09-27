@@ -57,13 +57,14 @@ build_without_overlay_context() (
   "$PODMAN" create --name "$build_container" "$BASE_IMAGE" sleep infinity >/dev/null
   "$PODMAN" start "$build_container" >/dev/null
   "$PODMAN" exec "$build_container" apt-get update
-  "$PODMAN" exec "$build_container" apt-get install -y --no-install-recommends bubblewrap ca-certificates git python3 make g++
+  "$PODMAN" exec "$build_container" apt-get install -y --no-install-recommends bubblewrap ca-certificates git python3 make g++ nftables
   "$PODMAN" exec "$build_container" rm -rf /var/lib/apt/lists/*
   "$PODMAN" exec "$build_container" mkdir -p /app
   "$PODMAN" cp package.json "$build_container:/app/package.json"
   if [[ -f package-lock.json ]]; then "$PODMAN" cp package-lock.json "$build_container:/app/package-lock.json"; fi
   "$PODMAN" cp tsconfig.json "$build_container:/app/tsconfig.json"
   "$PODMAN" cp src "$build_container:/app/src"
+  "$PODMAN" cp src/runtime/guest-exec.c "$build_container:/tmp/guest-exec.c"
   if [[ -d "$ROOT_DIR/node_modules" ]]; then
     printf '%s\n' 'using the lockfile-verified host node_modules cache for the isolated image build'
     "$PODMAN" cp "$ROOT_DIR/node_modules" "$build_container:/app/node_modules"
@@ -71,11 +72,12 @@ build_without_overlay_context() (
     "$PODMAN" exec --workdir /app "$build_container" sh -c 'if [ -f package-lock.json ]; then npm ci; else npm install; fi'
   fi
   "$PODMAN" exec --workdir /app "$build_container" npm run build
-  "$PODMAN" exec "$build_container" sh -c 'useradd --create-home --uid 10001 agent && mkdir -p /state /cache /scratch /run/agent-home && chown -R agent:agent /app /state /cache /scratch /run/agent-home'
+  "$PODMAN" exec "$build_container" gcc -O2 -Wall -Wextra -o /usr/local/bin/agent-home-guest-exec /tmp/guest-exec.c
+  "$PODMAN" exec "$build_container" chmod 755 /usr/local/bin/agent-home-guest-exec
+  "$PODMAN" exec "$build_container" sh -c 'useradd --create-home --uid 10001 agent && mkdir -p /state /cache /scratch /run/agent-home && chmod 711 /state && chmod 700 /cache /scratch /run/agent-home'
   "$PODMAN" exec "$build_container" sh -c "printf '%s\\n' '#!/bin/sh' 'exec node /app/dist/cli.js \"\$@\"' > /usr/local/bin/agent-home && chmod 755 /usr/local/bin/agent-home"
   "$PODMAN" commit --pause=false \
-    --change 'USER agent' \
-    --change 'ENV HOME=/state/home' \
+     --change 'ENV HOME=/state/home' \
     --change 'ENV PATH=/state/pi/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
     --change 'ENV XDG_CONFIG_HOME=/state/home/.config' \
     --change 'ENV XDG_DATA_HOME=/state/home/.local/share' \

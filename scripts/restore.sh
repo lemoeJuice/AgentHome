@@ -18,7 +18,7 @@ STAGING_VOLUME="${VOLUME}.restore-${STAMP}"
 OLD_VOLUME="${VOLUME}.pre-restore-${STAMP}"
 
 validate_manifest() {
-  CURRENT_RUNTIME_SCHEMA_VERSION="${AGENT_HOME_SCHEMA_VERSION:-18}" \
+  CURRENT_RUNTIME_SCHEMA_VERSION="${AGENT_HOME_SCHEMA_VERSION:-19}" \
   CURRENT_GATEWAY_SCHEMA_VERSION="${AGENT_HOME_GATEWAY_SCHEMA_VERSION:-6}" \
   node --input-type=module - \
     "$BACKUP/manifest.json" "$BACKUP/state.tar" "$BACKUP/image.tar" "$BACKUP/gateway.sqlite" \

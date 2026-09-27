@@ -13,6 +13,8 @@ CONTAINER="$AGENT_HOME_CONTAINER"
 "$PODMAN" info >/dev/null
 [[ "$($PODMAN container inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)" == true ]] || { printf '%s\n' "Agent Home container is not running: $CONTAINER" >&2; exit 2; }
 
+bash "$ROOT_DIR/scripts/test-guest-isolation.sh"
+
 PI_VERSION="$($PODMAN exec "$CONTAINER" pi --version)"
 printf 'Pi: %s\n' "$PI_VERSION"
 INSPECT_JSON="$($PODMAN inspect "$CONTAINER")" node --input-type=module -e 'const containers=JSON.parse(process.env.INSPECT_JSON); const container=containers[0] ?? {}; const mounts=container.Mounts ?? []; if (mounts.some((mount)=>mount.Type !== "volume" || mount.Destination !== "/state")) throw new Error(`forbidden Agent Home mount: ${JSON.stringify(mounts)}`); const hostConfig=container.HostConfig ?? {}; if (hostConfig.NetworkMode === "host") throw new Error("Agent Home uses host networking"); const ports=hostConfig.PortBindings ?? container.NetworkSettings?.Ports ?? {}; if (Object.keys(ports).length) throw new Error(`Agent Home publishes ports: ${JSON.stringify(ports)}`); if (!mounts.some((mount)=>mount.Type === "volume" && mount.Destination === "/state")) throw new Error("Agent Home /state volume is missing");'

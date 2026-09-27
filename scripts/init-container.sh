@@ -21,6 +21,20 @@ if "$PODMAN" container exists "$CONTAINER" && [[ "$($PODMAN container inspect -f
   printf 'replacing existing Agent Home container with updated image %s (state volume is retained)\n' "$IMAGE"
   "$PODMAN" rm -f "$CONTAINER" >/dev/null
 fi
+if "$PODMAN" container exists "$CONTAINER"; then
+  cap_add="$($PODMAN container inspect -f '{{json .HostConfig.CapAdd}}' "$CONTAINER")"
+  CAP_ADD_JSON="$cap_add" node --input-type=module -e 'const caps=JSON.parse(process.env.CAP_ADD_JSON||"null")||[];if(!caps.some((item)=>String(item).toUpperCase().replace(/^CAP_/,"")==="NET_ADMIN"))process.exit(1);' || {
+    printf '%s\n' 'replacing existing Agent Home container without guest network filter capability (state volume is retained)' >&2
+    "$PODMAN" rm -f "$CONTAINER" >/dev/null
+  }
+fi
+if "$PODMAN" container exists "$CONTAINER"; then
+  binds="$($PODMAN container inspect -f '{{json .HostConfig.Binds}}' "$CONTAINER")"
+  BINDS_JSON="$binds" node --input-type=module -e 'const binds=JSON.parse(process.env.BINDS_JSON||"null")||[];if(binds.some((bind)=>String(bind).split(":").at(-1).split(",").some((option)=>option.toUpperCase()==="U")))process.exit(1);' || {
+    printf '%s\n' 'replacing existing Agent Home container with Podman volume ownership rewriting disabled (state volume is retained)' >&2
+    "$PODMAN" rm -f "$CONTAINER" >/dev/null
+  }
+fi
 
 if "$PODMAN" container exists "$CONTAINER"; then
   privileged="$($PODMAN container inspect -f '{{.HostConfig.Privileged}}' "$CONTAINER")"
@@ -39,7 +53,7 @@ if "$PODMAN" container exists "$CONTAINER"; then
 fi
 
 if ! "$PODMAN" container exists "$CONTAINER"; then
-  run_args=(run -d --name "$CONTAINER" --volume "${VOLUME}:/state:Z,U" --network "$NETWORK")
+  run_args=(run -d --name "$CONTAINER" --cap-add NET_ADMIN --volume "${VOLUME}:/state:Z" --network "$NETWORK")
   [[ -n "${AGENT_HOME_MCP_URL:-}" ]] && run_args+=(--env "AGENT_HOME_MCP_URL=${AGENT_HOME_MCP_URL}")
   [[ -n "${AGENT_HOME_MCP_CALLER:-}" ]] && run_args+=(--env "AGENT_HOME_MCP_CALLER=${AGENT_HOME_MCP_CALLER}")
   if [[ -z "${AGENT_HOME_MCP_URL:-}" ]]; then run_args+=(--env "AGENT_HOME_MCP_URL=${AGENT_HOME_MCP_DEFAULT_URL:-http://host.containers.internal:8787/mcp}"); fi
@@ -50,8 +64,6 @@ if ! "$PODMAN" container exists "$CONTAINER"; then
 elif [[ "$("$PODMAN" container inspect -f '{{.State.Running}}' "$CONTAINER")" != true ]]; then
   "$PODMAN" start "$CONTAINER" >/dev/null
 fi
-
-"$PODMAN" exec "$CONTAINER" sh -c 'mkdir -p /state/home/.pi/agent && chmod 700 /state/home/.pi /state/home/.pi/agent'
 
 if [[ "${AGENT_HOME_REBOOTSTRAP:-0}" != 1 ]] && "$PODMAN" exec "$CONTAINER" agent-home control ping >/dev/null 2>&1; then
   printf '%s\n' 'Agent Home container is already initialized; skipping bootstrap'
@@ -82,8 +94,8 @@ fi
 if [[ -f "${AGENT_HOME_CONFIG:-$ROOT_DIR/config/agent-home.json}" ]]; then
   CONFIG_PATH="${AGENT_HOME_CONFIG:-$ROOT_DIR/config/agent-home.json}"
   [[ "$CONFIG_PATH" == /* ]] || CONFIG_PATH="$ROOT_DIR/$CONFIG_PATH"
-  deployment_config="$(CONFIG_PATH="$CONFIG_PATH" node --input-type=module -e 'import fs from "node:fs"; const c=JSON.parse(fs.readFileSync(process.env.CONFIG_PATH,"utf8")); const {piProvider:_legacyProvider,piModel:_legacyModel,...runtime}=c.runtime||{}; process.stdout.write(JSON.stringify({ runtime, agent: c.agent || { persona: "" } }));')"
-  DEPLOYMENT_CONFIG="$deployment_config" "$PODMAN" exec "$CONTAINER" env DEPLOYMENT_CONFIG="$deployment_config" node --input-type=module -e 'import fs from "node:fs"; const path="/state/config/bootstrap.json"; const value=JSON.parse(fs.readFileSync(path,"utf8")); const deployment=JSON.parse(process.env.DEPLOYMENT_CONFIG); value.runtime=deployment.runtime; value.agent=deployment.agent; fs.writeFileSync(path, JSON.stringify(value)+"\n", { mode: 0o600 }); fs.chmodSync(path, 0o600);'
+  deployment_config="$(CONFIG_PATH="$CONFIG_PATH" node --input-type=module -e 'import fs from "node:fs"; const c=JSON.parse(fs.readFileSync(process.env.CONFIG_PATH,"utf8")); const {piProvider:_legacyProvider,piModel:_legacyModel,...runtime}=c.runtime||{}; process.stdout.write(JSON.stringify({ runtime, guest: c.guest || undefined, agent: c.agent || { persona: "" } }));')"
+  DEPLOYMENT_CONFIG="$deployment_config" "$PODMAN" exec "$CONTAINER" env DEPLOYMENT_CONFIG="$deployment_config" node --input-type=module -e 'import fs from "node:fs"; const path="/state/config/bootstrap.json"; const value=JSON.parse(fs.readFileSync(path,"utf8")); const deployment=JSON.parse(process.env.DEPLOYMENT_CONFIG); value.runtime=deployment.runtime; if(deployment.guest) value.guest=deployment.guest; value.agent=deployment.agent; fs.writeFileSync(path, JSON.stringify(value)+"\n", { mode: 0o600 }); fs.chmodSync(path, 0o600);'
 fi
 
 if [[ "$initialized" == true && "${AGENT_HOME_REBOOTSTRAP:-0}" == 1 ]]; then

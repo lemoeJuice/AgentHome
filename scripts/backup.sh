@@ -47,7 +47,7 @@ fi
 if [[ -f runtime-state/gateway.sqlite ]]; then
   node --input-type=module -e 'import { DatabaseSync } from "node:sqlite"; const db=new DatabaseSync(process.argv[1]); db.exec("PRAGMA wal_checkpoint(TRUNCATE)"); db.close();' runtime-state/gateway.sqlite
 fi
-RUNTIME_SCHEMA_VERSION="${AGENT_HOME_SCHEMA_VERSION:-18}"
+RUNTIME_SCHEMA_VERSION="${AGENT_HOME_SCHEMA_VERSION:-19}"
 GATEWAY_SCHEMA_VERSION="$(node --input-type=module -e 'import { DatabaseSync } from "node:sqlite"; try { const db=new DatabaseSync(process.argv[1], { readOnly: true }); process.stdout.write(String(db.prepare("SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations").get().version ?? 0)); db.close(); } catch { process.stdout.write("0"); }' runtime-state/gateway.sqlite)"
 "$PODMAN" volume export "$VOLUME" -o "$DEST/state.tar"
 "$PODMAN" image exists "$AGENT_HOME_IMAGE" || { printf '%s\n' "agent home image is not available: $AGENT_HOME_IMAGE" >&2; exit 2; }
