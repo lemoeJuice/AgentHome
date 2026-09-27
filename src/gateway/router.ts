@@ -59,7 +59,7 @@ export class Router {
       await this.handleCommand(event, conversationId, command.name, command.args);
       return;
     }
-    if (event.conversation.kind === "group" && !this.naturalWakes(event)) return;
+    if (event.conversation.kind === "group" && !(await this.naturalWakes(event))) return;
     await this.controller.deliver(this.toEnvelope(event, conversationId, replyBinding ? { type: "direct_command_result", externalContext: replyBinding } : undefined));
   }
 
@@ -207,9 +207,12 @@ export class Router {
     return event.conversation.kind !== "group" || !this.policy(event).commandRequireMention || event.message.mentionsBot === true;
   }
 
-  private naturalWakes(event: ChatEvent): boolean {
+  private async naturalWakes(event: ChatEvent): Promise<boolean> {
     const policy = this.policy(event);
-    return policy.naturalLanguageMode === "observe_all" || event.message.mentionsBot === true || (event.message.replyTo !== null && event.message.replyTo !== undefined && event.message.replyTo !== (undefined as never));
+    if (policy.naturalLanguageMode === "observe_all" || event.message.mentionsBot === true) return true;
+    const replyTo = event.message.replyTo;
+    if (!replyTo || replyTo === null || !("messageId" in replyTo) || !this.adapter.isReplyToBot) return false;
+    return this.adapter.isReplyToBot(replyTo, event.conversation.kind).catch(() => false);
   }
 
   private policy(event: ChatEvent): { commandRequireMention: boolean; naturalLanguageMode: "observe_all" | "explicit_wake" } {

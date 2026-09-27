@@ -86,6 +86,17 @@ export class QQChatPlatformAdapter implements ChatPlatformAdapter {
     return { message: { platform: "qq", accountId: target.accountId, platformConversationId: target.platformConversationId, threadId: target.threadId, messageId }, raw: result as never };
   }
 
+  async isReplyToBot(ref: PlatformMessageRef, kind: ConversationAddress["kind"]): Promise<boolean> {
+    if (!this.botId || ref.platform !== "qq" || ref.accountId !== this.config.snowluma.accountId) return false;
+    try {
+      const raw = await this.client.action<Record<string, unknown>>("get_msg", { message_id: integerValue(ref.messageId, "message_id") });
+      return stringValue(raw.user_id) === this.botId;
+    } catch {
+      // Wake policy must fail closed when the referenced message cannot be verified.
+      return false;
+    }
+  }
+
   private normalize(raw: Record<string, unknown>): ChatEvent | null { return normalizeQQEvent(raw, this.config, this.botId); }
 }
 

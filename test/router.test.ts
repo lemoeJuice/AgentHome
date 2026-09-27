@@ -21,9 +21,11 @@ class Adapter implements ChatPlatformAdapter {
   readonly platform = "qq";
   readonly sent: OutgoingMessage[] = [];
   fail = false;
+  botMessageIds = new Set<string>();
   async start(): Promise<void> {}
   async stop(): Promise<void> {}
   async sendMessage(target: ConversationAddress, message: OutgoingMessage): Promise<SendResult> { if (this.fail) throw new Error("OUTBOUND_UNAVAILABLE"); this.sent.push(message); return { message: { platform: "qq", accountId: target.accountId, platformConversationId: target.platformConversationId, threadId: target.threadId, messageId: `out-${this.sent.length}` } }; }
+  async isReplyToBot(ref: import("../src/shared/types.js").PlatformMessageRef): Promise<boolean> { return this.botMessageIds.has(ref.messageId); }
 }
 
 test("Controller ingress contains only the summary and trusted message references", async () => {
@@ -115,6 +117,21 @@ test("group explicit wake policy does not forward unmentioned messages", async (
   const state = new GatewayState(join(root, "gateway.sqlite")); const adapter = new Adapter(); const events: unknown[] = [];
   const router = new Router(config, adapter, state, new CommandRegistry(), new AgentActionRegistry(), { deliver: async (event) => events.push(event) }, logger);
   await router.handle(event("hello group", "group", false)); await router.handle(event("@bot hello", "group", true));
+  assert.equal(events.length, 1);
+  state.close(); await rm(root, { recursive: true, force: true });
+});
+
+test("group replies wake only when the quoted message belongs to the bot", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-home-router-reply-wake-"));
+  const state = new GatewayState(join(root, "gateway.sqlite")); const adapter = new Adapter(); const events: unknown[] = [];
+  adapter.botMessageIds.add("bot-message");
+  const router = new Router(config, adapter, state, new CommandRegistry(), new AgentActionRegistry(), { deliver: async (event) => events.push(event) }, logger);
+  const quotedUserMessage = event("reply to user", "group");
+  quotedUserMessage.message.replyTo = { ...quotedUserMessage.message.ref, messageId: "user-message" };
+  const quotedBotMessage = event("reply to bot", "group");
+  quotedBotMessage.message.replyTo = { ...quotedBotMessage.message.ref, messageId: "bot-message" };
+  await router.handle(quotedUserMessage);
+  await router.handle(quotedBotMessage);
   assert.equal(events.length, 1);
   state.close(); await rm(root, { recursive: true, force: true });
 });
