@@ -80,6 +80,7 @@ export interface ChatPlatformAdapter {
   start(onEvent: (event: ChatEvent) => Promise<void>): Promise<void>;
   stop(): Promise<void>;
   sendMessage(target: ConversationAddress, message: OutgoingMessage): Promise<SendResult>;
+  isReplyToBot?(ref: PlatformMessageRef, kind: ConversationAddress["kind"]): Promise<boolean>;
 }
 
 export interface ArtifactRef {
