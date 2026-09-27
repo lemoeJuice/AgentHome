@@ -360,6 +360,8 @@ WorkerExecution → INTERRUPTED
 
 Task 再根据剩余 Worker 和 Main decision 继续处理。
 
+当前 Pi Session 属于 Trusted Model Plane，只挂载 Model Plane auth/session state 和固定 Runtime extension。Principal workspace 不挂入 Pi mount namespace。Worker 的 `worker_exec`、workspace read/write/edit/mkdir/remove/list/stat 通过 Runtime Tool socket 到 TaskService `ExecutionBackend`；该 backend 从 durable Task/Worker/Principal 构造 ExecutionContext 并以 Principal UID/GID 启动操作。Owner 与 Guest 共用此路径。
+
 ---
 
 # 10. Task Event Log

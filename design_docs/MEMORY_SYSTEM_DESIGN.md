@@ -421,7 +421,7 @@ Outcome:
 Host 和 Agent 的系统边界更清晰。
 
 Lesson:
-Agent Home 和 Guest Sandbox 必须视为两个不同概念。
+Agent Home 是同一个持久 runtime；Guest 是其中不同 Principal/ExecutionContext，不是另一套 Pi/model execution 架构或 nested container。
 ```
 
 不要保存 LLM 私有 chain-of-thought。

@@ -134,7 +134,7 @@ Host Controller restart ≠ Worker 自动停止
 - Kubernetes / 分布式调度；
 - 多机集群；
 - 多租户 SaaS；
-- 完整 Guest Sandbox；
+- per-task VM、nested container 或完整 cgroup 管理；
 - 每个 Worker 一个容器；
 - 复杂 Git worktree 调度；
 - 向量数据库作为前置依赖；
@@ -151,56 +151,28 @@ Host Controller restart ≠ Worker 自动停止
 # 4. 总体架构
 
 ```text
-                          QQ
-                          │
-                          ▼
-                      SnowLuma
-                          │
-                          ▼
-                     Bot Gateway
-                    /           \
-               Direct         Agent
-              Commands         Path
-                 │              │
-          Gateway Plugins   Controller
-                                │
-                         persistent exec
-                                ▼
-┌─────────────────────────────────────────────┐
-│              Agent Home                    │
-│                                             │
-│  Control Bridge → Runtime / Control Plane   │
-│                         │                   │
-│                         ├── Main Agent ─────┘
-│                         ├── Task Runtime
-│                         ├── Pi Harness
-│                         ├── Worker Sessions
-│                         ├── Memory Service
-│                         ├── Artifact Service
-│                         ├── Usage Service
-│                         └── Persistent State
-│
-│  /state = canonical persistent instance state
-└─────────────────────────────────────────────┘
-                         │
-                         │ outbound network
-                         ▼
-                      Internet
+                           QQ
+                           │
+                           ▼
+               SnowLuma → Router → Controller
+                                      │
+                           authenticated IPC
+                                      ▼
+┌─────────────────────────────────────────────────────┐
+│ Agent Home                                          │
+│  Control Plane: Runtime / Task / Principal / SQLite │
+│                  │                                  │
+│                  ▼                                  │
+│  Model Plane: Trusted Pi UID 10002 + Pi auth        │
+│                  │ Runtime tool protocol            │
+│                  ▼                                  │
+│  Execution Plane: Worker + Principal UID/GID        │
+│      ┌───────────┴────────────┐                     │
+│      Owner workspace      Guest workspace           │
+└─────────────────────────────────────────────────────┘
 ```
 
-未来：
-
-```text
-Guest
-↓
-Main
-↓
-Authorization Gate
-↓
-Disposable Guest Sandbox
-```
-
-Guest Sandbox 不属于当前 Owner Agent Home。
+Owner and Guest share the same Trusted Pi Runtime and Principal-scoped ExecutionBackend. Pi receives only fixed trusted Runtime extensions; it has no workspace mount and no unrestricted built-in tools. `guest-persistent-sandbox-design.md` defines the UID/GID filesystem and network boundary.
 
 ---
 
@@ -1160,6 +1132,31 @@ Capability / Service
 = 实际实现
 ```
 
+## 16.1 Control / Model / Execution Planes
+
+当前执行架构有三个安全域：
+
+```text
+Control Plane
+  Router / Controller / Runtime / SQLite / Principal / Task / policy
+
+Model Plane
+  Trusted Pi process / provider credentials / trusted extensions / agent loop
+
+Execution Plane
+  Worker tools / shell / filesystem / build tools / Principal workspace
+```
+
+Pi 不拥有 Principal workspace mount，也不启用 unrestricted built-in tools。只有部署镜像中的固定 Runtime extension 能进入 Pi；Principal workspace 的 `.pi/extensions` 不会加载。
+
+Owner 与 Guest 共用 Pi、Runtime Tool Protocol 和 `ExecutionBackend`。Runtime 从 Task/Worker/Principal 的持久可信记录构造 `ExecutionContext`（task、worker、Principal、UID/GID、role、capability、workspace、session）；模型输入只提供 operation 参数，不能指定身份、UID 或 workspace root。shell、read/write/edit、mkdir/remove/list/stat 均通过 backend 以目标 Principal UID/GID 执行。
+
+Pi provider auth 位于 `/state/model/pi/agent`，由 Model Plane UID 10002 持有。Principal execution 不获得 provider token、auth path bind、环境变量副本或临时凭据文件。系统当前没有通用 `secret.read` 或 raw secret export tool；未来需要服务凭据时必须将 `secret.use` 与 `secret.export` 分开，默认不提供 `secret.export`。Model Plane 直接访问模型 provider，不经过 LLM reverse proxy。
+
+Owner workspace 同样属于 `/state/principals/principal:owner`。`/state/home` 和 `/state/projects` 只作为迁移兼容路径指向 Owner Principal 数据；Controller SQLite、Runtime secrets、Model Plane 和 worker session state 不在 execution namespace 中。
+
+Guest execution 另外受 `guest.enabled`、Principal capability、UID/GID filesystem permission 与 Guest UID nftables policy 约束。Model Plane provider networking 不受 Guest egress rules 限制。
+
 禁止：
 
 > 一个 Command 必须对应一个独立实现。
@@ -1201,12 +1198,14 @@ Privilege-changing command 必须由 deterministic Runtime 处理。
 
 # 18. Workspace
 
-Owner Worker 使用 Agent Home 内的持久 project workspace。
+每个 Principal（包括 Owner）使用 Agent Home 内独立、持久的 project workspace。
 
 MVP：
 
 ```text
-shared persistent projects
+/state/principals/<principal-id>/projects/<workspace-id>
++
+per-principal workspace scope
 +
 per-project writer lock
 ```
@@ -1628,8 +1627,9 @@ TODO
 14. Memory Service 按独立设计接入 Main；
 15. 正常 build/typecheck/test；
 16. 至少一个真实 E2E demo。
+17. Owner/Guest 共用 Model Plane 与 Runtime Tool interface；真实 OS UID 测试证明 workspace/credential isolation。
 
-Guest Sandbox、Graph Memory、Git worktree、multi-harness 等不属于 MVP blocking。
+Principal-scoped ExecutionBackend 与 Model Plane credential isolation 属于 MVP security blocking；per-task VM/cgroup、Graph Memory、Git worktree、multi-harness 不属于当前 MVP blocking。
 
 ---
 
@@ -1921,7 +1921,7 @@ Pi 的具体 integration API 与 SnowLuma 的低层 API 不再单独设计；Cha
 
 暂时不值得写详细文档：
 
-- Guest Sandbox backend；
+- per-task Guest VM/cgroup backend；
 - Git worktree；
 - Graph Memory；
 - multi-harness；
@@ -1930,7 +1930,7 @@ Pi 的具体 integration API 与 SnowLuma 的低层 API 不再单独设计；Cha
 - distributed workers；
 - Web dashboard。
 
-它们尚未成为 MVP blocking 问题。
+其中 per-task VM/cgroup 尚未成为 MVP blocking；Principal-scoped ExecutionBackend 属于当前安全边界，必须沿用现有 Principal/Task/Runtime 架构维护。
 
 ---
 

@@ -214,7 +214,7 @@ QQ
 
 ### Guest Sandbox
 
-Guest Sandbox 是另一套安全边界，未来可以使用 VM、gVisor、其他容器等实现，不影响本设计。
+Owner 与 Guest 均在 Agent Home 容器内，复用 Trusted Pi Model Plane 和同一 Principal ExecutionBackend。容器边界保护 Host；Principal UID/GID、workspace permission 与 capability 在容器内区分 Owner/Guest。当前不使用 nested container、VM 或 LLM reverse proxy。
 
 ---
 
@@ -2067,7 +2067,7 @@ Secret 通过 CLI argv
 12. **Controller 不直接依赖 Pi 或 Memory 实现。**
 13. **SnowLuma 是 QQ protocol gateway，不是授权边界。**
 14. **Runtime 依据可信平台 metadata 做确定性授权。**
-15. **Guest Sandbox 与 Owner Agent Home 分离。**
+15. **Guest 与 Owner 共用 Agent Home/Model Plane；Principal ExecutionContext、UID/GID、capability 与 workspace 不同。**
 16. **Control Protocol 与 Podman 解耦，Podman 只是当前 transport/backend。**
 17. **恢复 Agent 依赖的是 `/state` 与兼容 runtime，不是原宿主环境。**
 18. **正常业务入站只使用一个长期 `podman exec -i ... control stream` 通道，不存在 one-shot event injection fallback。**

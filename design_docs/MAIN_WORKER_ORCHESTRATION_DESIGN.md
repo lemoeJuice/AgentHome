@@ -2063,3 +2063,13 @@ Runtime 已拥有一个可信、durable 的 ingress event
 15. **Main context 按需组合，不复制全部 QQ/Memory/Worker 历史。**
 16. **Main Session 故障不能导致 Task/Memory 消失。**
 17. **多 Agent 的复杂度必须由并行性或任务拆分的真实收益证明。**
+
+---
+
+# 61. Trusted Model Plane / Principal Execution Plane
+
+当前实现中，Main 与 Worker 的 Pi 都运行在同一个 Trusted Model Plane UID（rootful 容器内 UID/GID 10002）。Pi 直接访问 provider，不存在 LLM reverse proxy；Pi 的 mount namespace 不包含 Principal workspace、SQLite、deployment secrets 或 project extensions。Provider auth/settings 位于 `/state/model/pi/agent`。
+
+Worker Pi 只加载应用镜像里的 `worker-tools` Runtime extension，Main Pi 只加载应用镜像里的 `pi-tools` extension。两者均关闭 Pi built-in tools、自动 extensions、skills 与 context files。任何 workspace `.pi/extensions` 都不自动执行。
+
+所有 Worker 的 shell 和文件工具均通过同一 Unix Runtime Tool socket 到 TaskService `ExecutionBackend`。Runtime token 对应服务端 Task/Worker/Principal 上下文；Worker 输入不能指定 Principal、UID/GID 或绝对 workspace。Owner 与 Guest 差别仅由 Principal 身份、capability、workspace 与 Guest policy 决定。
