@@ -284,6 +284,13 @@ export const runtimeMigrations = [
       UPDATE worker_executions SET workspace_scope_id=workspace_id WHERE workspace_scope_id IS NULL AND workspace_id IS NOT NULL;
     `,
   },
+  {
+    version: 20,
+    sql: `
+      ALTER TABLE worker_executions ADD COLUMN source_mailbox_id TEXT;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_workers_source_mailbox ON worker_executions(source_mailbox_id) WHERE source_mailbox_id IS NOT NULL;
+    `,
+  },
 ];
 
 export function ensureRuntimeSchema(store: SqliteStore): void {

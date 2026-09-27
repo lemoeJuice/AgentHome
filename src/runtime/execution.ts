@@ -6,12 +6,16 @@ export interface ExecutionContext {
   taskId: string;
   workerId: string;
   principalId: string;
+  workspaceId: string;
+  workspaceScopeId?: string;
   uid: number;
   gid: number;
   role: Trust;
   capabilities: CapabilitySet;
   workspace: string;
   workspaceAccess: "READ" | "WRITE";
+  executionProfile: "PRINCIPAL_READ_ONLY" | "PRINCIPAL_READ_WRITE" | "LEGACY_READ_ONLY" | "LEGACY_READ_WRITE" | "LEGACY_UNSCOPED";
+  contextSource: "durable-worker-record";
   home: string;
   sessionId?: string;
   groupId?: string;

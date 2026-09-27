@@ -1,12 +1,22 @@
 import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 
-export function installGuestEgressFilter(uidMin: number, uidMax: number, resolverConfig = "/etc/resolv.conf"): void {
+export function installGuestEgressFilter(uidMin: number, uidMax: number, resolverConfig = "/etc/resolv.conf", proxyUrl?: string): void {
   if (process.getuid?.() !== 0) throw new Error("GUEST_EGRESS_FILTER_REQUIRES_SYSTEM_ROOT");
-  const resolvers = parseResolvers(readFileSync(resolverConfig, "utf8"));
+  const rules = buildGuestEgressRules(uidMin, uidMax, readFileSync(resolverConfig, "utf8"), proxyUrl);
+  const nft = process.env.AGENT_HOME_NFT_COMMAND ?? "nft";
+  const remove = spawnSync(nft, ["delete", "table", "inet", "agent_home_guest"], { encoding: "utf8" });
+  if (remove.error && (remove.error as NodeJS.ErrnoException).code !== "ENOENT") throw remove.error;
+  const result = spawnSync(nft, ["-f", "-"], { input: rules, encoding: "utf8" });
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error(`GUEST_EGRESS_FILTER_INSTALL_FAILED:${(result.stderr || result.stdout).trim()}`);
+}
+
+export function buildGuestEgressRules(uidMin: number, uidMax: number, resolverConfiguration: string, proxyUrl?: string): string {
+  const resolvers = parseResolvers(resolverConfiguration);
   if (resolvers.ipv4.length === 0 && resolvers.ipv6.length === 0) throw new Error("GUEST_EGRESS_DNS_RESOLVER_REQUIRED");
   const range = `${uidMin}-${uidMax}`;
-  const rules = [
+  return [
     "table inet agent_home_guest {",
     "  chain output {",
     "    type filter hook output priority filter; policy accept;",
@@ -18,19 +28,24 @@ export function installGuestEgressFilter(uidMin: number, uidMax: number, resolve
       `    meta skuid ${range} ip6 daddr ${resolver} udp dport 53 accept`,
       `    meta skuid ${range} ip6 daddr ${resolver} tcp dport 53 accept`,
     ]),
+    ...guestProxyEgressRules(range, proxyUrl),
     `    meta skuid ${range} ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 } reject`,
     `    meta skuid ${range} ip6 daddr { ::/128, ::1, ::ffff:0:0/96, 64:ff9b::/96, fc00::/7, fe80::/10, ff00::/8 } reject`,
     "  }",
     "}",
     "",
   ].join("\n");
+}
 
-  const nft = process.env.AGENT_HOME_NFT_COMMAND ?? "nft";
-  const remove = spawnSync(nft, ["delete", "table", "inet", "agent_home_guest"], { encoding: "utf8" });
-  if (remove.error && (remove.error as NodeJS.ErrnoException).code !== "ENOENT") throw remove.error;
-  const result = spawnSync(nft, ["-f", "-"], { input: rules, encoding: "utf8" });
-  if (result.error) throw result.error;
-  if (result.status !== 0) throw new Error(`GUEST_EGRESS_FILTER_INSTALL_FAILED:${(result.stderr || result.stdout).trim()}`);
+function guestProxyEgressRules(uidRange: string, proxyUrl?: string): string[] {
+  if (!proxyUrl) return [];
+  let proxy: URL;
+  try { proxy = new URL(proxyUrl); }
+  catch { throw new Error("GUEST_EGRESS_PROXY_URL_INVALID"); }
+  if (proxy.hostname.toLowerCase() !== "host.containers.internal") return [];
+  const port = proxy.port || (proxy.protocol === "https:" ? "443" : "80");
+  if (!/^\d+$/.test(port) || Number(port) < 1 || Number(port) > 65535) throw new Error("GUEST_EGRESS_PROXY_PORT_INVALID");
+  return [`    meta skuid ${uidRange} ip daddr 169.254.1.2 tcp dport ${port} accept`];
 }
 
 function parseResolvers(content: string): { ipv4: string[]; ipv6: string[] } {

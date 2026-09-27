@@ -1,4 +1,4 @@
-import { access, chmod, chown, mkdir, readFile, readdir, realpath, stat } from "node:fs/promises";
+import { access, chmod, chown, mkdir, open, readFile, readdir, realpath, stat } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { dirname, join, relative, resolve } from "node:path";
@@ -8,12 +8,14 @@ import { attenuateTask, attenuateWorker, capabilityWithin, deriveCapabilities, v
 import { newId, nowIso, messageKey } from "../shared/ids.js";
 import type { ArtifactRef, CapabilitySet, JsonValue, PlatformMessageRef, TaskRecord, TaskRequester, TaskStatus, WorkerExecutionRecord, WorkerStatus } from "../shared/types.js";
 import type { ArtifactService } from "./artifacts.js";
-import type { PiHarness, PiProcessIdentity, PiSandbox, PiSession } from "./pi.js";
+import { piNetworkFailureHint, type PiHarness, type PiImageContent, type PiProcessIdentity, type PiSandbox, type PiSession } from "./pi.js";
 import type { GatewayMcpClient } from "./mcp.js";
 import type { Logger } from "../shared/logger.js";
 import { canonicalWorkspaceId, OWNER_RUNTIME_UID, type PrincipalService } from "./principals.js";
 import { type ExecutionBackend, type ExecutionContext, type ExecutionRequest } from "./execution.js";
 import { MODEL_RUNTIME_GID, MODEL_RUNTIME_UID } from "./model-plane.js";
+import { PI_IMAGE_INPUT_MAX_BYTES, piImageContent, sniffImageMimeType } from "./images.js";
+import { proxyEnvironment } from "./network.js";
 
 export type RuntimeEvent = { type: string; taskId?: string; workerId?: string; questionId?: string; payload?: Record<string, unknown> };
 
@@ -48,7 +50,6 @@ export interface TaskServiceOptions {
   modelSessionsRoot?: string;
   modelRuntimeUid?: number;
   modelRuntimeGid?: number;
-  getModelProxyUrl?: () => string | undefined;
   createWorkerToolContext?: (worker: WorkerExecutionRecord, task: TaskRecord) => { token: string; socketPath: string };
 }
 
@@ -96,11 +97,12 @@ export class TaskService implements ExecutionBackend {
       this.db.run("INSERT INTO tasks(id,title,goal,status,requester_json,trust,origin_conversation_id,notification_conversation_id,parent_task_id,capabilities_json,created_at,updated_at,principal_id,deadline_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", id, task.title, task.goal, task.status, JSON.stringify(task.requester), task.trust, task.originConversationId, task.notificationConversationId, task.parentTaskId ?? null, JSON.stringify(task.capabilities), timestamp, timestamp, requester.principalId ?? null, deadlineAt ?? null);
       this.event(id, "TASK_CREATED", undefined, { title: task.title });
     });
+    this.log.debug("Task Principal capabilities persisted", { taskId: id, principalId: requester.principalId, role: input.trust, uid: requester.runtimeUid, gid: requester.runtimeGid, capabilities: { projects: capabilities.projects }, executionProfile: "TASK_CAPABILITY_SNAPSHOT", scope: input.originConversationId, contextSource: requester.principalId ? "resolved-principal" : "unbound-requester" });
     this.audit("task.create", "ALLOW", undefined, id, input.requester.userId, id);
     return task;
   }
 
-  async createWorker(input: { taskId: string; objective: string; workspaceId?: string; workspaceAccess?: "READ" | "WRITE"; requestedCapabilities?: Partial<CapabilitySet>; artifactRefs?: ArtifactRef[]; actor: CapabilitySet; actorPrincipalId?: string; actorRequester?: TaskRequester }): Promise<WorkerExecutionRecord> {
+  async createWorker(input: { taskId: string; objective: string; workspaceId?: string; workspaceAccess?: "READ" | "WRITE"; requestedCapabilities?: Partial<CapabilitySet>; artifactRefs?: ArtifactRef[]; sourceMailboxId?: string; actor: CapabilitySet; actorPrincipalId?: string; actorRequester?: TaskRequester }): Promise<WorkerExecutionRecord> {
     const task = this.getTask(input.taskId);
     if (this.isTerminalTask(task.status) || this.cancellationRequested(task.id)) throw new Error("TASK_CREATE_WORKER_DENIED");
     const isGuest = task.trust === "GUEST" && Boolean(this.options.principals);
@@ -110,10 +112,13 @@ export class TaskService implements ExecutionBackend {
     if (this.options.principals && !principal) throw new Error("WORKER_PRINCIPAL_REQUIRED");
     const principalExecution = Boolean(principal);
     const workspaceId = input.workspaceId ? canonicalWorkspaceId(input.workspaceId) : principalExecution ? "default" : undefined;
-    const workspaceAccess = input.workspaceAccess ?? (principalExecution ? "WRITE" : undefined);
+    const inheritedWorkspaceRights = workspaceId ? task.capabilities.projects.filter((project) => project.projectId === "*" || project.projectId === workspaceId) : [];
+    const inheritedWorkspaceAccess = inheritedWorkspaceRights.some((project) => project.access === "WRITE") ? "WRITE" : inheritedWorkspaceRights.length ? "READ" : undefined;
+    const workspaceAccess = input.workspaceAccess ?? (principalExecution ? inheritedWorkspaceAccess : undefined);
     const actor = validateCapabilitySet(input.actor);
     const actorPrincipalId = input.actorPrincipalId ?? input.actorRequester?.principalId;
     if (!actor.tasks.canCreate || !this.taskVisibleToActor(task, actor, actorPrincipalId, input.actorRequester)) throw new Error("TASK_CREATE_WORKER_DENIED");
+    if (principalExecution && workspaceId && !workspaceAccess) throw new Error("PROJECT_ACCESS_DENIED");
     if (workspaceId && workspaceAccess && !task.capabilities.projects.some((project) => (project.projectId === "*" || project.projectId === workspaceId) && (project.access === "WRITE" || project.access === workspaceAccess))) throw new Error("PROJECT_ACCESS_DENIED");
     if (isGuest && !principal) throw new Error("GUEST_PRINCIPAL_REQUIRED");
     if (principal && this.options.principals) {
@@ -128,14 +133,7 @@ export class TaskService implements ExecutionBackend {
     if (this.activeRequesterWorkerCount(task.requester) >= this.limit("maxWorkersPerRequester")) throw new Error("WORKER_REQUESTER_QUOTA_EXCEEDED");
     if (isGuest && task.requester.principalId && this.activeRequesterWorkerCount(task.requester) >= this.config.guest.maxWorkersPerPrincipal) throw new Error("GUEST_WORKER_PRINCIPAL_QUOTA_EXCEEDED");
     const workerId = newId("worker");
-    const requestedCapabilities = input.requestedCapabilities ?? {
-      memory: { allowedScopes: task.capabilities.memory.allowedScopes },
-      projects: workspaceId && workspaceAccess ? [{ projectId: workspaceId, access: workspaceAccess }] : [],
-      qq: { readConversations: [], sendConversations: [] },
-      plugins: { allowedActions: task.capabilities.plugins.allowedActions, ...(task.capabilities.plugins.allowedPermissions !== undefined ? { allowedPermissions: task.capabilities.plugins.allowedPermissions } : {}) },
-      artifacts: { readableArtifactAuthorities: task.capabilities.artifacts.readableArtifactAuthorities, publishTaskIds: [input.taskId], allowedDestinations: [] },
-      tasks: { canCreate: false, visibleTaskIds: [], canCancel: false, canFollowUp: false },
-    };
+    const requestedCapabilities = input.requestedCapabilities ?? defaultWorkerCapabilityRequest(task, workspaceId, workspaceAccess);
     let capabilities: CapabilitySet;
     try { capabilities = attenuateWorker(task.capabilities, requestedCapabilities); }
     catch (error) { this.audit("worker.create", "DENY", error instanceof Error ? error.message : String(error), task.id, task.requester.userId, task.id); throw error; }
@@ -146,9 +144,12 @@ export class TaskService implements ExecutionBackend {
     const timestamp = nowIso();
     const worker: WorkerExecutionRecord = { id: workerId, taskId: input.taskId, objective: input.objective, status, harness: "pi", processMode: principalExecution ? "PRINCIPAL_BROKERED" : "PI", ...(effectivePrincipalId ? { principalId: effectivePrincipalId } : {}), ...(principal ? { runtimeUid: principal.runtimeUid, runtimeGid: principal.runtimeGid } : {}), ...(workspaceId ? { workspaceId } : {}), ...(workspaceScopeId ? { workspaceScopeId } : {}), ...(workspaceAccess ? { workspaceAccess } : {}), ...(input.artifactRefs?.length ? { artifactRefs: input.artifactRefs } : {}), updatedAt: timestamp };
     worker.capabilities = capabilities;
+    const executionProfile = describeExecutionProfile(worker);
+    this.log.debug("Worker execution profile selected", { taskId: task.id, workerId, principalId: effectivePrincipalId, role: principal?.role ?? task.trust, uid: principal?.runtimeUid ?? worker.runtimeUid, gid: principal?.runtimeGid ?? worker.runtimeGid, workspaceId, workspace: workspaceId && principal ? this.options.principals?.workspacePathSync(principal.principalId, workspaceId) : workspaceId ? join(this.options.workerRoot, "projects", workspaceId) : undefined, workspaceAccess, capabilities: { projects: capabilities.projects }, executionProfile, scope: workspaceScopeId ?? workspaceId, contextSource: principalExecution ? "durable-task-and-worker-records" : "legacy-worker-record" });
+    if (workspaceAccess === "READ") this.log.warn("Read-only Worker profile persisted", { taskId: task.id, workerId, principalId: effectivePrincipalId, role: principal?.role ?? task.trust, uid: principal?.runtimeUid ?? worker.runtimeUid, gid: principal?.runtimeGid ?? worker.runtimeGid, workspaceId, workspace: workspaceId && principal ? this.options.principals?.workspacePathSync(principal.principalId, workspaceId) : undefined, capabilities: { projects: capabilities.projects }, executionProfile, scope: workspaceScopeId ?? workspaceId, contextSource: principalExecution ? "durable-task-and-worker-records" : "legacy-worker-record" });
     try {
       this.db.transaction(() => {
-        this.db.run("INSERT INTO worker_executions(id,task_id,objective,status,harness,workspace_id,workspace_access,capabilities_json,artifact_refs_json,mcp_binding_token,updated_at,principal_id,runtime_uid,runtime_gid,workspace_scope_id,process_mode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", workerId, input.taskId, input.objective, status, "pi", workspaceId ?? null, workspaceAccess ?? null, JSON.stringify(capabilities), input.artifactRefs?.length ? JSON.stringify(input.artifactRefs) : null, null, timestamp, effectivePrincipalId ?? null, principal?.runtimeUid ?? null, principal?.runtimeGid ?? null, workspaceScopeId ?? null, worker.processMode ?? "PI");
+        this.db.run("INSERT INTO worker_executions(id,task_id,objective,status,harness,workspace_id,workspace_access,capabilities_json,artifact_refs_json,mcp_binding_token,updated_at,principal_id,runtime_uid,runtime_gid,workspace_scope_id,process_mode,source_mailbox_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", workerId, input.taskId, input.objective, status, "pi", workspaceId ?? null, workspaceAccess ?? null, JSON.stringify(capabilities), input.artifactRefs?.length ? JSON.stringify(input.artifactRefs) : null, null, timestamp, effectivePrincipalId ?? null, principal?.runtimeUid ?? null, principal?.runtimeGid ?? null, workspaceScopeId ?? null, worker.processMode ?? "PI", input.sourceMailboxId ?? null);
         this.event(input.taskId, "WORKER_CREATED", workerId, { status });
         this.db.run("UPDATE tasks SET status=?,updated_at=? WHERE id=? AND status IN ('CREATED','QUEUED')", status === "PENDING" ? "QUEUED" : "RUNNING", timestamp, input.taskId);
       });
@@ -174,9 +175,14 @@ export class TaskService implements ExecutionBackend {
     if (task.trust === "GUEST" && !this.config.guest.enabled) throw new Error("GUEST_PROCESS_EXEC_DENIED");
     const dirs = await this.options.principals.ensurePrincipalDirectories(principal.principalId);
     const workspace = await this.options.principals.workspacePath(principal.principalId, worker.workspaceId);
-    const capabilities = worker.capabilities ?? task.capabilities;
-    if (!capabilities.projects.some((project) => (project.projectId === "*" || project.projectId === worker.workspaceId) && (project.access === "WRITE" || worker.workspaceAccess === "READ"))) throw new Error("WORKSPACE_CAPABILITY_DENIED");
-    return { executionContextId: `${task.id}:${worker.id}:${principal.principalId}`, taskId: task.id, workerId: worker.id, principalId: principal.principalId, uid: principal.runtimeUid, gid: principal.runtimeGid, role: principal.role, capabilities, workspace, workspaceAccess: worker.workspaceAccess, home: dirs.home, ...(worker.harnessSessionId ? { sessionId: worker.harnessSessionId } : {}) };
+    const capabilities = worker.capabilities;
+    if (!capabilities) throw new Error("WORKER_CAPABILITY_SNAPSHOT_MISSING");
+    const workspaceCapability = capabilities.projects.find((project) => project.projectId === "*" || project.projectId === worker.workspaceId);
+    if (!workspaceCapability) throw new Error("WORKSPACE_CAPABILITY_MISSING");
+    if (worker.workspaceAccess === "WRITE" && workspaceCapability.access !== "WRITE") throw new Error("WORKSPACE_WRITE_CAPABILITY_MISSING");
+    const context: ExecutionContext = { executionContextId: `${task.id}:${worker.id}:${principal.principalId}`, taskId: task.id, workerId: worker.id, principalId: principal.principalId, workspaceId: worker.workspaceId, ...(worker.workspaceScopeId ? { workspaceScopeId: worker.workspaceScopeId } : {}), uid: principal.runtimeUid, gid: principal.runtimeGid, role: principal.role, capabilities, workspace, workspaceAccess: worker.workspaceAccess, executionProfile: describeExecutionProfile(worker), contextSource: "durable-worker-record", home: dirs.home, ...(worker.harnessSessionId ? { sessionId: worker.harnessSessionId } : {}) };
+    this.log.debug("Worker ExecutionContext reconstructed", executionContextLogFields(context));
+    return context;
   }
 
   async execute(context: ExecutionContext, input: ExecutionRequest): Promise<JsonValue> {
@@ -194,20 +200,34 @@ export class TaskService implements ExecutionBackend {
   private async executeFileOperation(context: ExecutionContext, request: { operation: "read" | "write" | "edit" | "mkdir" | "remove" | "list" | "stat"; path: string; content?: string; oldText?: string; newText?: string }): Promise<unknown> {
     if (typeof request.path !== "string" || request.path.length > 4096 || (request.content?.length ?? 0) > 512 * 1024 || (request.oldText?.length ?? 0) > 512 * 1024 || (request.newText?.length ?? 0) > 512 * 1024) throw new Error("WORKSPACE_TOOL_INPUT_INVALID");
     const mutating = ["write", "edit", "mkdir", "remove"].includes(request.operation);
-    if (context.workspaceAccess !== "WRITE" && mutating) throw new Error("WORKSPACE_WRITE_CAPABILITY_REQUIRED");
+    if (context.workspaceAccess !== "WRITE" && mutating) {
+      this.log.warn("Worker write denied by read-only execution profile", { ...executionContextLogFields(context), operation: request.operation, contextSource: "durable-worker-record" });
+      throw new Error("WORKER_PROFILE_READ_ONLY");
+    }
     const command = `node -e ${shellQuote(PRINCIPAL_FILE_TOOL_SCRIPT)} ${shellQuote(JSON.stringify(request))}`;
     const result = await this.executeAsPrincipal(context, { command }, mutating, true);
     if (!result || typeof result !== "object" || Array.isArray(result)) throw new Error("WORKSPACE_TOOL_RESPONSE_INVALID");
     const commandResult = result as Record<string, JsonValue>;
-    if (commandResult.exitCode !== 0) throw new Error(`WORKSPACE_TOOL_FAILED:${String(commandResult.stderr ?? "").slice(0, 500)}`);
-    try { return JSON.parse(String(commandResult.stdout ?? "")) as unknown; }
+    if (commandResult.exitCode !== 0) throw new Error(classifyWorkspaceExecutionFailure(String(commandResult.stderr ?? "")));
+    let envelope: { ok?: boolean; result?: unknown; errorCode?: string };
+    try { envelope = JSON.parse(String(commandResult.stdout ?? "")) as typeof envelope; }
     catch { throw new Error("WORKSPACE_TOOL_RESPONSE_INVALID"); }
+    if (envelope.ok !== true) {
+      const errorCode = typeof envelope.errorCode === "string" && envelope.errorCode.startsWith("WORKSPACE_")
+        ? envelope.errorCode
+        : classifyWorkspaceErrorCode(String(envelope.errorCode ?? ""));
+      throw new Error(errorCode);
+    }
+    return envelope.result;
   }
 
   private async executeAsPrincipal(context: ExecutionContext, input: ExecutionRequest, requireWrite: boolean, runtimeGeneratedCommand = false): Promise<JsonValue> {
     const current = await this.executionContext(context.workerId);
-    if (context.executionContextId !== current.executionContextId || context.taskId !== current.taskId || context.principalId !== current.principalId || context.uid !== current.uid || context.gid !== current.gid || context.workspace !== current.workspace || context.workspaceAccess !== current.workspaceAccess) throw new Error("EXECUTION_CONTEXT_STALE_OR_FORGED");
-    if (requireWrite && current.workspaceAccess !== "WRITE") throw new Error("WORKSPACE_WRITE_CAPABILITY_REQUIRED");
+    if (context.executionContextId !== current.executionContextId || context.taskId !== current.taskId || context.workerId !== current.workerId || context.principalId !== current.principalId || context.workspaceId !== current.workspaceId || context.workspaceScopeId !== current.workspaceScopeId || context.uid !== current.uid || context.gid !== current.gid || context.role !== current.role || context.workspace !== current.workspace || context.home !== current.home || context.workspaceAccess !== current.workspaceAccess || context.executionProfile !== current.executionProfile || JSON.stringify(context.capabilities) !== JSON.stringify(current.capabilities)) throw new Error("EXECUTION_CONTEXT_STALE_OR_FORGED");
+    if (requireWrite && current.workspaceAccess !== "WRITE") {
+      this.log.warn("Worker process execution denied by read-only execution profile", { ...executionContextLogFields(current), contextSource: "durable-worker-record" });
+      throw new Error("WORKER_PROFILE_READ_ONLY");
+    }
     const worker = this.getWorker(current.workerId);
     const task = this.getTask(current.taskId);
     const guest = task.trust === "GUEST";
@@ -221,7 +241,7 @@ export class TaskService implements ExecutionBackend {
     const commandTimeout = guest ? this.config.guest.commandTimeoutMs : this.config.runtime.piTimeoutMs;
     const timeoutMs = Math.max(1, Math.min(Number.isSafeInteger(input.timeoutMs) ? Number(input.timeoutMs) : commandTimeout, commandTimeout, remainingTaskMs));
     const helper = this.options.guestExecCommand ?? "/usr/local/bin/agent-home-guest-exec";
-    const environment = this.options.principals!.principalProcessEnvironment(current.principalId);
+    const environment = this.options.principals!.principalProcessEnvironment(current.principalId, this.config.network?.modelProxyUrl);
     const child = spawn(helper, [String(current.uid), String(current.gid), String(this.config.guest.cpuSeconds), String(this.config.guest.memoryBytes), String(this.config.guest.pids), String(this.config.guest.maxFileBytes), "--", "/bin/bash", "-c", input.command], { cwd, env: environment, detached: true, stdio: ["ignore", "pipe", "pipe"] });
     const active = this.activePrincipalCommands.get(worker.id) ?? new Set<ChildProcess>();
     active.add(child);
@@ -384,17 +404,24 @@ export class TaskService implements ExecutionBackend {
       await this.failWorker(worker.id, String(error));
       throw error;
     }
+    this.log.debug("Worker Pi harness started", { taskId: task.id, workerId: worker.id, principalId: worker.principalId, role: task.trust, uid: worker.runtimeUid, gid: worker.runtimeGid, workspace: projectPath, workspaceId: worker.workspaceId, workspaceAccess: worker.workspaceAccess, capabilities: { projects: worker.capabilities?.projects ?? [] }, executionProfile: describeExecutionProfile(worker), scope: worker.workspaceScopeId ?? worker.workspaceId, artifactRefCount: worker.artifactRefs?.length ?? 0, contextSource: "durable-worker-records", piCwd: principalBrokered ? dirname(sessionPath) : projectPath, sessionRoot: dirname(sessionPath) });
     let mcpToken: string | undefined;
     try { mcpToken = await this.ensureWorkerBinding(worker.id); }
     catch (error) { await this.failWorker(worker.id, String(error)); return; }
     if (!this.workerCanStart(worker.id)) return;
-    const sandbox: PiSandbox = { sessionRoot: dirname(sessionPath), ...(principalBrokered ? { modelProxyUrl: this.options.getModelProxyUrl?.(), launcherUid: modelUid, launcherGid: modelGid } : {}), ...(workerToolContext ? { toolSocket: workerToolContext.socketPath, toolToken: workerToolContext.token } : {}) };
+    const sandbox: PiSandbox = { sessionRoot: dirname(sessionPath), ...(principalBrokered ? { launcherUid: modelUid, launcherGid: modelGid } : {}), ...(workerToolContext ? { toolSocket: workerToolContext.socketPath, toolToken: workerToolContext.token } : {}) };
     const piCwd = principalBrokered ? dirname(sessionPath) : projectPath;
     const inboundFiles: string[] = [];
+    const imageInputs: PiImageContent[] = [];
     let session: PiSession;
     try {
       for (const ref of worker.artifactRefs ?? []) {
         const materialized = await this.artifacts.materializeForRead(ref, { conversationId: task.originConversationId, requesterId: task.requester.userId, taskId: task.id, readCapability: worker.capabilities?.artifacts ?? { readableArtifactAuthorities: [] } }, projectPath);
+        const visual = await readArtifactImage(materialized.path, materialized.metadata);
+        if (visual.imageInput) imageInputs.push(visual.imageInput);
+        else if (visual.reason) {
+          this.log.warn("Worker image Artifact was not injected into Pi visual input", { taskId: task.id, workerId: worker.id, artifactId: ref.artifactId, size: materialized.metadata.size, mime: materialized.metadata.mime, filename: materialized.metadata.filename, reason: visual.reason, principalId: worker.principalId, workspace: projectPath, executionProfile: describeExecutionProfile(worker), scope: worker.workspaceScopeId ?? worker.workspaceId, contextSource: "authorized-worker-artifact" });
+        }
         if (principalBrokered && worker.runtimeUid !== undefined && worker.runtimeGid !== undefined) {
           await chown(dirname(materialized.path), worker.runtimeUid, worker.runtimeGid);
           await chmod(dirname(materialized.path), 0o700);
@@ -429,6 +456,7 @@ export class TaskService implements ExecutionBackend {
       `Objective: ${worker.objective}`,
       principalBrokered ? `Execution Principal ${worker.principalId}; workspace ${worker.workspaceId ?? "default"}. Use worker_exec and worker workspace tools for every file/process operation; the model process has no workspace mount.` : `Workspace: ${projectPath}`,
       inboundFiles.length ? `Authorized inbound files (materialized in the workspace):\n${inboundFiles.join("\n")}` : "No inbound files were supplied.",
+      imageInputs.length ? `${imageInputs.length} authorized image input(s) are attached to this Pi turn as visual content.` : "No visual image inputs were attached to this Pi turn.",
       "Do not send chat messages or access credentials. Return a concise verified result.",
       `Runtime control frames must be separate lines prefixed with ${WORKER_CONTROL_PREFIX.trimEnd()} and contain JSON. Supported types are progress, question, artifact, and finish.`,
       `Use ${WORKER_CONTROL_PREFIX}{"type":"progress","summary":"..."} for meaningful progress; use question with a question field; use artifact with a workspace-relative path; use finish with outcome COMPLETED, PARTIAL, or FAILED and a summary.`,
@@ -437,7 +465,7 @@ export class TaskService implements ExecutionBackend {
     try {
       const useWorkerExtension = Boolean(this.options.workerToolExtensionPath && (mcpToken || principalBrokered));
       const timeoutMs = task.trust === "GUEST" ? Math.min(this.config.runtime.piTimeoutMs, this.remainingGuestTaskMs(task)) : this.config.runtime.piTimeoutMs;
-      const outputPromise = this.pi.send(session, prompt, { cwd: piCwd, sandbox, timeoutMs, taskId: task.id, workerId: worker.id, ...(useWorkerExtension ? { extensionPath: this.options.workerToolExtensionPath } : {}), ...(principalBrokered ? { mainTools: true } : {}) });
+      const outputPromise = this.pi.send(session, prompt, { cwd: piCwd, sandbox, timeoutMs, taskId: task.id, workerId: worker.id, ...(useWorkerExtension ? { extensionPath: this.options.workerToolExtensionPath } : {}), ...(principalBrokered ? { mainTools: true } : {}), ...(imageInputs.length ? { images: imageInputs } : {}) });
       const output = await outputPromise;
       await this.handleWorkerOutput(worker.id, output);
       const afterOutput = this.getWorker(worker.id).status;
@@ -525,6 +553,18 @@ export class TaskService implements ExecutionBackend {
       if (!actor.tasks.canFollowUp || !actor.qq.sendConversations.includes(source.conversationId)) throw new Error("TASK_FOLLOW_UP_DENIED");
     }
     const targetWorker = this.db.get<{ id: string }>("SELECT id FROM worker_executions WHERE task_id=? AND status IN ('PENDING','STARTING','RUNNING','WAITING_USER') ORDER BY CASE status WHEN 'RUNNING' THEN 0 WHEN 'WAITING_USER' THEN 1 WHEN 'STARTING' THEN 2 ELSE 3 END, updated_at DESC LIMIT 1", taskId);
+    if (!targetWorker) {
+      if (!source.requester || !source.capabilities?.tasks.canCreate) throw new Error("TASK_FOLLOW_UP_WORKER_CREATE_DENIED");
+      const mailboxId = newId("mail");
+      const timestamp = nowIso();
+      this.db.transaction(() => {
+        this.db.run("INSERT INTO task_mailbox(id,task_id,type,source_conversation_id,source_message_key,content,status,created_at) VALUES (?,?,?,?,?,?,?,?)", mailboxId, taskId, "FOLLOW_UP", source.conversationId, messageKey(source.message), content, "PENDING", timestamp);
+        this.event(taskId, "FOLLOW_UP_ADDED", undefined, { mailboxId, delegatedToNewWorker: true });
+      });
+      try { await this.dispatchFollowUpAsWorker(mailboxId, task, content, source.capabilities, source.requester); }
+      catch (error) { this.db.run("UPDATE task_mailbox SET status='FAILED' WHERE id=? AND status IN ('PENDING','PROCESSING')", mailboxId); this.recordException(taskId, undefined, "follow_up_dispatch", "FOLLOW_UP_WORKER_CREATE", String(error)); throw error; }
+      return;
+    }
     const id = newId("mail");
     this.db.transaction(() => {
       this.db.run("INSERT INTO task_mailbox(id,task_id,type,source_conversation_id,source_message_key,content,status,created_at,worker_id) VALUES (?,?,?,?,?,?,?,?,?)", id, taskId, "FOLLOW_UP", source.conversationId, messageKey(source.message), content, "PENDING", nowIso(), targetWorker?.id ?? null);
@@ -538,7 +578,13 @@ export class TaskService implements ExecutionBackend {
         this.db.run("UPDATE task_mailbox SET status='DELIVERED',delivered_at=? WHERE id=? AND status IN ('PENDING','DELIVERED')", nowIso(), id);
         await this.handleWorkerOutput(targetWorker.id, output);
         this.markMailboxConsumed(id);
-      } catch (error) { this.recordException(taskId, targetWorker.id, "addFollowUp", "WORKER_DELIVERY", String(error)); }
+      } catch (error) {
+        const currentStatus = this.getWorker(targetWorker.id).status;
+        if (["COMPLETED", "FAILED", "CANCELLED", "INTERRUPTED"].includes(currentStatus)) {
+          try { await this.dispatchFollowUpAsWorker(id, task, content, source.capabilities, source.requester); }
+          catch (dispatchError) { this.db.run("UPDATE task_mailbox SET status='FAILED' WHERE id=? AND status IN ('PENDING','DELIVERED','PROCESSING')", id); this.recordException(taskId, undefined, "follow_up_dispatch", "FOLLOW_UP_WORKER_CREATE", String(dispatchError)); throw dispatchError; }
+        } else this.recordException(taskId, targetWorker.id, "addFollowUp", "WORKER_DELIVERY", String(error));
+      }
     }
   }
 
@@ -705,10 +751,8 @@ export class TaskService implements ExecutionBackend {
       const update = this.db.run("UPDATE tasks SET status=?,completed_at=?,updated_at=? WHERE id=? AND status NOT IN ('COMPLETED','PARTIAL','FAILED','CANCELLED')", status, timestamp, timestamp, taskId);
       if (update.changes > 0) {
         this.event(taskId, "TASK_FINISHED", undefined, { ...finalResult });
-        this.event(taskId, "TASK_RESULT", undefined, { ...finalResult });
       }
     });
-    await this.emit({ type: "TASK_RESULT", taskId, payload: { ...finalResult } });
   }
 
   async failWorker(workerId: string, error: string): Promise<void> {
@@ -727,6 +771,7 @@ export class TaskService implements ExecutionBackend {
         return;
       }
     }
+    const failure = workerFailureDetail(error);
     const timestamp = nowIso();
     const failed = this.db.transaction(() => {
       const update = this.db.run("UPDATE worker_executions SET status='FAILED',finished_at=?,updated_at=? WHERE id=? AND status IN ('STARTING','RUNNING','WAITING_USER')", timestamp, timestamp, workerId);
@@ -734,7 +779,7 @@ export class TaskService implements ExecutionBackend {
       if (worker.workspaceScopeId ?? worker.workspaceId) this.db.run("DELETE FROM project_locks WHERE project_id=? AND owner_worker_id=?", worker.workspaceScopeId ?? worker.workspaceId as string, workerId);
       this.db.run("DELETE FROM owned_processes WHERE worker_id=?", workerId);
       this.event(worker.taskId, "WORKER_FAILED", workerId, { error: error.slice(0, 1000) });
-      this.event(worker.taskId, "TASK_RESULT", workerId, { outcome: "FAILED", summary: "Worker failed." });
+      this.event(worker.taskId, "TASK_RESULT", workerId, { outcome: "FAILED", errorCode: failure.errorCode, summary: failure.summary });
       this.db.run("UPDATE tasks SET status='RUNNING',updated_at=? WHERE id=?", timestamp, worker.taskId);
       this.event(worker.taskId, "TASK_AWAITING_COMPLETION", undefined, { outcome: "FAILED" });
       return true;
@@ -742,8 +787,8 @@ export class TaskService implements ExecutionBackend {
     if (!failed) return;
     this.activeSessions.delete(workerId);
     await this.revokeWorkerBinding(workerId);
-    this.recordException(worker.taskId, workerId, "worker", "PI_FAILURE", error);
-    await this.emit({ type: "TASK_RESULT", taskId: worker.taskId, workerId, payload: { outcome: "FAILED", summary: "Worker failed." } });
+    this.recordException(worker.taskId, workerId, "worker", failure.errorCode, failure.summary, false);
+    await this.emit({ type: "TASK_RESULT", taskId: worker.taskId, workerId, payload: { outcome: "FAILED", errorCode: failure.errorCode, summary: failure.summary } });
     void this.schedulePendingWorkers(worker.taskId);
   }
 
@@ -765,6 +810,7 @@ export class TaskService implements ExecutionBackend {
 
   async recover(): Promise<void> {
     await this.terminateOrphanedPrincipalCommands();
+    this.reconcileMissingWorkerCapabilitySnapshots();
     const active = this.db.all<{
       id: string; task_id: string; workspace_id: string | null; harness_session_id: string | null; harness_session_path: string | null;
       process_id: number | null; status: WorkerStatus; owned_pid: number | null;
@@ -833,6 +879,65 @@ export class TaskService implements ExecutionBackend {
     }
     this.reconcileProjectLocks();
     await this.schedulePendingWorkers();
+    await this.recoverPendingFollowUps();
+  }
+
+  private async dispatchFollowUpAsWorker(mailboxId: string, task: TaskRecord, content: string, sourceCapabilities?: CapabilitySet, sourceRequester?: TaskRequester): Promise<WorkerExecutionRecord> {
+    const existing = this.db.get<{ id: string }>("SELECT id FROM worker_executions WHERE source_mailbox_id=?", mailboxId);
+    if (existing) {
+      const worker = this.getWorker(existing.id);
+      const timestamp = nowIso();
+      this.db.run("UPDATE task_mailbox SET worker_id=?,status='CONSUMED',delivered_at=COALESCE(delivered_at,?),consumed_at=COALESCE(consumed_at,?) WHERE id=?", worker.id, timestamp, timestamp, mailboxId);
+      return worker;
+    }
+    if (this.isTerminalTask(task.status) || !task.capabilities.tasks.canFollowUp || this.cancellationRequested(task.id)) throw new Error("TASK_FOLLOW_UP_DENIED");
+    const requester = sourceRequester ?? task.requester;
+    const actor = validateCapabilitySet(sourceCapabilities ?? {
+      ...task.capabilities,
+      tasks: { ...task.capabilities.tasks, canCreate: true, visibleTaskIds: [...new Set([...task.capabilities.tasks.visibleTaskIds, task.id])] },
+    });
+    if (!actor.tasks.canCreate) throw new Error("TASK_FOLLOW_UP_WORKER_CREATE_DENIED");
+    const previousWorkspace = this.db.get<{ workspace_id: string | null }>("SELECT workspace_id FROM worker_executions WHERE task_id=? AND workspace_id IS NOT NULL ORDER BY updated_at DESC LIMIT 1", task.id)?.workspace_id;
+    const worker = await this.createWorker({
+      taskId: task.id,
+      objective: `Continue Task: ${task.title}\nOriginal goal: ${task.goal}\nUser follow-up: ${content}`,
+      ...(previousWorkspace ? { workspaceId: previousWorkspace } : {}),
+      sourceMailboxId: mailboxId,
+      actor,
+      actorPrincipalId: requester.principalId,
+      actorRequester: requester,
+    });
+    const timestamp = nowIso();
+    this.db.run("UPDATE task_mailbox SET worker_id=?,status='CONSUMED',delivered_at=?,consumed_at=? WHERE id=? AND status IN ('PENDING','DELIVERED','PROCESSING')", worker.id, timestamp, timestamp, mailboxId);
+    this.log.info("Task follow-up dispatched to a new Worker", { taskId: task.id, workerId: worker.id, principalId: worker.principalId, role: task.trust, uid: worker.runtimeUid, gid: worker.runtimeGid, workspaceId: worker.workspaceId, workspaceAccess: worker.workspaceAccess, capabilities: { projects: worker.capabilities?.projects ?? [] }, executionProfile: describeExecutionProfile(worker), scope: worker.workspaceScopeId ?? worker.workspaceId, contextSource: sourceCapabilities ? "authenticated-follow-up-and-durable-task-capabilities" : "recovered-authorized-task-mailbox" });
+    return worker;
+  }
+
+  private async recoverPendingFollowUps(): Promise<void> {
+    const rows = this.db.all<{ id: string; task_id: string; content: string | null; worker_id: string | null }>("SELECT id,task_id,content,worker_id FROM task_mailbox WHERE type='FOLLOW_UP' AND status IN ('PENDING','DELIVERED','PROCESSING') ORDER BY created_at,id");
+    for (const row of rows) {
+      const task = this.getTask(row.task_id);
+      if (this.isTerminalTask(task.status) || !task.capabilities.tasks.canFollowUp || this.cancellationRequested(task.id)) {
+        this.db.run("UPDATE task_mailbox SET status='FAILED' WHERE id=? AND status IN ('PENDING','DELIVERED','PROCESSING')", row.id);
+        this.log.warn("Pending Task follow-up discarded because its Task is no longer active", { taskId: task.id, mailboxId: row.id, workerId: row.worker_id, principalId: task.requester.principalId, role: task.trust, scope: task.originConversationId, contextSource: "durable-task-mailbox" });
+        continue;
+      }
+      if (row.worker_id) {
+        const worker = this.getWorker(row.worker_id);
+        if (["STARTING", "RUNNING", "WAITING_USER", "PENDING"].includes(worker.status)) continue;
+      }
+      const activeWorker = this.db.get<{ id: string }>("SELECT id FROM worker_executions WHERE task_id=? AND status IN ('PENDING','STARTING','RUNNING','WAITING_USER') ORDER BY updated_at DESC LIMIT 1", task.id);
+      if (activeWorker) {
+        this.db.run("UPDATE task_mailbox SET worker_id=? WHERE id=? AND status IN ('PENDING','DELIVERED','PROCESSING')", activeWorker.id, row.id);
+        continue;
+      }
+      this.db.run("UPDATE task_mailbox SET status='PROCESSING',worker_id=NULL WHERE id=? AND status IN ('PENDING','DELIVERED','PROCESSING')", row.id);
+      try { await this.dispatchFollowUpAsWorker(row.id, task, row.content ?? "Continue the authorized Task."); }
+      catch (error) {
+        this.db.run("UPDATE task_mailbox SET status='FAILED' WHERE id=? AND status IN ('PENDING','DELIVERED','PROCESSING')", row.id);
+        this.recordException(task.id, undefined, "follow_up_recovery", "FOLLOW_UP_WORKER_CREATE", String(error));
+      }
+    }
   }
 
   private async recoveryProcessState(session: PiSession | undefined, expected: PiProcessIdentity | undefined, processId: number | null): Promise<"OWNED" | "NOT_FOUND" | "FOREIGN" | "UNKNOWN"> {
@@ -862,7 +967,7 @@ export class TaskService implements ExecutionBackend {
       await mkdir(projectPath, { recursive: true, mode: 0o700 });
     }
     const mcpToken = await this.ensureWorkerBinding(workerId);
-    const sandbox: PiSandbox = { sessionRoot: dirname(session.sessionPath), ...(principalBrokered ? { modelProxyUrl: this.options.getModelProxyUrl?.(), launcherUid: modelUid, launcherGid: modelGid } : {}), ...(workerToolContext ? { toolSocket: workerToolContext.socketPath, toolToken: workerToolContext.token } : {}) };
+    const sandbox: PiSandbox = { sessionRoot: dirname(session.sessionPath), ...(principalBrokered ? { launcherUid: modelUid, launcherGid: modelGid } : {}), ...(workerToolContext ? { toolSocket: workerToolContext.socketPath, toolToken: workerToolContext.token } : {}) };
     const useWorkerExtension = Boolean(this.options.workerToolExtensionPath && (mcpToken || principalBrokered));
     if (!await this.pi.resumeSession(session, { cwd: dirname(session.sessionPath), sandbox, ...(useWorkerExtension ? { extensionPath: this.options.workerToolExtensionPath } : {}), ...(principalBrokered ? { mainTools: true } : {}) })) return false;
     this.activeSessions.set(workerId, session);
@@ -911,6 +1016,21 @@ export class TaskService implements ExecutionBackend {
     const rows = this.db.all<{ project_id: string; owner_worker_id: string; worker_status: WorkerStatus | null }>("SELECT l.project_id,l.owner_worker_id,w.status AS worker_status FROM project_locks l LEFT JOIN worker_executions w ON w.id=l.owner_worker_id");
     for (const row of rows) {
       if (!row.worker_status || ["COMPLETED", "FAILED", "CANCELLED"].includes(row.worker_status)) this.db.run("DELETE FROM project_locks WHERE project_id=? AND owner_worker_id=?", row.project_id, row.owner_worker_id);
+    }
+  }
+
+  private reconcileMissingWorkerCapabilitySnapshots(): void {
+    const rows = this.db.all<{ id: string; task_id: string; workspace_id: string | null; workspace_access: WorkerExecutionRecord["workspaceAccess"]; principal_id: string | null }>("SELECT id,task_id,workspace_id,workspace_access,principal_id FROM worker_executions WHERE capabilities_json IS NULL OR capabilities_json='' ");
+    for (const worker of rows) {
+      if (!worker.principal_id || !worker.workspace_id || (worker.workspace_access !== "READ" && worker.workspace_access !== "WRITE")) continue;
+      const task = this.getTask(worker.task_id);
+      const requested = defaultWorkerCapabilityRequest(task, worker.workspace_id, worker.workspace_access);
+      const capabilities = attenuateWorker(task.capabilities, requested);
+      const changed = this.db.run("UPDATE worker_executions SET capabilities_json=? WHERE id=? AND (capabilities_json IS NULL OR capabilities_json='')", JSON.stringify(capabilities), worker.id).changes;
+      if (changed) {
+        const principal = this.options.principals?.get(worker.principal_id);
+        this.log.warn("Missing Worker capability snapshot reconstructed from durable Task and profile", { taskId: task.id, workerId: worker.id, principalId: worker.principal_id, role: principal?.role ?? task.trust, uid: principal?.runtimeUid ?? null, gid: principal?.runtimeGid ?? null, workspaceId: worker.workspace_id, workspace: this.options.principals?.workspacePathSync(worker.principal_id, worker.workspace_id), workspaceAccess: worker.workspace_access, capabilities: { projects: capabilities.projects }, executionProfile: describeExecutionProfile({ processMode: "PRINCIPAL_BROKERED", workspaceAccess: worker.workspace_access } as WorkerExecutionRecord), scope: this.workspaceScopeId(task, worker.workspace_id), contextSource: "durable-task-capabilities-plus-durable-worker-profile" });
+      }
     }
   }
 
@@ -1029,20 +1149,20 @@ export class TaskService implements ExecutionBackend {
     if (task) await this.options.onEvent?.(event, task);
   }
 
-  private event(taskId: string, type: string, workerId?: string, payload: Record<string, unknown> = {}): void {
+  private event(taskId: string, type: string, workerId?: string, payload: Record<string, unknown> = {}, notifyMain = true): void {
     const eventId = newId("taskevt");
     const createdAt = nowIso();
     this.db.run("INSERT INTO task_events(id,task_id,worker_id,type,payload_json,created_at) VALUES (?,?,?,?,?,?)", eventId, taskId, workerId ?? null, type, JSON.stringify(payload), createdAt);
-    if (MAIN_EVENT_TYPES.has(type)) {
+    if (notifyMain && MAIN_EVENT_TYPES.has(type)) {
       this.db.run("INSERT INTO task_event_outbox(task_event_id,task_id,event_type,question_id,payload_json,status,attempts,created_at) VALUES (?,?,?,?,?,?,?,?)", eventId, taskId, type, typeof payload.questionId === "string" ? payload.questionId : null, JSON.stringify(payload), "PENDING", 0, createdAt);
     }
   }
 
-  private recordException(taskId: string, workerId: string | undefined, operation: string, category: string, summary: string): void {
+  private recordException(taskId: string, workerId: string | undefined, operation: string, category: string, summary: string, notifyMain = true): void {
     const bounded = summary.slice(0, 2000);
     this.db.run("INSERT INTO runtime_exceptions(id,task_id,worker_id,operation,category,summary,created_at) VALUES (?,?,?,?,?,?,?)", newId("exception"), taskId, workerId ?? null, operation, category, bounded, nowIso());
-    this.event(taskId, "TASK_EXCEPTION", workerId, { operation, category, summary: bounded });
-    void this.emit({ type: "TASK_EXCEPTION", taskId, workerId, payload: { operation, category, summary: bounded } });
+    this.event(taskId, "TASK_EXCEPTION", workerId, { operation, category, summary: bounded }, notifyMain);
+    if (notifyMain) void this.emit({ type: "TASK_EXCEPTION", taskId, workerId, payload: { operation, category, summary: bounded } });
   }
 
   private tryAcquireLock(projectId: string, workerId: string): boolean {
@@ -1082,8 +1202,9 @@ export class TaskService implements ExecutionBackend {
     const text: string[] = [];
     for (const line of output.split(/\r?\n/)) {
       if (!line.startsWith(WORKER_CONTROL_PREFIX)) { text.push(line); continue; }
-      let value: unknown;
-      try { value = JSON.parse(line.slice(WORKER_CONTROL_PREFIX.length)); } catch { throw new Error("WORKER_CONTROL_INVALID_JSON"); }
+      const parsedControl = parseWorkerControlFrame(line.slice(WORKER_CONTROL_PREFIX.length));
+      const value: unknown = parsedControl.frame;
+      if (parsedControl.trailing.trim()) text.push(parsedControl.trailing.trim());
       if (!value || typeof value !== "object") throw new Error("WORKER_CONTROL_INVALID_FRAME");
       const raw = value as Record<string, unknown>;
       const type = String(raw.type ?? "");
@@ -1107,7 +1228,9 @@ export class TaskService implements ExecutionBackend {
 
   private workerWorkspace(worker: WorkerExecutionRecord): string {
     if (worker.workspaceId && worker.principalId && this.options.principals) return this.options.principals.workspacePathSync(worker.principalId, worker.workspaceId);
-    return worker.workspaceId ? join(this.options.workerRoot, "projects", canonicalWorkspaceId(worker.workspaceId)) : join(this.options.workerRoot, "scratch", worker.id);
+    const fallback = worker.workspaceId ? join(this.options.workerRoot, "projects", canonicalWorkspaceId(worker.workspaceId)) : join(this.options.workerRoot, "scratch", worker.id);
+    this.log.warn("Non-Principal Worker workspace fallback selected", { taskId: worker.taskId, workerId: worker.id, principalId: worker.principalId, workspaceId: worker.workspaceId, workspace: fallback, executionProfile: describeExecutionProfile(worker), scope: worker.workspaceScopeId ?? worker.workspaceId, contextSource: worker.principalId && !this.options.principals ? "principal-service-unavailable" : "legacy-worker-without-principal" });
+    return fallback;
   }
 
   private async ensureSystemPrivateDirectory(path: string, uid?: number, gid?: number): Promise<void> {
@@ -1319,16 +1442,121 @@ function pathWithin(root: string, candidate: string): boolean {
   return child === "" || (child !== ".." && !child.startsWith(`..${candidate.includes("\\") ? "\\" : "/"}`));
 }
 
+function parseWorkerControlFrame(content: string): { frame: unknown; trailing: string } {
+  const start = content.search(/\S/);
+  if (start < 0 || content[start] !== "{") throw new Error("WORKER_CONTROL_INVALID_JSON");
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = start; index < content.length; index += 1) {
+    const char = content[index];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') { inString = true; continue; }
+    if (char === "{" || char === "[") depth += 1;
+    else if (char === "}" || char === "]") {
+      depth -= 1;
+      if (depth < 0) throw new Error("WORKER_CONTROL_INVALID_JSON");
+      if (depth === 0) {
+        try { return { frame: JSON.parse(content.slice(start, index + 1)) as unknown, trailing: content.slice(index + 1) }; }
+        catch { throw new Error("WORKER_CONTROL_INVALID_JSON"); }
+      }
+    }
+  }
+  throw new Error("WORKER_CONTROL_INVALID_JSON");
+}
+
 function isPrincipalBrokered(mode: string | undefined): boolean {
   return mode === "PRINCIPAL_BROKERED" || mode === "GUEST_BROKERED";
 }
 
 function shellQuote(value: string): string { return `'${value.replaceAll("'", `'\\''`)}'`; }
 
+function defaultWorkerCapabilityRequest(task: TaskRecord, workspaceId: string | undefined, workspaceAccess: WorkerExecutionRecord["workspaceAccess"]): Partial<CapabilitySet> {
+  return {
+    memory: { allowedScopes: task.capabilities.memory.allowedScopes },
+    projects: workspaceId && workspaceAccess ? [{ projectId: workspaceId, access: workspaceAccess }] : [],
+    qq: { readConversations: [], sendConversations: [] },
+    plugins: { allowedActions: task.capabilities.plugins.allowedActions, ...(task.capabilities.plugins.allowedPermissions !== undefined ? { allowedPermissions: task.capabilities.plugins.allowedPermissions } : {}) },
+    artifacts: { readableArtifactAuthorities: task.capabilities.artifacts.readableArtifactAuthorities, publishTaskIds: [task.id], allowedDestinations: [] },
+    tasks: { canCreate: false, visibleTaskIds: [], canCancel: false, canFollowUp: false },
+  };
+}
+
+function describeExecutionProfile(worker: WorkerExecutionRecord): ExecutionContext["executionProfile"] {
+  if (!worker.workspaceAccess) return "LEGACY_UNSCOPED";
+  const family = isPrincipalBrokered(worker.processMode) ? "PRINCIPAL" : "LEGACY";
+  return `${family}_${worker.workspaceAccess === "WRITE" ? "READ_WRITE" : "READ_ONLY"}` as ExecutionContext["executionProfile"];
+}
+
+function executionContextLogFields(context: ExecutionContext): Record<string, unknown> {
+  return {
+    taskId: context.taskId,
+    workerId: context.workerId,
+    principalId: context.principalId,
+    role: context.role,
+    uid: context.uid,
+    gid: context.gid,
+    workspaceId: context.workspaceId,
+    workspace: context.workspace,
+    home: context.home,
+    workspaceAccess: context.workspaceAccess,
+    capabilities: { projects: context.capabilities.projects },
+    executionProfile: context.executionProfile,
+    scope: context.workspaceScopeId ?? context.workspaceId,
+    contextSource: context.contextSource,
+  };
+}
+
+function classifyWorkspaceExecutionFailure(stderr: string): string {
+  const runtimeCode = stderr.match(/\b(WORKSPACE_[A-Z0-9_]+)\b/)?.[1];
+  return runtimeCode ?? classifyWorkspaceErrorCode(stderr.match(/\b(?:EROFS|EACCES|EPERM|ENOENT)\b/)?.[0] ?? "");
+}
+
+export function classifyWorkspaceErrorCode(code: string): string {
+  if (code === "EROFS") return "WORKSPACE_FILESYSTEM_READ_ONLY";
+  if (code === "EACCES" || code === "EPERM") return "WORKSPACE_UNIX_PERMISSION_DENIED";
+  if (code === "ENOENT") return "WORKSPACE_PATH_NOT_FOUND";
+  return "WORKSPACE_OPERATION_FAILED";
+}
+
+function workerFailureDetail(error: string): { errorCode: string; summary: string } {
+  const networkHint = piNetworkFailureHint(new Error(error));
+  if (networkHint) return { errorCode: "PI_NETWORK_UNAVAILABLE", summary: `Worker stopped because its model-service connection failed (${networkHint}). No verified result was produced; retry when model connectivity is restored.` };
+  if (error.toLowerCase().includes("terminated")) return { errorCode: "PI_TURN_TERMINATED", summary: "Worker's Pi turn terminated before it produced a verified result." };
+  const code = error.match(/\b(WORKER_[A-Z0-9_]+|WORKSPACE_[A-Z0-9_]+|PI_[A-Z0-9_]+|GUEST_[A-Z0-9_]+)\b/)?.[1] ?? "WORKER_EXECUTION_FAILED";
+  return { errorCode: code, summary: `Worker stopped with ${code}; no verified result was produced.` };
+}
+
+async function readArtifactImage(path: string, artifact: { size: number; filename: string; mime?: string }): Promise<{ imageInput?: PiImageContent; reason?: string }> {
+  const handle = await open(path, "r");
+  let detectedMime: string | undefined;
+  try {
+    const prefix = Buffer.alloc(32);
+    const read = await handle.read(prefix, 0, prefix.length, 0);
+    detectedMime = sniffImageMimeType(prefix.subarray(0, read.bytesRead));
+  } finally { await handle.close(); }
+  const candidate = Boolean(detectedMime || artifact.mime?.startsWith("image/") || /\.(?:jpe?g|png|gif|webp|bmp|tiff?|avif)$/i.test(artifact.filename));
+  if (!candidate) return {};
+  if (artifact.size > PI_IMAGE_INPUT_MAX_BYTES) return { reason: "IMAGE_INPUT_SIZE_LIMIT" };
+  const imageInput = piImageContent(await readFile(path), detectedMime ?? artifact.mime);
+  return imageInput ? { imageInput } : { reason: "IMAGE_FORMAT_UNSUPPORTED" };
+}
+
 const PRINCIPAL_FILE_TOOL_SCRIPT = String.raw`
 const fs = require("node:fs");
 const path = require("node:path");
 const request = JSON.parse(process.argv[1]);
+function workspaceErrorCode(error) {
+  if (typeof error.message === "string" && /^WORKSPACE_[A-Z0-9_]+$/.test(error.message)) return error.message;
+  if (error.code) return error.code;
+  return "WORKSPACE_OPERATION_FAILED";
+}
+try {
 const root = fs.realpathSync(process.cwd());
 function resolveWorkspacePath(value, allowRoot = false, createParents = false) {
   if (typeof value !== "string" || path.isAbsolute(value) || value.split(/[\\/]/).some((part) => part === "..")) throw new Error("WORKSPACE_PATH_DENIED");
@@ -1395,7 +1623,10 @@ if (request.operation === "read") {
   const info = fs.statSync(target);
   result = { type: info.isDirectory() ? "directory" : info.isFile() ? "file" : "other", size: info.size, mode: info.mode & 0o777 };
 } else throw new Error("WORKSPACE_OPERATION_INVALID");
-process.stdout.write(JSON.stringify(result));
+process.stdout.write(JSON.stringify({ ok: true, result }));
+} catch (error) {
+  process.stdout.write(JSON.stringify({ ok: false, errorCode: workspaceErrorCode(error) }));
+}
 `;
 
 async function directoryBytes(root: string, stopAfter: number): Promise<number> {

@@ -46,9 +46,10 @@ export class SnowLumaQQCapability {
     if (message.text) segments.push({ type: "text", data: { text: message.text } });
     for (const attachment of message.attachments ?? []) {
       if (!attachment.artifact) throw new Error("ARTIFACT_REFERENCE_REQUIRED");
-      this.artifacts.authorizeOutbound(attachment.artifact, { taskId: authorization.taskId ?? "", destination: authorization.conversationId, capability: authorization.capabilities.artifacts });
+      const artifact = this.artifacts.authorizeOutbound(attachment.artifact, { taskId: authorization.taskId ?? "", destination: authorization.conversationId, capability: authorization.capabilities.artifacts });
       const file = await this.artifactFile(attachment.artifact, authorization);
-      segments.push({ type: attachment.type, data: { file } });
+      const name = safeOutboundFilename(attachment.filename?.trim() || artifact.filename);
+      segments.push({ type: attachment.type, data: { file, name } });
     }
     const result = target.kind === "group"
       ? await this.mcp.invokeAction<{ message_id?: string | number }>("send_group_msg", { group_id: integerValue(target.platformConversationId, "group_id"), message: segments as never })
@@ -142,6 +143,12 @@ export class SnowLumaQQCapability {
       await unlink(filePath).catch(() => undefined);
     }
   }
+}
+
+function safeOutboundFilename(value: string): string {
+  const name = value.replaceAll("\\", "/").split("/").pop()?.replace(/[\u0000-\u001f]/g, "_").trim().slice(0, 180);
+  if (!name || name === "." || name === "..") throw new Error("ARTIFACT_FILENAME_INVALID");
+  return name;
 }
 
 type QQReadAuthorization = { conversationId: string; capabilities: CapabilitySet; target: ConversationAddress };

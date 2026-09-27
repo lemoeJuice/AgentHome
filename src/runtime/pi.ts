@@ -6,11 +6,28 @@ import { relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Logger } from "../shared/logger.js";
+import { proxyEnvironment } from "./network.js";
 import { newId } from "../shared/ids.js";
 
 export interface PiSession {
   sessionId: string;
   sessionPath: string;
+}
+
+export interface PiImageContent {
+  type: "image";
+  data: string;
+  mimeType: string;
+}
+
+/** A failed Pi turn records whether Runtime tools may already have caused side effects. */
+export class PiTurnError extends Error {
+  readonly toolCallsExecuted: boolean;
+  constructor(message: string, toolCallsExecuted: boolean, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "PiTurnError";
+    this.toolCallsExecuted = toolCallsExecuted;
+  }
 }
 
 export interface PiProcessIdentity {
@@ -23,7 +40,6 @@ export type PiProcessInspection = "OWNED" | "NOT_FOUND" | "FOREIGN" | "UNKNOWN";
 
 export interface PiSandbox {
   sessionRoot: string;
-  modelProxyUrl?: string;
   toolSocket?: string;
   toolToken?: string;
   launcherUid?: number;
@@ -40,8 +56,8 @@ type PiDefaults = { agentDir?: string; launcherUid?: number; launcherGid?: numbe
 export interface PiHarness {
   createSession(sessionPath: string, options?: PiLaunchOptions): Promise<PiSession>;
   resumeSession(session: PiSession, options?: PiLaunchOptions): Promise<boolean>;
-  send(session: PiSession, prompt: string, options?: { cwd?: string; timeoutMs?: number; taskId?: string; workerId?: string; sandbox?: PiSandbox; mainTools?: boolean; extensionPath?: string }): Promise<string>;
-  steer(session: PiSession, prompt: string, options?: { cwd?: string; timeoutMs?: number }): Promise<string>;
+  send(session: PiSession, prompt: string, options?: { cwd?: string; timeoutMs?: number; taskId?: string; workerId?: string; sandbox?: PiSandbox; mainTools?: boolean; extensionPath?: string; images?: PiImageContent[] }): Promise<string>;
+  steer(session: PiSession, prompt: string, options?: { cwd?: string; timeoutMs?: number; images?: PiImageContent[] }): Promise<string>;
   abort(session: PiSession): Promise<boolean>;
   inspect(session: PiSession): Promise<"available" | "missing" | "unknown">;
   processId?(session: PiSession): number | undefined;
@@ -58,6 +74,7 @@ type Turn = {
   settled: boolean;
   completed?: string;
   failure?: Error;
+  toolCallsExecuted: boolean;
   waiters: Array<{ resolve: (output: string) => void; reject: (error: Error) => void }>;
   resolve: (output: string) => void;
   reject: (error: Error) => void;
@@ -112,18 +129,19 @@ export class PiCliHarness implements PiHarness {
     } catch { return false; }
   }
 
-  async send(session: PiSession, prompt: string, options: { cwd?: string; timeoutMs?: number; taskId?: string; workerId?: string; sandbox?: PiSandbox; mainTools?: boolean; extensionPath?: string } = {}): Promise<string> {
-    return this.turnWithRetries(session, { type: "prompt", message: prompt }, options);
+  async send(session: PiSession, prompt: string, options: { cwd?: string; timeoutMs?: number; taskId?: string; workerId?: string; sandbox?: PiSandbox; mainTools?: boolean; extensionPath?: string; images?: PiImageContent[] } = {}): Promise<string> {
+    return this.turnWithRetries(session, { type: "prompt", message: prompt, ...(options.images?.length ? { images: options.images } : {}) }, options);
   }
 
-  async steer(session: PiSession, prompt: string, options: { cwd?: string; timeoutMs?: number } = {}): Promise<string> {
+  async steer(session: PiSession, prompt: string, options: { cwd?: string; timeoutMs?: number; images?: PiImageContent[] } = {}): Promise<string> {
     const process = this.findProcess(session);
-    if (!process?.turn) return this.turnWithRetries(session, { type: "prompt", message: prompt }, options);
+    const imageFields = options.images?.length ? { images: options.images } : {};
+    if (!process?.turn) return this.turnWithRetries(session, { type: "prompt", message: prompt, ...imageFields }, options);
     const turn = process.turn;
     return await new Promise<string>((resolve, reject) => {
       const waiter = { resolve, reject };
       turn.waiters.push(waiter);
-      void this.rpc(process, { type: "steer", message: prompt }).catch((error) => {
+      void this.rpc(process, { type: "steer", message: prompt, ...imageFields }).catch((error) => {
         const index = turn.waiters.indexOf(waiter);
         if (index >= 0) turn.waiters.splice(index, 1);
         reject(error instanceof Error ? error : new Error(String(error)));
@@ -251,6 +269,7 @@ export class PiCliHarness implements PiHarness {
       turn = {
         accepted: false,
         settled: false,
+        toolCallsExecuted: false,
         waiters: [],
         resolve: (output) => { clearTimeout(timer); resolve(output); },
         reject: (error) => { clearTimeout(timer); reject(error); },
@@ -273,7 +292,7 @@ export class PiCliHarness implements PiHarness {
         lastError = new Error("PI_EMPTY_RESPONSE");
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
-        if (!isRetryablePiFailure(lastError)) throw lastError;
+        if (!isRetryablePiFailure(lastError) || (lastError instanceof PiTurnError && lastError.toolCallsExecuted)) throw lastError;
       }
       if (retry === PI_MAX_NETWORK_RETRIES) break;
       this.log.warn("Retrying failed or empty Pi turn", { sessionId: session.sessionId, retry: retry + 1, maxRetries: PI_MAX_NETWORK_RETRIES, error: lastError.message });
@@ -371,7 +390,9 @@ export class PiCliHarness implements PiHarness {
     if (authDirectory.length) args.push("--bind", this.agentDir, this.agentDir);
     if (options.extensionPath) args.push("--ro-bind", options.extensionPath, options.extensionPath);
     args.push("--chdir", sandbox.sessionRoot, "--clearenv", "--setenv", "HOME", "/tmp/agent-home-model", "--setenv", "XDG_CONFIG_HOME", "/tmp/agent-home-model/.config", "--setenv", "XDG_DATA_HOME", "/tmp/agent-home-model/.local/share", "--setenv", "XDG_STATE_HOME", "/tmp/agent-home-model/.local/state", "--setenv", "TMPDIR", "/tmp", "--setenv", "PI_CODING_AGENT_DIR", this.agentDir, "--setenv", "PATH", process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
-    if (sandbox.modelProxyUrl) args.push("--setenv", "HTTP_PROXY", sandbox.modelProxyUrl, "--setenv", "HTTPS_PROXY", sandbox.modelProxyUrl, "--setenv", "http_proxy", sandbox.modelProxyUrl, "--setenv", "https_proxy", sandbox.modelProxyUrl, "--setenv", "NODE_USE_ENV_PROXY", "1", "--setenv", "NODE_OPTIONS", "--tls-max-v1.2");
+    const proxyEnv = proxyEnvironment(process.env.HTTPS_PROXY ?? process.env.https_proxy);
+    for (const [name, value] of Object.entries(proxyEnv)) if (value) args.push("--setenv", name, value);
+    if (Object.keys(proxyEnv).length) args.push("--setenv", "NODE_OPTIONS", "--tls-max-v1.2");
     if (sandbox.toolSocket && sandbox.toolToken) args.push("--setenv", "AGENT_HOME_RUNTIME_TOOL_SOCKET", sandbox.toolSocket, "--setenv", "AGENT_HOME_RUNTIME_TOOL_TOKEN", sandbox.toolToken);
     if (options.mainTools) args.push("--", this.command, "--no-builtin-tools", "--no-extensions", "--no-skills", "--no-context-files", ...(options.extensionPath ? ["--extension", options.extensionPath] : []), "--mode", "rpc", "--session", session.sessionPath);
     else args.push("--", this.command, ...(options.extensionPath ? ["--extension", options.extensionPath] : []), "--mode", "rpc", "--session", session.sessionPath);
@@ -433,6 +454,10 @@ export class PiCliHarness implements PiHarness {
         const frameFailure = classifyPiStderr(JSON.stringify(value));
         if (frameFailure) process.stderrFailure = frameFailure;
       }
+      const assistantDelta = value.assistantMessageEvent;
+      const assistantDeltaType = assistantDelta && typeof assistantDelta === "object" ? String((assistantDelta as RpcValue).type ?? "") : "";
+      const isToolCallFrame = assistantDeltaType.startsWith("toolcall_");
+      if (process.turn && (value.type === "tool_execution_start" || value.type === "tool_execution_end" || isToolCallFrame)) process.turn.toolCallsExecuted = true;
       if (value.type === "response" && typeof value.id === "string") {
         const pending = process.pending.get(value.id);
         if (!pending) continue;
@@ -444,7 +469,7 @@ export class PiCliHarness implements PiHarness {
       this.captureAssistantText(process, value);
       if (value.type === this.settledEvent && process.turn) {
         if (process.turn.failure) {
-          this.rejectTurn(process, process.turn.failure);
+          this.rejectTurn(process, new PiTurnError(process.turn.failure.message, process.turn.toolCallsExecuted, { cause: process.turn.failure }));
           continue;
         }
         process.turn.settled = true;
@@ -465,6 +490,8 @@ export class PiCliHarness implements PiHarness {
   private captureAssistantText(process: RpcProcess, value: RpcValue): void {
     if (!process.turn) return;
     const messages = value.message ?? value.messages;
+    const messageValues = Array.isArray(messages) ? messages : messages && typeof messages === "object" ? [messages] : [];
+    if (messageValues.some((message) => message && typeof message === "object" && Array.isArray((message as RpcValue).content) && ((message as RpcValue).content as unknown[]).some((item) => item && typeof item === "object" && (item as RpcValue).type === "toolCall"))) process.turn.toolCallsExecuted = true;
     const failure = this.extractAssistantFailure(messages) ?? (value.type === "agent_error" ? rpcError(value.error) : undefined);
     if (failure) process.turn.failure = failure;
     const text = this.extractAssistantText(messages);
@@ -494,7 +521,9 @@ export class PiCliHarness implements PiHarness {
   private failProcess(process: RpcProcess, error: Error): void {
     for (const pending of process.pending.values()) pending.reject(error);
     process.pending.clear();
-    this.rejectTurn(process, process.turn?.failure ?? error);
+    const turn = process.turn;
+    const failure = turn?.failure ?? error;
+    this.rejectTurn(process, new PiTurnError(failure.message, turn?.toolCallsExecuted ?? false, { cause: failure }));
     for (const [id, value] of this.active) if (value === process) this.active.delete(id);
   }
 
@@ -621,7 +650,7 @@ function errorMessages(error: unknown): string {
 }
 
 function sameSandbox(left: PiSandbox, right: PiSandbox): boolean {
-  return left.sessionRoot === right.sessionRoot && left.modelProxyUrl === right.modelProxyUrl && left.toolSocket === right.toolSocket && left.toolToken === right.toolToken && left.launcherUid === right.launcherUid && left.launcherGid === right.launcherGid && left.launcherCpuSeconds === right.launcherCpuSeconds && left.launcherMemoryBytes === right.launcherMemoryBytes && left.launcherPids === right.launcherPids && left.launcherMaxFileBytes === right.launcherMaxFileBytes;
+  return left.sessionRoot === right.sessionRoot && left.toolSocket === right.toolSocket && left.toolToken === right.toolToken && left.launcherUid === right.launcherUid && left.launcherGid === right.launcherGid && left.launcherCpuSeconds === right.launcherCpuSeconds && left.launcherMemoryBytes === right.launcherMemoryBytes && left.launcherPids === right.launcherPids && left.launcherMaxFileBytes === right.launcherMaxFileBytes;
 }
 
 function isWithin(root: string, path: string): boolean {

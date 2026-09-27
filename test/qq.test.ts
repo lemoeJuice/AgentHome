@@ -227,15 +227,16 @@ test("Agent QQ capability sends an authorized ArtifactRef", async () => {
     const mcp = fakeMcp({ invokeAction: async <T>(action, params) => {
       assert.equal(action, "send_private_msg");
       assert.equal(params.user_id, 8);
-      const message = params.message as Array<{ type: string; data: { file?: string } }>;
-      assert.equal(message[0]?.type, "image");
-      assert.match(message[0]?.data.file ?? "", /^base64:\/\//);
+       const message = params.message as Array<{ type: string; data: { file?: string; name?: string } }>;
+       assert.equal(message[0]?.type, "image");
+       assert.match(message[0]?.data.file ?? "", /^base64:\/\//);
+       assert.equal(message[0]?.data.name, "solution.cpp.txt");
       return { message_id: 11 } as T;
     } });
     const capability = new SnowLumaQQCapability(config, artifacts, logger, mcp);
     const sent = await capability.sendMessage(
       { platform: "qq", accountId: "default", kind: "private", platformConversationId: "8", threadId: null },
-      { attachments: [{ type: "image", artifact: artifact.ref, filename: artifact.filename }] },
+       { attachments: [{ type: "image", artifact: artifact.ref, filename: "solution.cpp.txt" }] },
       { conversationId: "conversation-1", taskId: "task-1", capabilities: { memory: { allowedScopes: [] }, projects: [], qq: { readConversations: ["conversation-1"], sendConversations: ["conversation-1"] }, plugins: { allowedActions: [] }, artifacts: artifactCapability, tasks: { canCreate: false, visibleTaskIds: [], canCancel: false, canFollowUp: false } } },
     );
     assert.equal(sent.message.messageId, "11");
