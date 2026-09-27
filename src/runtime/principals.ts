@@ -3,6 +3,7 @@ import { join, relative, resolve } from "node:path";
 import type { SqliteStore } from "../db.js";
 import type { Trust } from "../shared/types.js";
 import { newId, nowIso } from "../shared/ids.js";
+import { proxyEnvironment } from "./network.js";
 
 export const PRINCIPAL_UID_MIN = 20_000;
 export const PRINCIPAL_UID_MAX = 60_000;
@@ -212,11 +213,11 @@ export class PrincipalService {
     return resolve(this.principalRoot(principalId), "projects", canonicalWorkspaceId(workspaceId));
   }
 
-  guestProcessEnvironment(principalId: string): NodeJS.ProcessEnv {
-    return this.principalProcessEnvironment(principalId);
+  guestProcessEnvironment(principalId: string, proxyUrl?: string): NodeJS.ProcessEnv {
+    return this.principalProcessEnvironment(principalId, proxyUrl);
   }
 
-  principalProcessEnvironment(principalId: string): NodeJS.ProcessEnv {
+  principalProcessEnvironment(principalId: string, proxyUrl?: string): NodeJS.ProcessEnv {
     const home = join(this.principalRoot(principalId), "home");
     const cache = join(this.principalRoot(principalId), "cache");
     const agent = join(this.principalRoot(principalId), "agent");
@@ -242,6 +243,7 @@ export class PrincipalService {
       PI_CODING_AGENT_DIR: agent,
       PATH: `${join(home, ".npm-global", "bin")}:${join(home, ".local", "bin")}:${process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}`,
       LANG: "C.UTF-8",
+      ...proxyEnvironment(proxyUrl),
     };
   }
 

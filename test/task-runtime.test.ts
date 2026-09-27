@@ -8,7 +8,7 @@ import { runtimeMigrations } from "../src/schema.js";
 import { TaskService } from "../src/runtime/tasks.js";
 import { WORKER_CONTROL_PREFIX } from "../src/runtime/tasks.js";
 import { ArtifactService } from "../src/runtime/artifacts.js";
-import type { PiHarness, PiProcessIdentity, PiProcessInspection, PiSandbox, PiSession } from "../src/runtime/pi.js";
+import type { PiHarness, PiImageContent, PiProcessIdentity, PiProcessInspection, PiSandbox, PiSession } from "../src/runtime/pi.js";
 import type { AppConfig } from "../src/config.js";
 import type { Logger } from "../src/shared/logger.js";
 import type { PrincipalService } from "../src/runtime/principals.js";
@@ -28,6 +28,12 @@ class CompletingPi extends TestPi {
   async send(): Promise<string> { return "verified result"; }
 }
 
+class SuffixControlPi extends TestPi {
+  async send(): Promise<string> {
+    return `${WORKER_CONTROL_PREFIX}${JSON.stringify({ type: "finish", outcome: "COMPLETED", summary: "image work completed" })}Plain text only result summary.`;
+  }
+}
+
 class StructuredPi extends TestPi {
   async send(_session: PiSession, _prompt: string, options?: { cwd?: string }): Promise<string> {
     await writeFile(join(options?.cwd ?? "/tmp", "result.txt"), "verified artifact");
@@ -36,6 +42,14 @@ class StructuredPi extends TestPi {
       `${WORKER_CONTROL_PREFIX}{"type":"artifact","path":"result.txt","mime":"text/plain"}`,
       `${WORKER_CONTROL_PREFIX}{"type":"finish","outcome":"COMPLETED","summary":"structured result"}`,
     ].join("\n");
+  }
+}
+
+class ImageCapturingPi extends TestPi {
+  images: PiImageContent[] = [];
+  async send(_session: PiSession, _prompt: string, options?: { images?: PiImageContent[] }): Promise<string> {
+    this.images = options?.images ?? [];
+    return `${WORKER_CONTROL_PREFIX}${JSON.stringify({ type: "finish", outcome: "COMPLETED", summary: "image inspected" })}Plain text only result summary.`;
   }
 }
 
@@ -237,6 +251,69 @@ test("pending writer starts after the previous writer releases its lock", async 
   db.close(); await rm(root, { recursive: true, force: true });
 });
 
+test("follow-up after the last Worker completed starts a new Worker instead of orphaning a mailbox", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-home-follow-up-no-worker-"));
+  const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
+  const config = { runtime: { maxWorkers: 2, maxArtifactBytes: 100000, piCommand: "pi", piTimeoutMs: 1000 } } as AppConfig;
+  const tasks = new TaskService(db, new CompletingPi(), new ArtifactService(db, root), config, { workerRoot: root }, logger);
+  const caps = { memory: { allowedScopes: ["global_agent"] }, projects: [{ projectId: "*", access: "WRITE" as const }], qq: { readConversations: ["c"], sendConversations: ["c"] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: ["agent-home"], publishTaskIds: ["*"], allowedDestinations: ["c"] }, tasks: { canCreate: true, visibleTaskIds: [], canCancel: true, canFollowUp: true } };
+  const requester = { platform: "qq", accountId: "a", userId: "owner" };
+  const task = tasks.createTask({ title: "artifact output", goal: "produce a result", requester, trust: "OWNER", originConversationId: "c", notificationConversationId: "c", parentCapabilities: caps });
+  try {
+    const first = await tasks.createWorker({ taskId: task.id, objective: "inspect source", actor: caps, actorRequester: requester });
+    for (let index = 0; index < 100 && tasks.getWorker(first.id).status !== "COMPLETED"; index += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(tasks.getWorker(first.id).status, "COMPLETED");
+    await tasks.addFollowUp(task.id, "write the requested output artifact", { conversationId: "c", message: { platform: "qq", accountId: "a", platformConversationId: "group", threadId: null, messageId: "follow-up" }, requester, capabilities: caps });
+    const next = db.get<{ id: string; status: string; objective: string }>("SELECT id,status,objective FROM worker_executions WHERE task_id=? AND id<>? ORDER BY updated_at DESC LIMIT 1", task.id, first.id);
+    assert.ok(next);
+    assert.match(next.objective, /write the requested output artifact/);
+    const mailbox = db.get<{ status: string; worker_id: string | null; content: string }>("SELECT status,worker_id,content FROM task_mailbox WHERE task_id=? ORDER BY created_at DESC LIMIT 1", task.id);
+    assert.equal(mailbox?.status, "CONSUMED");
+    assert.equal(mailbox?.worker_id, next.id);
+    assert.equal(mailbox?.content, "write the requested output artifact");
+    for (let index = 0; index < 100 && tasks.getWorker(next.id).status !== "COMPLETED"; index += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(tasks.getWorker(next.id).status, "COMPLETED");
+    assert.equal(db.get<{ count: number }>("SELECT count(*) AS count FROM task_mailbox WHERE task_id=? AND status='PENDING'", task.id)?.count, 0);
+  } finally { db.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("Runtime recovery resumes an orphaned follow-up mailbox with a durably linked Worker", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-home-follow-up-recovery-"));
+  const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
+  const tasks = new TaskService(db, new CompletingPi(), new ArtifactService(db, root), { runtime: { maxWorkers: 2, maxArtifactBytes: 100000, piCommand: "pi", piTimeoutMs: 1000 } } as AppConfig, { workerRoot: root }, logger);
+  const caps = { memory: { allowedScopes: ["global_agent"] }, projects: [], qq: { readConversations: ["c"], sendConversations: ["c"] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: ["agent-home"], publishTaskIds: ["*"], allowedDestinations: ["c"] }, tasks: { canCreate: true, visibleTaskIds: [], canCancel: true, canFollowUp: true } };
+  const requester = { platform: "qq", accountId: "a", userId: "owner" };
+  const task = tasks.createTask({ title: "recover follow-up", goal: "write an artifact", requester, trust: "OWNER", originConversationId: "c", notificationConversationId: "c", parentCapabilities: caps });
+  const mailboxId = "mail_orphaned-follow-up";
+  db.run("INSERT INTO task_mailbox(id,task_id,type,source_conversation_id,source_message_key,content,status,created_at) VALUES (?,?,?,?,?,?,?,?)", mailboxId, task.id, "FOLLOW_UP", "c", "message-key", "write solution.cpp.txt and publish it", "PENDING", new Date().toISOString());
+  try {
+    await tasks.recover();
+    const mailbox = db.get<{ status: string; worker_id: string | null }>("SELECT status,worker_id FROM task_mailbox WHERE id=?", mailboxId);
+    assert.equal(mailbox?.status, "CONSUMED");
+    assert.ok(mailbox?.worker_id);
+    const worker = tasks.getWorker(mailbox!.worker_id!);
+    assert.equal(worker.taskId, task.id);
+    assert.match(worker.objective, /write solution.cpp.txt and publish it/);
+    assert.equal(db.get<{ source_mailbox_id: string }>("SELECT source_mailbox_id FROM worker_executions WHERE id=?", worker.id)?.source_mailbox_id, mailboxId);
+    for (let index = 0; index < 100 && tasks.getWorker(worker.id).status !== "COMPLETED"; index += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(tasks.getWorker(worker.id).status, "COMPLETED");
+  } finally { db.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("Worker control JSON followed by harness summary text still completes the Worker", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-home-worker-control-suffix-"));
+  const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
+  const tasks = new TaskService(db, new SuffixControlPi(), new ArtifactService(db, root), { runtime: { maxWorkers: 1, maxArtifactBytes: 100000, piCommand: "pi", piTimeoutMs: 1000 } } as AppConfig, { workerRoot: root }, logger);
+  const caps = { memory: { allowedScopes: ["global_agent"] }, projects: [], qq: { readConversations: ["c"], sendConversations: ["c"] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: ["agent-home"], publishTaskIds: ["*"], allowedDestinations: ["c"] }, tasks: { canCreate: true, visibleTaskIds: [], canCancel: true, canFollowUp: true } };
+  const task = tasks.createTask({ title: "control suffix", goal: "complete", requester: { platform: "qq", accountId: "a", userId: "owner" }, trust: "OWNER", originConversationId: "c", notificationConversationId: "c", parentCapabilities: caps });
+  try {
+    const worker = await tasks.createWorker({ taskId: task.id, objective: "finish using a control frame", actor: caps });
+    for (let index = 0; index < 100 && tasks.getWorker(worker.id).status !== "COMPLETED"; index += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(tasks.getWorker(worker.id).status, "COMPLETED");
+    assert.equal(db.get("SELECT 1 FROM runtime_exceptions WHERE worker_id=? AND category='PI_FAILURE'", worker.id), undefined);
+  } finally { db.close(); await rm(root, { recursive: true, force: true }); }
+});
+
 test("runtime recovery does not leave phantom RUNNING workers", async () => {
   const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
   const timestamp = new Date().toISOString();
@@ -272,6 +349,59 @@ test("WorkerControl persists progress, publishes artifacts, and explicitly finis
   db.close(); await rm(root, { recursive: true, force: true });
 });
 
+test("authorized image Artifact is injected into Pi visual context and adjacent prose does not corrupt control frames", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-home-worker-image-input-"));
+  const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
+  const pi = new ImageCapturingPi();
+  const config = { runtime: { maxWorkers: 2, maxArtifactBytes: 100000, piCommand: "pi", piTimeoutMs: 1000 } } as AppConfig;
+  const artifacts = new ArtifactService(db, root);
+  const tasks = new TaskService(db, pi, artifacts, config, { workerRoot: root }, logger);
+  const caps = { memory: { allowedScopes: ["global_agent"] }, projects: [{ projectId: "*", access: "WRITE" as const }], qq: { readConversations: ["c"], sendConversations: ["c"] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: ["agent-home"], publishTaskIds: ["*"], allowedDestinations: ["c"] }, tasks: { canCreate: true, visibleTaskIds: [], canCancel: true, canFollowUp: true } };
+  const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+  const artifact = await artifacts.ingestAttachment({ stream: (async function* () { yield jpeg; })(), filename: "upload.png", mime: "application/octet-stream", conversationId: "c", requesterId: "owner", eventId: "image-event", maxBytes: 1000 });
+  assert.equal(artifact.mime, "image/jpeg");
+  const task = tasks.createTask({ title: "visual", goal: "inspect supplied image", requester: { platform: "qq", accountId: "a", userId: "owner" }, trust: "OWNER", originConversationId: "c", notificationConversationId: "c", parentCapabilities: caps });
+  try {
+    const worker = await tasks.createWorker({ taskId: task.id, objective: "inspect the image", artifactRefs: [artifact.ref], actor: caps });
+    for (let index = 0; index < 100 && tasks.getWorker(worker.id).status !== "COMPLETED"; index += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(tasks.getWorker(worker.id).status, "COMPLETED");
+    assert.deepEqual(pi.images, [{ type: "image", data: jpeg.toString("base64"), mimeType: "image/jpeg" }]);
+    assert.equal(db.get("SELECT 1 FROM runtime_exceptions WHERE task_id=? AND category='PI_FAILURE'", task.id), undefined);
+    assert.equal(db.get("SELECT 1 FROM task_events WHERE task_id=? AND type='WORKER_COMPLETED'", task.id) !== undefined, true);
+  } finally { db.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("a Worker network failure sends one actionable Main result without a duplicate exception turn", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-home-worker-network-failure-"));
+  const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
+  const tasks = new TaskService(db, new TestPi(), new ArtifactService(db, root), { runtime: { maxWorkers: 1, maxArtifactBytes: 100000, piCommand: "pi", piTimeoutMs: 1000 } } as AppConfig, { workerRoot: root }, logger);
+  const caps = { memory: { allowedScopes: ["global_agent"] }, projects: [], qq: { readConversations: ["c"], sendConversations: ["c"] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: ["agent-home"], publishTaskIds: ["*"], allowedDestinations: ["c"] }, tasks: { canCreate: true, visibleTaskIds: [], canCancel: true, canFollowUp: true } };
+  const task = tasks.createTask({ title: "network failure", goal: "network failure", requester: { platform: "qq", accountId: "a", userId: "owner" }, trust: "OWNER", originConversationId: "c", notificationConversationId: "c", parentCapabilities: caps });
+  try {
+    const worker = await tasks.createWorker({ taskId: task.id, objective: "test network failure", actor: caps });
+    for (let index = 0; index < 100 && tasks.getWorker(worker.id).status !== "WAITING_USER"; index += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+    await tasks.failWorker(worker.id, "fetch failed: ECONNRESET");
+    assert.equal(tasks.getWorker(worker.id).status, "FAILED");
+    const result = db.get<{ payload_json: string }>("SELECT payload_json FROM task_event_outbox WHERE task_id=? AND event_type='TASK_RESULT'", task.id);
+    const payload = JSON.parse(result!.payload_json) as { errorCode: string; summary: string };
+    assert.equal(payload.errorCode, "PI_NETWORK_UNAVAILABLE");
+    assert.match(payload.summary, /model-service connection failed/);
+    assert.equal(db.get<{ count: number }>("SELECT count(*) AS count FROM task_event_outbox WHERE task_id=? AND event_type='TASK_EXCEPTION'", task.id)?.count, 0);
+    assert.ok(db.get("SELECT 1 FROM runtime_exceptions WHERE task_id=? AND worker_id=? AND category='PI_NETWORK_UNAVAILABLE'", task.id, worker.id));
+  } finally { db.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("Main Task finalization does not enqueue a duplicate Task result turn", async () => {
+  const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
+  const caps = { memory: { allowedScopes: ["global_agent"] }, projects: [], qq: { readConversations: ["c"], sendConversations: ["c"] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: ["agent-home"], publishTaskIds: ["*"], allowedDestinations: ["c"] }, tasks: { canCreate: true, visibleTaskIds: [], canCancel: true, canFollowUp: true } };
+  const tasks = new TaskService(db, new TestPi(), new ArtifactService(db, "/tmp"), { runtime: { maxWorkers: 1, maxArtifactBytes: 1000, piCommand: "pi", piTimeoutMs: 1000 } } as AppConfig, { workerRoot: "/tmp" }, logger);
+  const task = tasks.createTask({ title: "finalize once", goal: "finalize once", requester: { platform: "qq", accountId: "a", userId: "owner" }, trust: "OWNER", originConversationId: "c", notificationConversationId: "c", parentCapabilities: caps });
+  await tasks.finishTask(task.id, { outcome: "COMPLETED", summary: "verified" });
+  assert.equal(db.get<{ count: number }>("SELECT count(*) AS count FROM task_events WHERE task_id=? AND type='TASK_FINISHED'", task.id)?.count, 1);
+  assert.equal(db.get<{ count: number }>("SELECT count(*) AS count FROM task_event_outbox WHERE task_id=? AND event_type='TASK_RESULT'", task.id)?.count, 0);
+  db.close();
+});
+
 test("Owner and Guest Workers persist the same Principal-brokered execution mode", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-principal-worker-mode-"));
   const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
@@ -295,7 +425,24 @@ test("Owner and Guest Workers persist the same Principal-brokered execution mode
       assert.equal(durable?.runtime_uid, principalId === "principal:owner" ? 10001 : 20001);
       assert.equal(durable?.workspace_id, "default");
       assert.equal(durable?.workspace_access, "WRITE");
+      assert.deepEqual(worker.capabilities?.projects, [{ projectId: "default", access: "WRITE" }]);
+      const execution = await service.executionContext(worker.id);
+      assert.equal(execution.taskId, task.id);
+      assert.equal(execution.workerId, worker.id);
+      assert.equal(execution.principalId, principalId);
+      assert.equal(execution.role, trust);
+      assert.equal(execution.uid, principalId === "principal:owner" ? 10001 : 20001);
+      assert.equal(execution.gid, principalId === "principal:owner" ? 10001 : 20001);
+      assert.equal(execution.workspaceId, "default");
+      assert.equal(execution.workspaceAccess, "WRITE");
+      assert.equal(execution.executionProfile, "PRINCIPAL_READ_WRITE");
+      assert.equal(execution.contextSource, "durable-worker-record");
     }
+    const readonlyCaps = { ...caps, projects: [{ projectId: "*", access: "READ" as const }] };
+    const readonlyTask = service.createTask({ title: "readonly", goal: "readonly", requester: { platform: "qq", accountId: "a", userId: "principal:guest-readonly", principalId: "principal:guest-readonly" }, trust: "GUEST", originConversationId: "c", notificationConversationId: "c", parentCapabilities: readonlyCaps });
+    const readonlyWorker = await service.createWorker({ taskId: readonlyTask.id, objective: "read only", actor: readonlyCaps, actorPrincipalId: "principal:guest-readonly" });
+    assert.equal(readonlyWorker.workspaceAccess, "READ");
+    assert.deepEqual(readonlyWorker.capabilities?.projects, [{ projectId: "default", access: "READ" }]);
     assert.deepEqual(modes, ["PRINCIPAL_BROKERED", "PRINCIPAL_BROKERED"]);
   } finally { db.close(); await rm(root, { recursive: true, force: true }); }
 });

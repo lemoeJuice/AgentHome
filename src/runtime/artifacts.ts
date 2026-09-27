@@ -1,11 +1,12 @@
 import { createHash } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
-import { access, copyFile, mkdir, realpath, stat, unlink } from "node:fs/promises";
+import { access, copyFile, mkdir, open, realpath, stat, unlink } from "node:fs/promises";
 import { basename, relative, resolve } from "node:path";
 import { once } from "node:events";
 import type { SqliteStore } from "../db.js";
 import { newId, nowIso } from "../shared/ids.js";
 import type { ArtifactRef } from "../shared/types.js";
+import { sniffImageMimeType } from "./images.js";
 
 export interface ArtifactMetadata {
   ref: ArtifactRef;
@@ -72,6 +73,14 @@ export class ArtifactService {
     const id = newId("artifact");
     const filename = basename(candidate).replace(/[\u0000-\u001f]/g, "_").slice(0, 180) || "artifact";
     const retentionClass = input.retentionClass ?? "task-lifetime";
+    const signatureFile = await open(candidate, "r");
+    let detectedMime: string | undefined;
+    try {
+      const signature = Buffer.alloc(32);
+      const read = await signatureFile.read(signature, 0, signature.length, 0);
+      detectedMime = sniffImageMimeType(signature.subarray(0, read.bytesRead));
+    } finally { await signatureFile.close(); }
+    const mime = detectedMime ?? input.mime;
     const artifactDirectory = resolve(this.stateRoot, "artifacts");
     const target = resolve(artifactDirectory, `${id}-${filename}`);
     await mkdir(artifactDirectory, { recursive: true, mode: 0o700 });
@@ -83,11 +92,11 @@ export class ArtifactService {
     try {
       this.db.transaction(() => {
         if (input.sourcePrincipalId && input.principalQuotaBytes !== undefined) this.assertPrincipalQuota(input.sourcePrincipalId, input.principalQuotaBytes, targetInfo.size);
-        this.db.run("INSERT INTO artifacts(id,owner_task_id,producer_worker_id,source_type,canonical_path,filename,mime,size,sha256,status,created_at,expires_at,retention_class,owner_invocation_id,owner_plugin_id,source_principal_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", id, input.taskId, input.workerId ?? null, input.sourceType ?? "WORKER_OUTPUT", target, filename, input.mime ?? null, targetInfo.size, digest, "AVAILABLE", createdAt, expiresAt ?? null, retentionClass, input.ownerInvocationId ?? null, input.ownerPluginId ?? null, input.sourcePrincipalId ?? null);
+        this.db.run("INSERT INTO artifacts(id,owner_task_id,producer_worker_id,source_type,canonical_path,filename,mime,size,sha256,status,created_at,expires_at,retention_class,owner_invocation_id,owner_plugin_id,source_principal_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", id, input.taskId, input.workerId ?? null, input.sourceType ?? "WORKER_OUTPUT", target, filename, mime ?? null, targetInfo.size, digest, "AVAILABLE", createdAt, expiresAt ?? null, retentionClass, input.ownerInvocationId ?? null, input.ownerPluginId ?? null, input.sourcePrincipalId ?? null);
       });
     } catch (error) { await unlink(target).catch(() => undefined); throw error; }
     this.audit("artifact.publish", "ALLOW", undefined, id, input.workerId ? `worker:${input.workerId}` : undefined, input.taskId);
-    return { ref: { authority: "agent-home", artifactId: id }, ownerTaskId: input.taskId, ...(input.workerId ? { producerWorkerId: input.workerId } : {}), ...(input.sourcePrincipalId ? { sourcePrincipalId: input.sourcePrincipalId } : {}), filename, ...(input.mime ? { mime: input.mime } : {}), size: targetInfo.size, sha256: digest, status: "AVAILABLE", retentionClass, ...(input.ownerInvocationId ? { ownerInvocationId: input.ownerInvocationId } : {}), ...(input.ownerPluginId ? { ownerPluginId: input.ownerPluginId } : {}), ...(expiresAt ? { expiresAt } : {}) };
+    return { ref: { authority: "agent-home", artifactId: id }, ownerTaskId: input.taskId, ...(input.workerId ? { producerWorkerId: input.workerId } : {}), ...(input.sourcePrincipalId ? { sourcePrincipalId: input.sourcePrincipalId } : {}), filename, ...(mime ? { mime } : {}), size: targetInfo.size, sha256: digest, status: "AVAILABLE", retentionClass, ...(input.ownerInvocationId ? { ownerInvocationId: input.ownerInvocationId } : {}), ...(input.ownerPluginId ? { ownerPluginId: input.ownerPluginId } : {}), ...(expiresAt ? { expiresAt } : {}) };
   }
 
   async ingestAttachment(input: { stream: AsyncIterable<Uint8Array>; filename?: string; mime?: string; size?: number; conversationId: string; requesterId?: string; principalId?: string; principalQuotaBytes?: number; eventId?: string; maxBytes: number }): Promise<ArtifactMetadata> {
@@ -100,6 +109,8 @@ export class ArtifactService {
     await mkdir(resolve(this.stateRoot, "inbox"), { recursive: true });
     const output = createWriteStream(target, { mode: 0o600 });
     const hash = createHash("sha256");
+    const signature: Buffer[] = [];
+    let signatureBytes = 0;
     let size = 0;
     try {
       for await (const chunk of input.stream) {
@@ -107,6 +118,11 @@ export class ArtifactService {
         if (size > input.maxBytes) throw new Error("ARTIFACT_SIZE_LIMIT");
         if (input.principalQuotaBytes !== undefined && currentPrincipalBytes + size > input.principalQuotaBytes) throw new Error("PRINCIPAL_ARTIFACT_QUOTA_EXCEEDED");
         hash.update(chunk);
+        if (signatureBytes < 32) {
+          const prefix = Buffer.from(chunk).subarray(0, 32 - signatureBytes);
+          signature.push(prefix);
+          signatureBytes += prefix.byteLength;
+        }
         if (!output.write(chunk)) await once(output, "drain");
       }
       await new Promise<void>((resolve, reject) => {
@@ -121,13 +137,14 @@ export class ArtifactService {
     }
     const createdAt = nowIso();
     const digest = hash.digest("hex");
+    const mime = sniffImageMimeType(Buffer.concat(signature)) ?? input.mime;
     try {
       this.db.transaction(() => {
         if (input.principalId && input.principalQuotaBytes !== undefined) this.assertPrincipalQuota(input.principalId, input.principalQuotaBytes, size);
-        this.db.run("INSERT INTO artifacts(id,owner_task_id,producer_worker_id,source_type,canonical_path,filename,mime,size,sha256,status,created_at,source_conversation_id,source_requester_id,source_event_id,retention_class,expires_at,source_principal_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", id, null, null, "QQ_INBOUND", target, safeName, input.mime ?? null, size, digest, "AVAILABLE", createdAt, input.conversationId, input.requesterId ?? null, input.eventId ?? null, "task-lifetime", null, input.principalId ?? null);
+        this.db.run("INSERT INTO artifacts(id,owner_task_id,producer_worker_id,source_type,canonical_path,filename,mime,size,sha256,status,created_at,source_conversation_id,source_requester_id,source_event_id,retention_class,expires_at,source_principal_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", id, null, null, "QQ_INBOUND", target, safeName, mime ?? null, size, digest, "AVAILABLE", createdAt, input.conversationId, input.requesterId ?? null, input.eventId ?? null, "task-lifetime", null, input.principalId ?? null);
       });
     } catch (error) { await unlink(target).catch(() => undefined); throw error; }
-    return { ref: { authority: "agent-home", artifactId: id }, ...(input.principalId ? { sourcePrincipalId: input.principalId } : {}), filename: safeName, ...(input.mime ? { mime: input.mime } : {}), size, sha256: digest, status: "AVAILABLE", retentionClass: "task-lifetime" };
+    return { ref: { authority: "agent-home", artifactId: id }, ...(input.principalId ? { sourcePrincipalId: input.principalId } : {}), filename: safeName, ...(mime ? { mime } : {}), size, sha256: digest, status: "AVAILABLE", retentionClass: "task-lifetime" };
   }
 
   get(ref: ArtifactRef): ArtifactMetadata & { path: string } {

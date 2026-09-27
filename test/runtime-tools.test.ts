@@ -55,7 +55,9 @@ test("Runtime tool socket binds authorization context server-side", async () => 
 
 test("Main Pi exposes only service tools and prompt text cannot add a shell action", async () => {
   const names: string[] = [];
-  registerAgentHomeTools({ registerTool: (definition) => { names.push(definition.name); } });
+  let spawnWorker: { description: string; parameters: Record<string, unknown> } | undefined;
+  let createTask: { parameters: Record<string, unknown> } | undefined;
+  registerAgentHomeTools({ registerTool: (definition) => { names.push(definition.name); if (definition.name === "spawn_worker") spawnWorker = definition; if (definition.name === "create_task") createTask = definition; } });
   assert.equal(names.includes("shell"), false);
   assert.equal(names.includes("bash"), false);
   assert.equal(names.includes("read_file"), false);
@@ -64,6 +66,13 @@ test("Main Pi exposes only service tools and prompt text cannot add a shell acti
   assert.ok(names.includes("list_snowluma_actions"));
   assert.ok(names.includes("get_snowluma_action"));
   assert.ok(names.includes("invoke_snowluma_action"));
+  assert.ok(spawnWorker);
+  assert.equal("workspaceAccess" in (spawnWorker.parameters.properties as Record<string, unknown>), false);
+  assert.equal("requestedCapabilities" in (spawnWorker.parameters.properties as Record<string, unknown>), false);
+  assert.match(spawnWorker.description, /Runtime derives the Worker profile from the Task's authorized workspace capability/);
+  assert.match(spawnWorker.description, /Include authorized artifactRefs/);
+  assert.ok(createTask);
+  assert.equal("requestedCapabilities" in (createTask.parameters.properties as Record<string, unknown>), false);
 
   const root = await mkdtemp(join(tmpdir(), "agent-home-main-boundary-"));
   const socketPath = join(root, "tools.sock");
@@ -111,6 +120,38 @@ test("Worker Pi exposes only Runtime-brokered Principal execution and workspace 
   assert.equal(names.includes("bash"), false);
   assert.equal(names.includes("read"), false);
   assert.equal(names.includes("write"), false);
+});
+
+test("Main attachment tool returns authorized images as Pi image content blocks", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-home-main-image-tool-"));
+  const socketPath = join(root, "tools.sock");
+  const token = "main-image-token";
+  const image = { type: "image" as const, data: Buffer.from([0xff, 0xd8, 0xff]).toString("base64"), mimeType: "image/jpeg" };
+  const server = new RuntimeToolServer(socketPath, (candidate) => candidate === token ? context : undefined, async (action) => {
+    assert.equal(action, "get_attachment");
+    return { ref: { authority: "agent-home", artifactId: "artifact-image" }, filename: "image.jpg", imageInput: image };
+  });
+  const previousSocket = process.env.AGENT_HOME_RUNTIME_TOOL_SOCKET;
+  const previousToken = process.env.AGENT_HOME_RUNTIME_TOOL_TOKEN;
+  await server.start();
+  process.env.AGENT_HOME_RUNTIME_TOOL_SOCKET = socketPath;
+  process.env.AGENT_HOME_RUNTIME_TOOL_TOKEN = token;
+  try {
+    const definitions = new Map<string, Parameters<Parameters<typeof registerAgentHomeTools>[0]["registerTool"]>[0]>();
+    registerAgentHomeTools({ registerTool: (definition) => { definitions.set(definition.name, definition); } });
+    const getAttachment = definitions.get("get_attachment");
+    assert.ok(getAttachment);
+    const result = await getAttachment.execute("call", { attachment: { type: "image", id: "image-id" } }, new AbortController().signal);
+    assert.match(result.content[0]?.text ?? "", /artifact-image/);
+    assert.equal(result.content[1]?.type, "image");
+    assert.deepEqual(result.content[1], image);
+    assert.equal(result.isError, undefined);
+  } finally {
+    await server.stop();
+    if (previousSocket === undefined) delete process.env.AGENT_HOME_RUNTIME_TOOL_SOCKET; else process.env.AGENT_HOME_RUNTIME_TOOL_SOCKET = previousSocket;
+    if (previousToken === undefined) delete process.env.AGENT_HOME_RUNTIME_TOOL_TOKEN; else process.env.AGENT_HOME_RUNTIME_TOOL_TOKEN = previousToken;
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("Worker Gateway actions return through the authenticated Runtime tool socket", async () => {

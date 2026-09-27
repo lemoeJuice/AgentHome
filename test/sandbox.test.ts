@@ -43,7 +43,9 @@ exec ${process.execPath} ${JSON.stringify(fakeBwrapProgram)} "$@"
   await chmod(fakePi, 0o755);
   await chmod(fakeBwrap, 0o755);
   const harness = new PiCliHarness(fakePi, new Logger("test", "error"), fakeBwrap, undefined, { agentDir });
+  const proxyEnvironment = { HTTP_PROXY: process.env.HTTP_PROXY, HTTPS_PROXY: process.env.HTTPS_PROXY, ALL_PROXY: process.env.ALL_PROXY, http_proxy: process.env.http_proxy, https_proxy: process.env.https_proxy, all_proxy: process.env.all_proxy, NO_PROXY: process.env.NO_PROXY, no_proxy: process.env.no_proxy, NODE_USE_ENV_PROXY: process.env.NODE_USE_ENV_PROXY };
   try {
+    for (const [name, value] of Object.entries({ HTTP_PROXY: "http://host.containers.internal:17890", HTTPS_PROXY: "http://host.containers.internal:17890", ALL_PROXY: "http://host.containers.internal:17890", http_proxy: "http://host.containers.internal:17890", https_proxy: "http://host.containers.internal:17890", all_proxy: "http://host.containers.internal:17890", NO_PROXY: "localhost,host.containers.internal,snowluma", no_proxy: "localhost,host.containers.internal,snowluma", NODE_USE_ENV_PROXY: "1" })) process.env[name] = value;
     process.env.SANDBOX_ARGS_LOG = argsPath;
     const session = await harness.createSession(join(sessionRoot, "session.jsonl"), {
       cwd: workspace,
@@ -61,6 +63,8 @@ exec ${process.execPath} ${JSON.stringify(fakeBwrapProgram)} "$@"
     assert.ok(args.includes(agentDir));
     assert.ok(args.includes(sessionRoot));
     assert.ok(args.includes(toolSocket));
+    assert.ok(args.some((item, index) => item === "--setenv" && args[index + 1] === "HTTPS_PROXY" && args[index + 2] === "http://host.containers.internal:17890"));
+    assert.ok(args.some((item, index) => item === "--setenv" && args[index + 1] === "NODE_USE_ENV_PROXY" && args[index + 2] === "1"));
     assert.equal(args.some((item) => item.includes("AGENT_HOME_MCP_URL") || item.includes("AGENT_HOME_MCP_TOKEN")), false);
     assert.equal(args.some((item) => item.includes(workspace)), false);
     const bindings = args.flatMap((item, index) => ["--bind", "--ro-bind"].includes(item) ? args.slice(index + 1, index + 3) : []);
@@ -71,6 +75,7 @@ exec ${process.execPath} ${JSON.stringify(fakeBwrapProgram)} "$@"
     );
   } finally {
     delete process.env.SANDBOX_ARGS_LOG;
+    for (const [name, value] of Object.entries(proxyEnvironment)) if (value === undefined) delete process.env[name]; else process.env[name] = value;
     await harness.stop();
     await rm(root, { recursive: true, force: true });
   }

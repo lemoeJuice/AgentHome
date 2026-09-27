@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import type { AppConfig } from "../config.js";
 import { snowlumaAccessToken } from "../config.js";
 import type { Logger } from "../shared/logger.js";
+import { proxyEnvironment } from "./network.js";
 
 type JsonRpcResponse = {
   jsonrpc?: string;
@@ -142,6 +143,7 @@ export class SnowLumaMcpClient implements SnowLumaMcpActions {
       env: {
         PATH: process.env.PATH ?? "",
         HOME: process.env.HOME ?? "/tmp",
+        ...proxyEnvironment(process.env.HTTPS_PROXY ?? process.env.https_proxy),
         ...(process.env.TMPDIR ? { TMPDIR: process.env.TMPDIR } : {}),
         SNOWLUMA_MCP_ENDPOINT: this.endpoint,
         ...(this.token ? { SNOWLUMA_MCP_TOKEN: this.token } : {}),

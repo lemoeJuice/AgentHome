@@ -36,6 +36,12 @@ test("Principal runtime identities are stable, unique and independent of platfor
     assert.equal(a.runtimeGid, a.runtimeUid);
     assert.deepEqual(new PrincipalService(db, root).get(first.principalId), a);
     assert.equal(service.get(OWNER_PRINCIPAL_ID).role, "OWNER");
+    const proxyEnvironment = service.principalProcessEnvironment(first.principalId, "http://host.containers.internal:17890");
+    assert.equal(proxyEnvironment.HTTP_PROXY, "http://host.containers.internal:17890");
+    assert.equal(proxyEnvironment.https_proxy, "http://host.containers.internal:17890");
+    assert.equal(proxyEnvironment.NODE_USE_ENV_PROXY, "1");
+    assert.match(proxyEnvironment.NO_PROXY ?? "", /snowluma/);
+    assert.equal("HTTP_PROXY" in service.principalProcessEnvironment(first.principalId), false);
   } finally { db.close(); await rm(root, { recursive: true, force: true }); }
 });
 

@@ -5,6 +5,7 @@ import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { RuntimeApp } from "../src/runtime/runtime.js";
+import { PiTurnError } from "../src/runtime/pi.js";
 import { deriveCapabilities } from "../src/auth.js";
 import type { AppConfig } from "../src/config.js";
 import type { Logger } from "../src/shared/logger.js";
@@ -99,11 +100,13 @@ test("main turns are durable and serialized per conversation", async () => {
   const config = { instanceId: "main-queue", owner: { platform: "qq", accountId: "a", userId: "owner" }, paths: { gatewayState: join(root, "gateway.sqlite"), pluginData: join(root, "plugins"), backupDir: join(root, "backups"), stateRoot: root, runtimeSocket: join(root, "run.sock") }, snowluma: { accountId: "a", endpoint: "ws://127.0.0.1:1", apiEndpoint: "http://127.0.0.1:1", accessTokenEnv: "NO_TOKEN", reverseWebSocketPath: "/ws", reconnectMs: 10, requestTimeoutMs: 10 }, chat: { global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, conversationOverrides: {} }, runtime: { maxInFlight: 2, maxWorkers: 1, maxArtifactBytes: 100000, piCommand: "missing-pi", piTimeoutMs: 100 }, plugins: { enabled: [] }, logging: { level: "error" } } as AppConfig;
   const runtime = new RuntimeApp(config, logger);
   const prompts: string[] = [];
+  const sentTexts: string[] = [];
+  let retryablePromptAttempts = 0;
   let activeTurns = 0;
   let maxActiveTurns = 0;
-  const internals = runtime as unknown as { pi: { createSession: (path: string) => Promise<{ sessionId: string; sessionPath: string }>; send: (session: { sessionId: string; sessionPath: string }, prompt: string) => Promise<string>; stop: () => Promise<void> }; qq: { sendMessage: (target: unknown, message: { text: string }) => Promise<unknown> }; mainToolContexts: Map<string, { conversationId: string; requesterId: string; requester: { platform: string; accountId: string; userId: string; principalId?: string }; capabilities: CapabilitySet }> };
-  internals.pi = { createSession: async (path) => ({ sessionId: `main-session-${path}`, sessionPath: path }), send: async (_session, prompt) => { prompts.push(prompt); activeTurns += 1; maxActiveTurns = Math.max(maxActiveTurns, activeTurns); await new Promise((resolve) => setTimeout(resolve, 10)); activeTurns -= 1; return `response-${prompts.length}`; }, stop: async () => {} };
-  internals.qq = { sendMessage: async (_target, message) => ({ message: { platform: "qq", accountId: "a", platformConversationId: "owner", threadId: null, messageId: `out-${prompts.length}` }, accepted: true, echoedText: message.text }) };
+  const internals = runtime as unknown as { pi: { createSession: (path: string) => Promise<{ sessionId: string; sessionPath: string }>; send: (session: { sessionId: string; sessionPath: string }, prompt: string) => Promise<string>; stop: () => Promise<void> }; qq: { sendMessage: (target: unknown, message: { text: string }) => Promise<unknown> }; mainToolContexts: Map<string, { conversationId: string; requesterId: string; requester: { platform: string; accountId: string; userId: string; principalId?: string }; capabilities: CapabilitySet }>; processMainTurnJob: (job: { kind: "TASK_EVENT"; taskId: string; eventType: string; payload: Record<string, unknown> }) => Promise<void> };
+  internals.pi = { createSession: async (path) => ({ sessionId: `main-session-${path}`, sessionPath: path }), send: async (_session, prompt) => { prompts.push(prompt); activeTurns += 1; maxActiveTurns = Math.max(maxActiveTurns, activeTurns); await new Promise((resolve) => setTimeout(resolve, 10)); activeTurns -= 1; if (prompt.includes("retryable message") && retryablePromptAttempts++ === 0) throw new Error("fetch failed"); if (prompt.includes("tool already called")) throw new PiTurnError("fetch failed", true); return `response-${prompts.length}`; }, stop: async () => {} };
+  internals.qq = { sendMessage: async (_target, message) => { sentTexts.push(message.text); return { message: { platform: "qq", accountId: "a", platformConversationId: "owner", threadId: null, messageId: `out-${prompts.length}` }, accepted: true, echoedText: message.text }; } };
   const event = (eventId: string, text: string, group = false) => ({ protocolVersion: 1 as const, eventId, instanceId: "main-queue", type: "chat.message" as const, occurredAt: new Date().toISOString(), source: { platform: "qq", accountId: "a", adapter: "test" }, trustedIdentity: { userId: group ? "guest" : "owner" }, conversation: { conversationId: "external", address: { platform: "qq", accountId: "a", kind: group ? "group" as const : "private" as const, platformConversationId: group ? "group-1" : "owner", threadId: null } }, message: { ref: { platform: "qq", accountId: "a", platformConversationId: group ? "group-1" : "owner", threadId: null, messageId: eventId }, replyTo: null }, payload: { text } });
   try {
     await runtime.start();
@@ -123,6 +126,22 @@ test("main turns are durable and serialized per conversation", async () => {
     assert.ok(ownerContext);
     const task = runtime.tasks.createTask({ title: "visible task", goal: "visible task", requester: ownerContext.requester, trust: "OWNER", originConversationId: ownerContext.conversationId, notificationConversationId: ownerContext.conversationId, parentCapabilities: ownerContext.capabilities });
     assert.ok(runtime.tasks.listTasks(ownerContext.conversationId, ownerContext.capabilities, ownerContext.requesterId, ownerContext.requester.principalId).some((item) => item.id === task.id));
+    await internals.processMainTurnJob({ kind: "TASK_EVENT", taskId: task.id, eventType: "TASK_RESULT", payload: { outcome: "COMPLETED", summary: "verified worker result" } });
+    assert.match(prompts.at(-1) ?? "", /调用 finish_task/);
+    assert.match(prompts.at(-1) ?? "", new RegExp(task.id.slice(-8)));
+    await runtime.receive(event("main-retry", "retryable message"));
+    for (let index = 0; index < 500 && runtime.db.get<{ status: string }>("SELECT status FROM main_turn_queue WHERE job_json LIKE '%retryable message%' ORDER BY created_at DESC LIMIT 1")?.status !== "DONE"; index += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+    const retried = runtime.db.get<{ status: string; attempts: number }>("SELECT status,attempts FROM main_turn_queue WHERE job_json LIKE '%retryable message%' ORDER BY created_at DESC LIMIT 1");
+    assert.equal(retried?.status, "DONE");
+    assert.equal(retried?.attempts, 2);
+    assert.equal(sentTexts.filter((text) => text.includes("已保留，Runtime 会自动重试")).length, 1);
+    assert.ok(sentTexts.some((text) => text.startsWith("response-")));
+    await runtime.receive(event("main-after-tool", "tool already called"));
+    for (let index = 0; index < 100 && runtime.db.get<{ status: string }>("SELECT status FROM main_turn_queue WHERE job_json LIKE '%tool already called%' ORDER BY created_at DESC LIMIT 1")?.status !== "DONE"; index += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+    const noReplay = runtime.db.get<{ status: string; attempts: number }>("SELECT status,attempts FROM main_turn_queue WHERE job_json LIKE '%tool already called%' ORDER BY created_at DESC LIMIT 1");
+    assert.equal(noReplay?.status, "DONE");
+    assert.equal(noReplay?.attempts, 1);
+    assert.ok(sentTexts.some((text) => text.includes("为避免重复执行")));
   } finally {
     await runtime.stop();
     await rm(root, { recursive: true, force: true });
@@ -196,16 +215,22 @@ test("Main lazy QQ tools enforce the current conversation read capability", asyn
     assert.deepEqual(await internals.handleMainTool("get_message", { ref }, context), { ref, payload: { text: "authorized" } });
     assert.deepEqual(await internals.handleMainTool("get_current_message", {}, context), { ref, payload: { text: "authorized" } });
     assert.deepEqual(await internals.handleMainTool("get_reply_context", {}, context), { ref: { ...ref, messageId: "7" }, payload: { text: "authorized" } });
+    const historicalRef = { ...ref, messageId: "41" };
     internals.qq = {
-      getMessage: async (value) => ({ message: { attachments: [{ type: "image", id: "image-1" }] }, ref: value }),
-      getHistory: async (query) => [{ query }],
-      fetchAttachment: async () => ({ filename: "image.png", mime: "image/png", stream: (async function* () { yield Buffer.from("image"); })() }),
+      getMessage: async (value) => ({ message: { attachments: [{ type: "image", id: "image-history" }] }, ref: value }),
+      getHistory: async (query) => [{ query, message: { ref: historicalRef, attachments: [{ type: "image", id: "image-history" }] } }],
+      fetchAttachment: async () => ({ filename: "misleading.png", mime: "application/octet-stream", stream: (async function* () { yield Buffer.from([0xff, 0xd8, 0xff, 0xd9]); })() }),
     };
-    const fetched = await internals.handleMainTool("get_attachment", { attachment: { type: "image", id: "image-1" } }, context) as { filename: string };
-    assert.equal(fetched.filename, "image.png");
-    assert.equal((await internals.handleMainTool("read_artifact", { ref: artifact.ref }, context) as { content: string }).content, "authorized artifact");
-    const history = await internals.handleMainTool("get_history", { limit: 3 }, context) as Array<{ query: { limit: number } }>;
+    const history = await internals.handleMainTool("get_history", { limit: 3 }, context) as Array<{ query: { limit: number }; message: { ref: PlatformMessageRef; attachments: Array<{ type: string; id: string }> } }>;
     assert.equal(history[0]?.query.limit, 3);
+    const fetched = await internals.handleMainTool("get_attachment", { attachment: history[0]!.message.attachments[0], messageRef: history[0]!.message.ref }, context) as { filename: string; mime: string; ref: { artifactId: string }; imageInput: { type: string; data: string; mimeType: string } };
+    assert.equal(fetched.filename, "misleading.png");
+    assert.equal(fetched.mime, "image/jpeg");
+    assert.equal(fetched.imageInput.type, "image");
+    assert.equal(fetched.imageInput.mimeType, "image/jpeg");
+    assert.equal(fetched.imageInput.data, Buffer.from([0xff, 0xd8, 0xff, 0xd9]).toString("base64"));
+    assert.ok(runtime.artifacts.get({ authority: "agent-home", artifactId: fetched.ref.artifactId }));
+    assert.equal((await internals.handleMainTool("read_artifact", { ref: artifact.ref }, context) as { content: string }).content, "authorized artifact");
     assert.deepEqual(await internals.handleMainTool("list_snowluma_actions", { category: "消息" }, context), [{ name: "send_private_msg", category: "消息" }]);
     assert.deepEqual(await internals.handleMainTool("search_snowluma_actions", { query: "私聊" }, context), [{ name: "send_private_msg" }]);
     assert.deepEqual(await internals.handleMainTool("get_snowluma_action", { name: "send_private_msg" }, context), { name: "send_private_msg", inputSchema: { type: "object" } });

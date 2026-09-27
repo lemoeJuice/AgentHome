@@ -12,6 +12,7 @@ test("PiCliHarness drives a persistent RPC session", async () => {
   const sessionPath = join(root, "session.jsonl");
   const networkRetryPath = join(root, "network-retry-count.txt");
   const networkExitRetryPath = join(root, "network-exit-retry-count.txt");
+  const rpcCommandsPath = join(root, "rpc-commands.jsonl");
   await writeFile(command, `#!/usr/bin/env node
     import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
      writeFileSync(process.argv[process.argv.length - 1], JSON.stringify({ booted: true, args: process.argv.slice(2) }) + "\\n");
@@ -25,14 +26,21 @@ test("PiCliHarness drives a persistent RPC session", async () => {
       let index = buffer.indexOf("\\n");
       while (index >= 0) {
         const line = buffer.slice(0, index); buffer = buffer.slice(index + 1); index = buffer.indexOf("\\n");
-        if (!line) continue;
-        const command = JSON.parse(line);
+         if (!line) continue;
+         const command = JSON.parse(line);
+         appendFileSync(${JSON.stringify(rpcCommandsPath)}, JSON.stringify(command) + "\\n");
         const response = (data = {}) => process.stdout.write(JSON.stringify({ type: "response", id: command.id, success: true, data }) + "\\n");
          if (command.type === "get_state") response({ sessionId: process.argv[process.argv.length - 1].endsWith("main.jsonl") ? "pi-main" : "pi-session-real" });
           else if (command.type === "prompt" || command.type === "steer") {
             response();
-            if (command.message === "timeout") return;
-             if (command.message === "exit") { setTimeout(() => process.exit(2), 20); return; }
+             if (command.message === "timeout") return;
+              if (command.message === "exit") { setTimeout(() => process.exit(2), 20); return; }
+              if (command.message === "tool-transient") {
+                process.stdout.write(JSON.stringify({ type: "tool_execution_start", toolName: "workspace_write" }) + "\\n");
+                process.stdout.write(JSON.stringify({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "toolCall", id: "side-effect", name: "workspace_write", arguments: {} }], stopReason: "error", errorMessage: "fetch failed" }] }) + "\\n");
+                process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
+                return;
+              }
              if (command.message === "network-transient-exit") {
               let attempts = 0;
               try { attempts = Number(readFileSync(${JSON.stringify(networkRetryPath)}, "utf8")); } catch {}
@@ -87,6 +95,13 @@ test("PiCliHarness drives a persistent RPC session", async () => {
     assert.equal(session.sessionId, "pi-session-real");
     assert.equal(await harness.resumeSession(session), true);
     assert.equal(await harness.send(session, "hello"), "reply:hello");
+    const imageBytes = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+    assert.equal(await harness.send(session, "visual check", { images: [{ type: "image", data: imageBytes.toString("base64"), mimeType: "image/jpeg" }] }), "reply:visual check");
+    const rpcCommands = (await readFile(rpcCommandsPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as { type?: string; message?: string; images?: Array<{ type: string; data: string; mimeType: string }> });
+    assert.deepEqual(rpcCommands.find((item) => item.type === "prompt" && item.message === "visual check")?.images, [{ type: "image", data: imageBytes.toString("base64"), mimeType: "image/jpeg" }]);
+    await assert.rejects(harness.send(session, "tool-transient"), /fetch failed/);
+    const commandsAfterSideEffect = (await readFile(rpcCommandsPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as { type?: string; message?: string });
+    assert.equal(commandsAfterSideEffect.filter((item) => item.type === "prompt" && item.message === "tool-transient").length, 1);
     assert.equal(await harness.send(session, "transient"), "reply:transient");
     assert.equal(await harness.send(session, "transient-retries"), "reply:transient-retries");
     assert.equal(await harness.send(session, "network-transient-exit"), "reply:network-transient-exit");
