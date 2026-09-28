@@ -23,9 +23,9 @@
     "persona": ""
   },
   "paths": {
-    "gatewayState": "../.agent-home/runtime-state/gateway.sqlite",
-    "pluginData": "../.agent-home/runtime-state/plugin-data",
-    "backupDir": "../backups",
+    "gatewayState": ".agent-home/runtime-state/gateway.sqlite",
+    "pluginData": ".agent-home/runtime-state/plugin-data",
+    "backupDir": "backups",
     "stateRoot": "/state",
     "runtimeSocket": "/run/agent-home/control.sock"
   },
@@ -35,7 +35,17 @@
     "apiEndpoint": "http://127.0.0.1:3000",
     "reverseWebSocketPath": "/onebot/v11/ws",
     "reconnectMs": 2000,
-    "requestTimeoutMs": 15000
+    "requestTimeoutMs": 15000,
+    "deployment": {
+      "serviceBindAddress": "127.0.0.1",
+      "uiBindAddress": "0.0.0.0",
+      "httpPort": 3000,
+      "wsPort": 3001,
+      "webuiPort": 5100,
+      "novncPort": 6081,
+      "acceptEula": true,
+      "acceptPrivacy": true
+    }
   },
   "chat": {
     "global": {

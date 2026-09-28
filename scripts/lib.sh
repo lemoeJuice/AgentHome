@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Deployment defaults are fixed here so setup never depends on a user-maintained
+# Deployment defaults come from config.json; setup never depends on a separate
 # environment file or a host-specific binary path.
 if [[ -z "${ROOT_DIR:-}" ]]; then
   ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -30,21 +30,30 @@ AGENT_HOME_CONTAINER="${AGENT_HOME_CONTAINER:-agent-home-default}"
 export AGENT_HOME_IMAGE AGENT_HOME_BASE_IMAGE AGENT_HOME_VOLUME AGENT_HOME_NETWORK AGENT_HOME_CONTAINER
 export AGENT_HOME_HOST_SECRET_ROOT="${AGENT_HOME_HOST_SECRET_ROOT:-$ROOT_DIR/.agent-home}"
 
-SNOWLUMA_CONFIG_FILE="${SNOWLUMA_CONFIG_FILE:-$ROOT_DIR/config/snowluma.env}"
-if [[ ! -e "$SNOWLUMA_CONFIG_FILE" && -f "$ROOT_DIR/config/snowluma.env.example" ]]; then
-  cp "$ROOT_DIR/config/snowluma.env.example" "$SNOWLUMA_CONFIG_FILE"
-  chmod 600 "$SNOWLUMA_CONFIG_FILE"
-fi
-if [[ -r "$SNOWLUMA_CONFIG_FILE" ]]; then
-  while IFS='=' read -r config_key config_value; do
-    config_value="${config_value%$'\r'}"
-    [[ -z "$config_key" || "$config_key" == \#* ]] && continue
-    case "$config_key" in
-      SNOWLUMA_SERVICE_BIND_ADDRESS|SNOWLUMA_UI_BIND_ADDRESS|SNOWLUMA_HTTP_PORT|SNOWLUMA_WS_PORT|SNOWLUMA_WEBUI_PORT|SNOWLUMA_NOVNC_PORT|SNOWLUMA_ACCEPT_EULA|SNOWLUMA_ACCEPT_PRIVACY)
-        [[ -v "$config_key" ]] || printf -v "$config_key" '%s' "$config_value"
-        ;;
-    esac
-  done < "$SNOWLUMA_CONFIG_FILE"
+DEPLOYMENT_CONFIG_FILE="${AGENT_HOME_CONFIG:-$ROOT_DIR/config.json}"
+if [[ "$DEPLOYMENT_CONFIG_FILE" != /* ]]; then DEPLOYMENT_CONFIG_FILE="$ROOT_DIR/$DEPLOYMENT_CONFIG_FILE"; fi
+SNOWLUMA_CONFIG_SOURCE="$DEPLOYMENT_CONFIG_FILE"
+if [[ ! -r "$SNOWLUMA_CONFIG_SOURCE" ]]; then SNOWLUMA_CONFIG_SOURCE="$ROOT_DIR/config.example.json"; fi
+mapfile -t SNOWLUMA_DEPLOYMENT_SETTINGS < <(CONFIG_PATH="$SNOWLUMA_CONFIG_SOURCE" node --input-type=module -e '
+  import fs from "node:fs";
+  const config=JSON.parse(fs.readFileSync(process.env.CONFIG_PATH,"utf8"));
+  const deployment=config.snowluma?.deployment??{};
+  const values=[
+    deployment.serviceBindAddress??"127.0.0.1",
+    deployment.uiBindAddress??"0.0.0.0",
+    deployment.httpPort??3000,
+    deployment.wsPort??3001,
+    deployment.webuiPort??5100,
+    deployment.novncPort??6081,
+    deployment.acceptEula===false?"0":"1",
+    deployment.acceptPrivacy===false?"0":"1",
+  ];
+  if(values.some((value)=>String(value).includes("\n")||String(value).includes("\t")))process.exit(2);
+  process.stdout.write(values.map(String).join("\n"));
+')
+if ((${#SNOWLUMA_DEPLOYMENT_SETTINGS[@]} != 8)); then
+  printf '%s\n' "invalid SnowLuma deployment config: $SNOWLUMA_CONFIG_SOURCE" >&2
+  return 2 2>/dev/null || exit 2
 fi
 
 SNOWLUMA_IMAGE="docker.io/motricseven7/snowluma:latest"
@@ -74,14 +83,14 @@ if [[ -s "$ROOT_DIR/.agent-home/mcp-control-token" ]]; then
 fi
 SNOWLUMA_CONTAINER="${SNOWLUMA_CONTAINER:-snowluma}"
 SNOWLUMA_NETWORK="$AGENT_HOME_NETWORK"
-SNOWLUMA_SERVICE_BIND_ADDRESS="${SNOWLUMA_SERVICE_BIND_ADDRESS:-127.0.0.1}"
-SNOWLUMA_UI_BIND_ADDRESS="${SNOWLUMA_UI_BIND_ADDRESS:-0.0.0.0}"
-SNOWLUMA_HTTP_PORT="${SNOWLUMA_HTTP_PORT:-3000}"
-SNOWLUMA_WS_PORT="${SNOWLUMA_WS_PORT:-3001}"
-SNOWLUMA_WEBUI_PORT="${SNOWLUMA_WEBUI_PORT:-5100}"
-SNOWLUMA_NOVNC_PORT="${SNOWLUMA_NOVNC_PORT:-6081}"
-SNOWLUMA_ACCEPT_EULA="${SNOWLUMA_ACCEPT_EULA:-1}"
-SNOWLUMA_ACCEPT_PRIVACY="${SNOWLUMA_ACCEPT_PRIVACY:-1}"
+SNOWLUMA_SERVICE_BIND_ADDRESS="${SNOWLUMA_SERVICE_BIND_ADDRESS:-${SNOWLUMA_DEPLOYMENT_SETTINGS[0]}}"
+SNOWLUMA_UI_BIND_ADDRESS="${SNOWLUMA_UI_BIND_ADDRESS:-${SNOWLUMA_DEPLOYMENT_SETTINGS[1]}}"
+SNOWLUMA_HTTP_PORT="${SNOWLUMA_HTTP_PORT:-${SNOWLUMA_DEPLOYMENT_SETTINGS[2]}}"
+SNOWLUMA_WS_PORT="${SNOWLUMA_WS_PORT:-${SNOWLUMA_DEPLOYMENT_SETTINGS[3]}}"
+SNOWLUMA_WEBUI_PORT="${SNOWLUMA_WEBUI_PORT:-${SNOWLUMA_DEPLOYMENT_SETTINGS[4]}}"
+SNOWLUMA_NOVNC_PORT="${SNOWLUMA_NOVNC_PORT:-${SNOWLUMA_DEPLOYMENT_SETTINGS[5]}}"
+SNOWLUMA_ACCEPT_EULA="${SNOWLUMA_ACCEPT_EULA:-${SNOWLUMA_DEPLOYMENT_SETTINGS[6]}}"
+SNOWLUMA_ACCEPT_PRIVACY="${SNOWLUMA_ACCEPT_PRIVACY:-${SNOWLUMA_DEPLOYMENT_SETTINGS[7]}}"
 for snowluma_bind_address in "$SNOWLUMA_SERVICE_BIND_ADDRESS" "$SNOWLUMA_UI_BIND_ADDRESS"; do
   if [[ ! "$snowluma_bind_address" =~ ^[A-Za-z0-9.:-]+$ ]]; then
     printf '%s\n' "unsafe SnowLuma bind address: $snowluma_bind_address" >&2
@@ -94,20 +103,20 @@ for snowluma_consent in "$SNOWLUMA_ACCEPT_EULA" "$SNOWLUMA_ACCEPT_PRIVACY"; do
     *) printf '%s\n' 'SnowLuma consent settings must be 0, 1, true, or false' >&2; return 2 2>/dev/null || exit 2 ;;
   esac
 done
-export SNOWLUMA_CONFIG_FILE SNOWLUMA_CONTAINER SNOWLUMA_NETWORK SNOWLUMA_SERVICE_BIND_ADDRESS SNOWLUMA_UI_BIND_ADDRESS SNOWLUMA_HTTP_PORT SNOWLUMA_WS_PORT SNOWLUMA_WEBUI_PORT SNOWLUMA_NOVNC_PORT SNOWLUMA_ACCEPT_EULA SNOWLUMA_ACCEPT_PRIVACY
+export SNOWLUMA_CONTAINER SNOWLUMA_NETWORK SNOWLUMA_SERVICE_BIND_ADDRESS SNOWLUMA_UI_BIND_ADDRESS SNOWLUMA_HTTP_PORT SNOWLUMA_WS_PORT SNOWLUMA_WEBUI_PORT SNOWLUMA_NOVNC_PORT SNOWLUMA_ACCEPT_EULA SNOWLUMA_ACCEPT_PRIVACY
 
 agent_home_model_proxy_url() {
   if [[ -v AGENT_HOME_MODEL_PROXY_URL ]]; then
     printf '%s' "$AGENT_HOME_MODEL_PROXY_URL"
     return
   fi
-  local config_path="${AGENT_HOME_CONFIG:-$ROOT_DIR/config/agent-home.json}"
+  local config_path="${AGENT_HOME_CONFIG:-$ROOT_DIR/config.json}"
   if [[ "$config_path" != /* ]]; then config_path="$ROOT_DIR/$config_path"; fi
   CONFIG_PATH="$config_path" node --input-type=module -e 'import fs from "node:fs"; const config=JSON.parse(fs.readFileSync(process.env.CONFIG_PATH,"utf8")); const network=config.network??{}; if(Object.hasOwn(network,"modelProxyUrl")){process.stdout.write(network.modelProxyUrl??"");}else{const relay=network.proxyRelay??{enabled:true,listenPort:17890};process.stdout.write(relay.enabled===false?"":`http://host.containers.internal:${relay.listenPort??17890}`);}'
 }
 
 agent_home_proxy_relay_settings() {
-  local config_path="${AGENT_HOME_CONFIG:-$ROOT_DIR/config/agent-home.json}"
+  local config_path="${AGENT_HOME_CONFIG:-$ROOT_DIR/config.json}"
   if [[ "$config_path" != /* ]]; then config_path="$ROOT_DIR/$config_path"; fi
   CONFIG_PATH="$config_path" node --input-type=module -e 'import fs from "node:fs";const config=JSON.parse(fs.readFileSync(process.env.CONFIG_PATH,"utf8"));const relay=config.network?.proxyRelay??{enabled:true,listenPort:17890,upstreamHost:"127.0.0.1",upstreamPort:7897};const values=[relay.enabled===false?"0":"1",relay.listenPort??17890,relay.upstreamHost??"127.0.0.1",relay.upstreamPort??7897];if(values.some((value)=>String(value).includes("\n")||String(value).includes("\t")))process.exit(2);process.stdout.write(values.join("\t"));'
 }

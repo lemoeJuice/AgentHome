@@ -105,6 +105,37 @@ test("loadConfig exposes gateway and network endpoints as deployment settings", 
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test("loadConfig merges and validates SnowLuma container deployment settings", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-home-snowluma-deployment-config-"));
+  const configPath = join(root, "config.json");
+  try {
+    await writeFile(configPath, JSON.stringify({
+      instanceId: "snowluma-deployment-config",
+      snowluma: {
+        endpoint: "ws://snowluma",
+        apiEndpoint: "http://snowluma",
+        deployment: { serviceBindAddress: "127.0.0.2", httpPort: 3100, acceptEula: false },
+      },
+    }));
+    const config = await loadConfig(configPath);
+    assert.deepEqual(config.snowluma.deployment, {
+      serviceBindAddress: "127.0.0.2",
+      uiBindAddress: "0.0.0.0",
+      httpPort: 3100,
+      wsPort: 3001,
+      webuiPort: 5100,
+      novncPort: 6081,
+      acceptEula: false,
+      acceptPrivacy: true,
+    });
+    await writeFile(configPath, JSON.stringify({
+      instanceId: "snowluma-deployment-config",
+      snowluma: { endpoint: "ws://snowluma", apiEndpoint: "http://snowluma", deployment: { wsPort: 70000 } },
+    }));
+    await assert.rejects(loadConfig(configPath), /CONFIG_INVALID: snowluma\.deployment\.wsPort/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("loadConfig derives the container proxy endpoint from configurable relay ports", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-proxy-relay-config-"));
   const configPath = join(root, "agent-home.json");

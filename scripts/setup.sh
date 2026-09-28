@@ -10,7 +10,7 @@ node -e 'const [major, minor] = process.versions.node.split(".").map(Number); if
 if command -v pnpm >/dev/null; then PACKAGE_MANAGER=pnpm; elif command -v npm >/dev/null; then PACKAGE_MANAGER=npm; else printf '%s\n' 'missing dependency: pnpm or npm' >&2; exit 2; fi
 mkdir -p config "$AGENT_HOME_RUNTIME_DIR/plugin-data" backups
 mkdir -p .agent-home
-CONFIG_PATH="${AGENT_HOME_CONFIG:-$ROOT_DIR/config/agent-home.json}"
+CONFIG_PATH="${AGENT_HOME_CONFIG:-$ROOT_DIR/config.json}"
 if [[ "$CONFIG_PATH" != /* ]]; then CONFIG_PATH="$ROOT_DIR/$CONFIG_PATH"; fi
 case "$CONFIG_PATH" in "$ROOT_DIR"/*) ;; *) printf '%s\n' 'AGENT_HOME_CONFIG must be inside the project directory' >&2; exit 2 ;; esac
 mkdir -p "$(dirname "$CONFIG_PATH")"
@@ -43,7 +43,7 @@ if [[ ! -s .agent-home/mcp-control-token ]]; then
 fi
 export GATEWAY_MCP_TOKEN="$(<.agent-home/mcp-main-token)"
 export GATEWAY_MCP_CONTROL_TOKEN="$(<.agent-home/mcp-control-token)"
-if [[ ! -e "$CONFIG_PATH" ]]; then cp "$ROOT_DIR/config/agent-home.example.json" "$CONFIG_PATH"; chmod 600 "$CONFIG_PATH"; printf '%s\n' "created $CONFIG_PATH; set SnowLuma endpoints before starting" >&2; fi
+if [[ ! -e "$CONFIG_PATH" ]]; then cp "$ROOT_DIR/config.example.json" "$CONFIG_PATH"; chmod 600 "$CONFIG_PATH"; printf '%s\n' "created $CONFIG_PATH; set SnowLuma endpoints before starting" >&2; fi
 
 DEPS_FINGERPRINT="$(node --input-type=module -e 'import fs from "node:fs";import crypto from "node:crypto";const h=crypto.createHash("sha256");for(const p of ["package.json","pnpm-lock.yaml","package-lock.json"]){if(fs.existsSync(p)){h.update(p);h.update("\0");h.update(fs.readFileSync(p));h.update("\0")}}process.stdout.write(h.digest("hex"))')"
 DEPS_STAMP="$ROOT_DIR/.agent-home/host-deps-lock.sha256"
