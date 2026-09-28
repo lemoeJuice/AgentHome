@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PROXY_RELAY_PID_FILE="${AGENT_HOME_PROXY_RELAY_PID_FILE:-$ROOT_DIR/runtime-state/proxy-relay.pid}"
-PROXY_RELAY_SETTINGS_FILE="${AGENT_HOME_PROXY_RELAY_SETTINGS_FILE:-$ROOT_DIR/runtime-state/proxy-relay.settings}"
+source "$ROOT_DIR/scripts/lib.sh"
+PROXY_RELAY_PID_FILE="${AGENT_HOME_PROXY_RELAY_PID_FILE:-$AGENT_HOME_RUNTIME_DIR/proxy-relay.pid}"
+PROXY_RELAY_SETTINGS_FILE="${AGENT_HOME_PROXY_RELAY_SETTINGS_FILE:-$AGENT_HOME_RUNTIME_DIR/proxy-relay.settings}"
 if [[ -s "$PROXY_RELAY_PID_FILE" ]]; then
   PROXY_RELAY_PID="$(<"$PROXY_RELAY_PID_FILE")"
   if kill -0 "$PROXY_RELAY_PID" 2>/dev/null; then
@@ -13,7 +14,7 @@ if [[ -s "$PROXY_RELAY_PID_FILE" ]]; then
   rm -f "$PROXY_RELAY_PID_FILE"
 fi
 rm -f "$PROXY_RELAY_SETTINGS_FILE"
-PID_FILE="${AGENT_HOME_PID_FILE:-$ROOT_DIR/runtime-state/gateway.pid}"
+PID_FILE="${AGENT_HOME_PID_FILE:-$AGENT_HOME_RUNTIME_DIR/gateway.pid}"
 if [[ ! -s "$PID_FILE" ]]; then printf '%s\n' 'gateway is not running'; exit 0; fi
 PID="$(<"$PID_FILE")"
 if kill -0 "$PID" 2>/dev/null; then

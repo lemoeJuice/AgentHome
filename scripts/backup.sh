@@ -31,7 +31,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [[ -s "${AGENT_HOME_PID_FILE:-$ROOT_DIR/runtime-state/gateway.pid}" ]] && kill -0 "$(<"${AGENT_HOME_PID_FILE:-$ROOT_DIR/runtime-state/gateway.pid}")" 2>/dev/null; then
+if [[ -s "${AGENT_HOME_PID_FILE:-$AGENT_HOME_RUNTIME_DIR/gateway.pid}" ]] && kill -0 "$(<"${AGENT_HOME_PID_FILE:-$AGENT_HOME_RUNTIME_DIR/gateway.pid}")" 2>/dev/null; then
   GATEWAY_WAS_RUNNING=true
   "$ROOT_DIR/scripts/stop.sh"
 fi
@@ -42,11 +42,11 @@ if [[ "$($PODMAN container inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/n
   "$PODMAN" stop "$CONTAINER" >/dev/null
 fi
 
-if [[ -f runtime-state/gateway.sqlite ]]; then
-  node --input-type=module -e 'import { DatabaseSync } from "node:sqlite"; const db=new DatabaseSync(process.argv[1]); db.exec("PRAGMA wal_checkpoint(TRUNCATE)"); db.close();' runtime-state/gateway.sqlite
+if [[ -f "$AGENT_HOME_RUNTIME_DIR/gateway.sqlite" ]]; then
+  node --input-type=module -e 'import { DatabaseSync } from "node:sqlite"; const db=new DatabaseSync(process.argv[1]); db.exec("PRAGMA wal_checkpoint(TRUNCATE)"); db.close();' "$AGENT_HOME_RUNTIME_DIR/gateway.sqlite"
 fi
 RUNTIME_SCHEMA_VERSION="${AGENT_HOME_SCHEMA_VERSION:-19}"
-GATEWAY_SCHEMA_VERSION="$(node --input-type=module -e 'import { DatabaseSync } from "node:sqlite"; try { const db=new DatabaseSync(process.argv[1], { readOnly: true }); process.stdout.write(String(db.prepare("SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations").get().version ?? 0)); db.close(); } catch { process.stdout.write("0"); }' runtime-state/gateway.sqlite)"
+GATEWAY_SCHEMA_VERSION="$(node --input-type=module -e 'import { DatabaseSync } from "node:sqlite"; try { const db=new DatabaseSync(process.argv[1], { readOnly: true }); process.stdout.write(String(db.prepare("SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations").get().version ?? 0)); db.close(); } catch { process.stdout.write("0"); }' "$AGENT_HOME_RUNTIME_DIR/gateway.sqlite")"
 "$PODMAN" volume export "$VOLUME" -o "$DEST/state.tar"
 "$PODMAN" image exists "$AGENT_HOME_IMAGE" || { printf '%s\n' "agent home image is not available: $AGENT_HOME_IMAGE" >&2; exit 2; }
 "$PODMAN" save "$AGENT_HOME_IMAGE" -o "$DEST/image.tar"
@@ -55,9 +55,9 @@ for snowluma_volume in "${SNOWLUMA_VOLUMES[@]}"; do
     "$PODMAN" volume export "$snowluma_volume" -o "$DEST/$snowluma_volume.tar"
   fi
 done
-[[ -e runtime-state/gateway.sqlite ]] && cp runtime-state/gateway.sqlite "$DEST/gateway.sqlite"
-[[ -d runtime-state/plugin-data ]] && tar -czf "$DEST/plugin-data.tar.gz" -C runtime-state plugin-data
-[[ -d runtime-state/gateway-artifacts ]] && tar -czf "$DEST/gateway-artifacts.tar.gz" -C runtime-state gateway-artifacts
+[[ -e "$AGENT_HOME_RUNTIME_DIR/gateway.sqlite" ]] && cp "$AGENT_HOME_RUNTIME_DIR/gateway.sqlite" "$DEST/gateway.sqlite"
+[[ -d "$AGENT_HOME_RUNTIME_DIR/plugin-data" ]] && tar -czf "$DEST/plugin-data.tar.gz" -C "$AGENT_HOME_RUNTIME_DIR" plugin-data
+[[ -d "$AGENT_HOME_RUNTIME_DIR/gateway-artifacts" ]] && tar -czf "$DEST/gateway-artifacts.tar.gz" -C "$AGENT_HOME_RUNTIME_DIR" gateway-artifacts
 [[ -f "$ROOT_DIR/config/snowluma.env" ]] && cp "$ROOT_DIR/config/snowluma.env" "$DEST/snowluma.env" && chmod 600 "$DEST/snowluma.env"
 cp config/agent-home.example.json "$DEST/config.example.json"
 SECRET_FILES=()

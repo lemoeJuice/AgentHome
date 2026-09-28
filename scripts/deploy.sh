@@ -22,7 +22,7 @@ export AGENT_HOME_CONFIG="$CONFIG_PATH"
 
 printf '%s\n' '== Environment and update check =='
 if command -v pnpm >/dev/null; then PACKAGE_MANAGER=pnpm; elif command -v npm >/dev/null; then PACKAGE_MANAGER=npm; else fail 'pnpm or npm is required'; fi
-mkdir -p config runtime-state/plugin-data backups .agent-home
+mkdir -p config "$AGENT_HOME_RUNTIME_DIR/plugin-data" backups .agent-home
 if [[ ! -s node_modules/.modules.yaml && ! -d node_modules ]]; then
   printf '%s\n' 'host dependencies are missing; setup will install them'
 else

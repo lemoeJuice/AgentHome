@@ -3,7 +3,9 @@ dist/
 config/agent-home.json
 config/snowluma.env
 .agent-home/
-runtime-state/
+AGENT.md
+IMPLEMENTATION_LOG.md
+IMPLEMENTATION_TODO.md
 backups/
 *.sqlite
 *.sqlite-wal
