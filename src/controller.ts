@@ -233,16 +233,17 @@ export class PodmanController implements AgentEventController {
     await execFileAsync(this.podman, ["network", "exists", this.network]).catch(async () => { await execFileAsync(this.podman, ["network", "create", this.network]); });
     await execFileAsync(this.podman, ["volume", "exists", this.volume]).catch(async () => { await execFileAsync(this.podman, ["volume", "create", this.volume]); });
     const proxyArgs = Object.entries(proxyEnvironment(this.modelProxyUrl, `localhost,127.0.0.1,::1,host.containers.internal,snowluma,${this.containerName}`)).flatMap(([name, value]) => ["--env", `${name}=${value}`]);
-    await execFileAsync(this.podman, ["run", "-d", "--name", this.containerName, "--cap-add", "NET_ADMIN", "--env", `AGENT_HOME_MODEL_PROXY_URL=${this.modelProxyUrl ?? ""}`, ...(this.modelProxyUrl ? proxyArgs : []), "--volume", `${this.volume}:/state:Z,U`, "--network", this.network, this.image, "supervise"]);
+    await execFileAsync(this.podman, ["run", "-d", "--init", "--name", this.containerName, "--cap-add", "NET_ADMIN", "--env", `AGENT_HOME_MODEL_PROXY_URL=${this.modelProxyUrl ?? ""}`, ...(this.modelProxyUrl ? proxyArgs : []), "--volume", `${this.volume}:/state:Z,U`, "--network", this.network, this.image, "supervise"]);
   }
 
   private async validateContainerTopology(): Promise<void> {
     const result = await execFileAsync(this.podman, ["inspect", "-f", "{{json .}}", this.containerName]);
-    let inspected: { HostConfig?: { Privileged?: boolean; PidMode?: string; NetworkMode?: string; Binds?: string[]; CapAdd?: string[]; PortBindings?: Record<string, unknown> | null }; Mounts?: Array<{ Type?: string; Name?: string; Source?: string; Destination?: string }>; NetworkSettings?: { Ports?: Record<string, unknown> | null; Networks?: Record<string, unknown> } };
+    let inspected: { HostConfig?: { Privileged?: boolean; Init?: boolean; PidMode?: string; NetworkMode?: string; Binds?: string[]; CapAdd?: string[]; PortBindings?: Record<string, unknown> | null }; Mounts?: Array<{ Type?: string; Name?: string; Source?: string; Destination?: string }>; NetworkSettings?: { Ports?: Record<string, unknown> | null; Networks?: Record<string, unknown> } };
     try { inspected = JSON.parse(result.stdout) as typeof inspected; }
     catch { throw new Error("CONTAINER_TOPOLOGY_INSPECT_INVALID"); }
     const hostConfig = inspected.HostConfig ?? {};
     if (hostConfig.Privileged === true) throw new Error("CONTAINER_PRIVILEGED_FORBIDDEN");
+    if (hostConfig.Init !== true) throw new Error("CONTAINER_INIT_REQUIRED");
     if (!(hostConfig.CapAdd ?? []).some((capability) => capabilityName(capability) === "NET_ADMIN")) throw new Error("CONTAINER_GUEST_EGRESS_FILTER_CAPABILITY_REQUIRED");
     if (hostConfig.PidMode === "host") throw new Error("CONTAINER_HOST_PID_FORBIDDEN");
     if (hostConfig.NetworkMode === "host") throw new Error("CONTAINER_HOST_NETWORK_FORBIDDEN");

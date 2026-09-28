@@ -22,6 +22,13 @@ if "$PODMAN" container exists "$CONTAINER" && [[ "$($PODMAN container inspect -f
   "$PODMAN" rm -f "$CONTAINER" >/dev/null
 fi
 if "$PODMAN" container exists "$CONTAINER"; then
+  init_enabled="$($PODMAN container inspect -f '{{.HostConfig.Init}}' "$CONTAINER")"
+  [[ "$init_enabled" == true ]] || {
+    printf '%s\n' 'replacing existing Agent Home container without a child-reaping init process (state volume is retained)' >&2
+    "$PODMAN" rm -f "$CONTAINER" >/dev/null
+  }
+fi
+if "$PODMAN" container exists "$CONTAINER"; then
   cap_add="$($PODMAN container inspect -f '{{json .HostConfig.CapAdd}}' "$CONTAINER")"
   CAP_ADD_JSON="$cap_add" node --input-type=module -e 'const caps=JSON.parse(process.env.CAP_ADD_JSON||"null")||[];if(!caps.some((item)=>String(item).toUpperCase().replace(/^CAP_/,"")==="NET_ADMIN"))process.exit(1);' || {
     printf '%s\n' 'replacing existing Agent Home container without guest network filter capability (state volume is retained)' >&2
@@ -68,7 +75,7 @@ if "$PODMAN" container exists "$CONTAINER"; then
 fi
 
 if ! "$PODMAN" container exists "$CONTAINER"; then
-  run_args=(run -d --name "$CONTAINER" --cap-add NET_ADMIN --volume "${VOLUME}:/state:Z" --network "$NETWORK")
+  run_args=(run -d --init --name "$CONTAINER" --cap-add NET_ADMIN --volume "${VOLUME}:/state:Z" --network "$NETWORK")
   proxy_url="$(agent_home_model_proxy_url)"
   run_args+=(--env "AGENT_HOME_MODEL_PROXY_URL=$proxy_url")
   if [[ -n "$proxy_url" ]]; then
