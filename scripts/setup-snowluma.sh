@@ -19,7 +19,7 @@ NOVNC_PORT="$SNOWLUMA_NOVNC_PORT"
 ACCEPT_EULA="$SNOWLUMA_ACCEPT_EULA"
 ACCEPT_PRIVACY="$SNOWLUMA_ACCEPT_PRIVACY"
 NOFILE_ULIMIT="${SNOWLUMA_NOFILE_ULIMIT:-65536:524288}"
-CONFIG_PATH="${AGENT_HOME_CONFIG:-$ROOT_DIR/config/agent-home.json}"
+CONFIG_PATH="${AGENT_HOME_CONFIG:-$ROOT_DIR/config.json}"
 
 fail() {
   printf 'SnowLuma setup error: %s\n' "$1" >&2
@@ -36,7 +36,7 @@ case "$CONFIG_PATH" in
 esac
 mkdir -p "$(dirname "$CONFIG_PATH")"
 if [[ ! -f "$CONFIG_PATH" ]]; then
-  cp "$ROOT_DIR/config/agent-home.example.json" "$CONFIG_PATH"
+  cp "$ROOT_DIR/config.example.json" "$CONFIG_PATH"
   chmod 600 "$CONFIG_PATH"
 fi
 

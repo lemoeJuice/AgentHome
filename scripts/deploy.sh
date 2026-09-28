@@ -15,7 +15,7 @@ fail() {
 command -v node >/dev/null || fail 'node >= 22.5 is required'
 node -e 'const [major, minor] = process.versions.node.split(".").map(Number); if (major < 22 || (major === 22 && minor < 5)) process.exit(1)' || fail 'node >= 22.5 is required'
 
-CONFIG_PATH="${AGENT_HOME_CONFIG:-$ROOT_DIR/config/agent-home.json}"
+CONFIG_PATH="${AGENT_HOME_CONFIG:-$ROOT_DIR/config.json}"
 if [[ "$CONFIG_PATH" != /* ]]; then CONFIG_PATH="$ROOT_DIR/$CONFIG_PATH"; fi
 case "$CONFIG_PATH" in "$ROOT_DIR"/*) ;; *) fail 'AGENT_HOME_CONFIG must be inside the project directory' ;; esac
 export AGENT_HOME_CONFIG="$CONFIG_PATH"

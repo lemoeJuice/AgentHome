@@ -11,7 +11,7 @@ VOLUME="$AGENT_HOME_VOLUME"
 PODMAN="$PODMAN_COMMAND"
 CONTAINER="$AGENT_HOME_CONTAINER"
 SNOWLUMA_VOLUMES=(snowluma-gateway-data snowluma-client-config snowluma-client-data)
-CONFIG_PATH="${AGENT_HOME_CONFIG:-$ROOT_DIR/config/agent-home.json}"
+CONFIG_PATH="${AGENT_HOME_CONFIG:-$ROOT_DIR/config.json}"
 if [[ "$CONFIG_PATH" != /* ]]; then CONFIG_PATH="$ROOT_DIR/$CONFIG_PATH"; fi
 GATEWAY_WAS_RUNNING=false
 CONTAINER_WAS_RUNNING=false
@@ -58,8 +58,7 @@ done
 [[ -e "$AGENT_HOME_RUNTIME_DIR/gateway.sqlite" ]] && cp "$AGENT_HOME_RUNTIME_DIR/gateway.sqlite" "$DEST/gateway.sqlite"
 [[ -d "$AGENT_HOME_RUNTIME_DIR/plugin-data" ]] && tar -czf "$DEST/plugin-data.tar.gz" -C "$AGENT_HOME_RUNTIME_DIR" plugin-data
 [[ -d "$AGENT_HOME_RUNTIME_DIR/gateway-artifacts" ]] && tar -czf "$DEST/gateway-artifacts.tar.gz" -C "$AGENT_HOME_RUNTIME_DIR" gateway-artifacts
-[[ -f "$ROOT_DIR/config/snowluma.env" ]] && cp "$ROOT_DIR/config/snowluma.env" "$DEST/snowluma.env" && chmod 600 "$DEST/snowluma.env"
-cp config/agent-home.example.json "$DEST/config.example.json"
+cp config.example.json "$DEST/config.example.json"
 SECRET_FILES=()
 for secret in .agent-home/control-token .agent-home/artifact-transfer-secret .agent-home/gateway-artifact-transfer-secret .agent-home/mcp-main-token .agent-home/mcp-control-token .agent-home/mcp-worker-bindings.json .agent-home/snowluma-access-token .agent-home/snowluma-websocket-access-token; do
   [[ -f "$ROOT_DIR/$secret" ]] && SECRET_FILES+=("$secret")

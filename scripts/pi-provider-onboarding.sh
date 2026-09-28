@@ -6,7 +6,7 @@ source "$ROOT_DIR/scripts/lib.sh"
 
 CONTAINER="$AGENT_HOME_CONTAINER"
 PI_COMMAND="${PI_COMMAND:-pi}"
-CONFIG_PATH="${AGENT_HOME_CONFIG:-$ROOT_DIR/config/agent-home.json}"
+CONFIG_PATH="${AGENT_HOME_CONFIG:-$ROOT_DIR/config.json}"
 [[ "$CONFIG_PATH" == /* ]] || CONFIG_PATH="$ROOT_DIR/$CONFIG_PATH"
 PI_AGENT_DIR="$(CONFIG_PATH="$CONFIG_PATH" node --input-type=module -e 'import fs from "node:fs";let d="/state/model/pi/agent";try{d=JSON.parse(fs.readFileSync(process.env.CONFIG_PATH,"utf8")).runtime?.piAgentDir||d}catch{}if(d==="/state/home/.pi/agent")d="/state/model/pi/agent";process.stdout.write(d)')"
 if [[ "$("$PODMAN_COMMAND" container inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)" != true ]]; then

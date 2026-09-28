@@ -9,7 +9,7 @@ PODMAN="$PODMAN_COMMAND"
 CONTAINER="$AGENT_HOME_CONTAINER"
 SNOWLUMA_CONTAINER="${SNOWLUMA_CONTAINER:-snowluma}"
 SNOWLUMA_VOLUMES=(snowluma-gateway-data snowluma-client-config snowluma-client-data)
-CONFIG_PATH="${AGENT_HOME_CONFIG:-$ROOT_DIR/config/agent-home.json}"
+CONFIG_PATH="${AGENT_HOME_CONFIG:-$ROOT_DIR/config.json}"
 if [[ "$CONFIG_PATH" != /* ]]; then CONFIG_PATH="$ROOT_DIR/$CONFIG_PATH"; fi
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 STAGING_VOLUME="${VOLUME}.restore-${STAMP}"
@@ -136,7 +136,6 @@ if [[ -f "$BACKUP/deployment-secrets.tar.gz" ]]; then
   done
 fi
 if [[ -f "$BACKUP/deployment-config.json" ]]; then mkdir -p "$(dirname "$CONFIG_PATH")"; cp "$BACKUP/deployment-config.json" "$CONFIG_PATH"; chmod 600 "$CONFIG_PATH"; fi
-if [[ -f "$BACKUP/snowluma.env" ]]; then mkdir -p "$ROOT_DIR/config"; cp "$BACKUP/snowluma.env" "$ROOT_DIR/config/snowluma.env"; chmod 600 "$ROOT_DIR/config/snowluma.env"; fi
 for snowluma_volume in "${SNOWLUMA_VOLUMES[@]}"; do
   if [[ -f "$BACKUP/$snowluma_volume.tar" ]]; then
     "$PODMAN" volume inspect "$snowluma_volume" >/dev/null 2>&1 || "$PODMAN" volume create "$snowluma_volume" >/dev/null

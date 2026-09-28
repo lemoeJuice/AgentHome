@@ -21,6 +21,16 @@ export interface AppConfig {
     reverseWebSocketPath: string;
     reconnectMs: number;
     requestTimeoutMs: number;
+    deployment: {
+      serviceBindAddress: string;
+      uiBindAddress: string;
+      httpPort: number;
+      wsPort: number;
+      webuiPort: number;
+      novncPort: number;
+      acceptEula: boolean;
+      acceptPrivacy: boolean;
+    };
   };
   chat: {
     global: { commandRequireMention: boolean; naturalLanguageMode: "observe_all" | "explicit_wake" };
@@ -54,6 +64,16 @@ const defaults: AppConfig = {
     reverseWebSocketPath: "/onebot/v11/ws",
     reconnectMs: 2000,
     requestTimeoutMs: 15000,
+    deployment: {
+      serviceBindAddress: "127.0.0.1",
+      uiBindAddress: "0.0.0.0",
+      httpPort: 3000,
+      wsPort: 3001,
+      webuiPort: 5100,
+      novncPort: 6081,
+      acceptEula: true,
+      acceptPrivacy: true,
+    },
   },
   chat: {
     global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" },
@@ -82,7 +102,7 @@ function merge<T>(base: T, value: Partial<T>): T {
   return output as T;
 }
 
-export async function loadConfig(path = process.env.AGENT_HOME_CONFIG ?? "./config/agent-home.json"): Promise<AppConfig> {
+export async function loadConfig(path = process.env.AGENT_HOME_CONFIG ?? "./config.json"): Promise<AppConfig> {
   const configPath = resolve(path);
   const configDirectory = dirname(configPath);
   let fileConfig: Partial<AppConfig> = {};
@@ -136,6 +156,9 @@ export function validateConfig(config: AppConfig): void {
   const required = [config.instanceId, config.snowluma.endpoint, config.snowluma.apiEndpoint];
   if (required.some((value) => !value)) throw new Error("CONFIG_MISSING: instance and SnowLuma endpoints are required");
   if (config.owners?.some((owner) => !owner.platform || !owner.accountId || !owner.userId)) throw new Error("CONFIG_INVALID: owners");
+  for (const key of ["serviceBindAddress", "uiBindAddress"] as const) if (!/^[A-Za-z0-9.:-]+$/.test(config.snowluma.deployment[key])) throw new Error(`CONFIG_INVALID: snowluma.deployment.${key}`);
+  for (const key of ["httpPort", "wsPort", "webuiPort", "novncPort"] as const) if (!Number.isInteger(config.snowluma.deployment[key]) || config.snowluma.deployment[key] < 1 || config.snowluma.deployment[key] > 65535) throw new Error(`CONFIG_INVALID: snowluma.deployment.${key}`);
+  if (typeof config.snowluma.deployment.acceptEula !== "boolean" || typeof config.snowluma.deployment.acceptPrivacy !== "boolean") throw new Error("CONFIG_INVALID: snowluma.deployment consent");
   if (typeof config.network.proxyRelay.enabled !== "boolean") throw new Error("CONFIG_INVALID: network.proxyRelay.enabled");
   for (const key of ["listenPort", "upstreamPort"] as const) if (!Number.isInteger(config.network.proxyRelay[key]) || config.network.proxyRelay[key] < 1 || config.network.proxyRelay[key] > 65535) throw new Error(`CONFIG_INVALID: network.proxyRelay.${key}`);
   if (!/^[A-Za-z0-9.:-]+$/.test(config.network.proxyRelay.upstreamHost)) throw new Error("CONFIG_INVALID: network.proxyRelay.upstreamHost");
