@@ -544,24 +544,23 @@ SnowLuma sees /state/artifacts/xxx
 
 # 19. QQ Inbound File
 
+本节描述的是 **Main 决定读取附件之后**的导入与授权路径，不是 Main turn 的启动前置条件。
+Router 只按唤醒策略判断是否形成 Main turn，并传递文本摘要及可信消息引用；不得
+为了检查或登记附件而提前下载附件。Main 可以仅凭摘要回答，也可以按需调用
+SnowLuma MCP 的原生 OneBot action 查询消息、历史或下载附件。
+
 流程：
 
 ```text
-Chat Platform attachment
+Main invokes a SnowLuma MCP Stream Action
 ↓
-SnowLuma event/reference
+Runtime validates the returned file is inside the MCP download root
 ↓
-Router / Runtime metadata
+stream into Artifact Service
 ↓
-authorized ingest request
+validate size, source scope and content metadata
 ↓
-Artifact Service
-↓
-download/stream
-↓
-validate
-↓
-Task/Main scoped Artifact
+on-demand Main/Task scoped ArtifactRef
 ```
 
 Runtime 不信任：
