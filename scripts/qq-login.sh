@@ -48,9 +48,9 @@ decode_screen_qr() {
   read -r width height <<<"$size"
   [[ "$width" =~ ^[0-9]+$ && "$height" =~ ^[0-9]+$ ]] || return 1
   if command -v magick >/dev/null; then
-    magick "$QR_SCREENSHOT" -depth 8 rgba:- | python3 "$ROOT_DIR/scripts/qr-decode.py" "$width" "$height"
+    magick "$QR_SCREENSHOT" -depth 8 rgba:- | python3 "$ROOT_DIR/scripts/qq/qr-decode.py" "$width" "$height"
   else
-    convert "$QR_SCREENSHOT" -depth 8 rgba:- | python3 "$ROOT_DIR/scripts/qr-decode.py" "$width" "$height"
+    convert "$QR_SCREENSHOT" -depth 8 rgba:- | python3 "$ROOT_DIR/scripts/qq/qr-decode.py" "$width" "$height"
   fi
 }
 
@@ -66,7 +66,7 @@ print_qr() {
 
 click_desktop() {
   local x="$1" y="$2"
-  "$PODMAN" cp "$ROOT_DIR/scripts/x11-click.py" "$CONTAINER:/tmp/agent-home-x11-click.py" >/dev/null
+  "$PODMAN" cp "$ROOT_DIR/scripts/qq/x11-click.py" "$CONTAINER:/tmp/agent-home-x11-click.py" >/dev/null
   "$PODMAN" exec -e DISPLAY="$DISPLAY_VALUE" "$CONTAINER" python3 /tmp/agent-home-x11-click.py "$x" "$y"
 }
 
