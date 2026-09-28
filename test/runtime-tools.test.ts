@@ -66,6 +66,11 @@ test("Main Pi exposes only service tools and prompt text cannot add a shell acti
   assert.ok(names.includes("list_snowluma_actions"));
   assert.ok(names.includes("get_snowluma_action"));
   assert.ok(names.includes("invoke_snowluma_action"));
+  assert.equal(names.includes("get_current_message"), false);
+  assert.equal(names.includes("get_message"), false);
+  assert.equal(names.includes("get_reply_context"), false);
+  assert.equal(names.includes("get_history"), false);
+  assert.equal(names.includes("get_attachment"), false);
   assert.ok(spawnWorker);
   assert.equal("workspaceAccess" in (spawnWorker.parameters.properties as Record<string, unknown>), false);
   assert.equal("requestedCapabilities" in (spawnWorker.parameters.properties as Record<string, unknown>), false);
@@ -122,13 +127,13 @@ test("Worker Pi exposes only Runtime-brokered Principal execution and workspace 
   assert.equal(names.includes("write"), false);
 });
 
-test("Main attachment tool returns authorized images as Pi image content blocks", async () => {
+test("native SnowLuma stream action results return ArtifactRefs and image content blocks", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-main-image-tool-"));
   const socketPath = join(root, "tools.sock");
   const token = "main-image-token";
   const image = { type: "image" as const, data: Buffer.from([0xff, 0xd8, 0xff]).toString("base64"), mimeType: "image/jpeg" };
   const server = new RuntimeToolServer(socketPath, (candidate) => candidate === token ? context : undefined, async (action) => {
-    assert.equal(action, "get_attachment");
+    assert.equal(action, "invoke_snowluma_action");
     return { ref: { authority: "agent-home", artifactId: "artifact-image" }, filename: "image.jpg", imageInput: image };
   });
   const previousSocket = process.env.AGENT_HOME_RUNTIME_TOOL_SOCKET;
@@ -139,9 +144,9 @@ test("Main attachment tool returns authorized images as Pi image content blocks"
   try {
     const definitions = new Map<string, Parameters<Parameters<typeof registerAgentHomeTools>[0]["registerTool"]>[0]>();
     registerAgentHomeTools({ registerTool: (definition) => { definitions.set(definition.name, definition); } });
-    const getAttachment = definitions.get("get_attachment");
-    assert.ok(getAttachment);
-    const result = await getAttachment.execute("call", { attachment: { type: "image", id: "image-id" } }, new AbortController().signal);
+    const invokeAction = definitions.get("invoke_snowluma_action");
+    assert.ok(invokeAction);
+    const result = await invokeAction.execute("call", { action: "download_file_image_stream", params: { file_id: "image-id" } }, new AbortController().signal);
     assert.match(result.content[0]?.text ?? "", /artifact-image/);
     assert.equal(result.content[1]?.type, "image");
     assert.deepEqual(result.content[1], image);

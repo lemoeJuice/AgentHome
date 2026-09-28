@@ -83,7 +83,17 @@ export class SnowLumaQQCapability {
     const result = await this.mcp.invokeAction<{ file_path?: string; file_size?: number }>("download_file_stream", { file_id: attachment.id });
     if (!result.file_path) throw new Error("ATTACHMENT_PATH_UNAVAILABLE");
     const filePath = await this.authorizedStreamPath(result.file_path);
-    return { filename: attachment.filename ?? attachment.id ?? "attachment", ...(attachment.mime ? { mime: attachment.mime } : {}), ...(result.file_size !== undefined ? { size: result.file_size } : {}), stream: this.readAndRemove(filePath) };
+    return { filename: attachment.filename ?? attachment.id, ...(attachment.mime ? { mime: attachment.mime } : {}), ...(result.file_size !== undefined ? { size: result.file_size } : {}), stream: this.readAndRemove(filePath) };
+  }
+
+  async readNativeStreamDownload(result: unknown): Promise<ArtifactTransfer> {
+    if (!result || typeof result !== "object" || Array.isArray(result)) throw new Error("SNOWLUMA_STREAM_RESULT_INVALID");
+    const value = result as Record<string, unknown>;
+    if (typeof value.file_path !== "string" || !value.file_path) throw new Error("SNOWLUMA_STREAM_FILE_PATH_MISSING");
+    const filePath = await this.authorizedStreamPath(value.file_path);
+    const filename = typeof value.filename === "string" ? value.filename : basename(filePath);
+    const size = typeof value.file_size === "number" && Number.isSafeInteger(value.file_size) ? value.file_size : (await stat(filePath)).size;
+    return { filename, size, stream: this.readAndRemove(filePath) };
   }
 
   private async artifactFile(ref: ArtifactRef, authorization: { conversationId: string; capabilities: CapabilitySet; taskId?: string }): Promise<string> {
@@ -110,16 +120,6 @@ export class SnowLumaQQCapability {
     }
   }
 
-  private assertReadable(authorization: QQReadAuthorization | undefined): asserts authorization is QQReadAuthorization {
-    if (!authorization) throw new Error("QQ_READ_AUTHORIZATION_REQUIRED");
-    const decision = authorizeRead(authorization.capabilities, authorization.conversationId);
-    if (!decision.allowed) throw new Error(`QQ_READ_DENIED:${decision.reason}`);
-  }
-
-  private assertTarget(authorization: QQReadAuthorization, target: ConversationAddress): void {
-    if (authorization.target && (authorization.target.platform !== target.platform || authorization.target.accountId !== target.accountId || authorization.target.kind !== target.kind || authorization.target.platformConversationId !== target.platformConversationId || JSON.stringify(authorization.target.threadId) !== JSON.stringify(target.threadId))) throw new Error("QQ_READ_TARGET_MISMATCH");
-  }
-
   private async authorizedStreamPath(filePath: string): Promise<string> {
     let root: string;
     let candidate: string;
@@ -136,6 +136,16 @@ export class SnowLumaQQCapability {
     return candidate;
   }
 
+  private assertReadable(authorization: QQReadAuthorization | undefined): asserts authorization is QQReadAuthorization {
+    if (!authorization) throw new Error("QQ_READ_AUTHORIZATION_REQUIRED");
+    const decision = authorizeRead(authorization.capabilities, authorization.conversationId);
+    if (!decision.allowed) throw new Error(`QQ_READ_DENIED:${decision.reason}`);
+  }
+
+  private assertTarget(authorization: QQReadAuthorization, target: ConversationAddress): void {
+    if (authorization.target && (authorization.target.platform !== target.platform || authorization.target.accountId !== target.accountId || authorization.target.kind !== target.kind || authorization.target.platformConversationId !== target.platformConversationId || JSON.stringify(authorization.target.threadId) !== JSON.stringify(target.threadId))) throw new Error("QQ_READ_TARGET_MISMATCH");
+  }
+
   private async *readAndRemove(filePath: string): AsyncIterable<Uint8Array> {
     try {
       for await (const chunk of createReadStream(filePath)) yield chunk as Uint8Array;
@@ -145,10 +155,10 @@ export class SnowLumaQQCapability {
   }
 }
 
+type QQReadAuthorization = { conversationId: string; capabilities: CapabilitySet; target: ConversationAddress };
+
 function safeOutboundFilename(value: string): string {
   const name = value.replaceAll("\\", "/").split("/").pop()?.replace(/[\u0000-\u001f]/g, "_").trim().slice(0, 180);
   if (!name || name === "." || name === "..") throw new Error("ARTIFACT_FILENAME_INVALID");
   return name;
 }
-
-type QQReadAuthorization = { conversationId: string; capabilities: CapabilitySet; target: ConversationAddress };

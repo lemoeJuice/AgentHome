@@ -117,8 +117,9 @@ test("main turns are durable and serialized per conversation", async () => {
     assert.equal(prompts.filter((prompt) => prompt.includes("first message")).length, 1);
     assert.equal(prompts.filter((prompt) => prompt.includes("second message")).length, 1);
     assert.ok(prompts.findIndex((prompt) => prompt.includes("first message")) < prompts.findIndex((prompt) => prompt.includes("second message")));
-    assert.match(prompts[0] ?? "", /Always call get_current_message before answering any user-triggered message/);
-    assert.match(prompts[0] ?? "", /Current message reference \(trusted routing metadata, not message content\)/);
+    assert.match(prompts[0] ?? "", /The trigger summary is the user-message content for this turn/);
+    assert.doesNotMatch(prompts[0] ?? "", /Always call get_current_message/);
+    assert.match(prompts[0] ?? "", /currentMessageId/);
     assert.ok(maxActiveTurns >= 2);
     assert.equal(runtime.db.get<{ count: number }>("SELECT count(*) AS count FROM main_turn_queue WHERE status='DONE'")?.count, 3);
     const ownerContext = [...internals.mainToolContexts.values()].find((context) => context.requesterId === "owner");
@@ -171,7 +172,7 @@ test("runtime outbound intents recover after failed delivery", async () => {
   } finally { await second.stop(); await rm(root, { recursive: true, force: true }); }
 });
 
-test("Main lazy QQ tools enforce the current conversation read capability", async () => {
+test("Main uses native SnowLuma actions and on-demand stream downloads become Artifacts", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-main-qq-tools-"));
   const config = { instanceId: "main-qq-tools", owner: { platform: "qq", accountId: "a", userId: "owner" }, paths: { gatewayState: join(root, "gateway.sqlite"), pluginData: join(root, "plugins"), backupDir: join(root, "backups"), stateRoot: root, runtimeSocket: join(root, "run.sock") }, snowluma: { accountId: "a", endpoint: "ws://127.0.0.1:1", apiEndpoint: "http://127.0.0.1:1", accessTokenEnv: "NO_TOKEN", reverseWebSocketPath: "/ws", reconnectMs: 10, requestTimeoutMs: 10 }, chat: { global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, conversationOverrides: {} }, runtime: { maxInFlight: 2, maxWorkers: 1, maxArtifactBytes: 100000, piCommand: "missing-pi", piTimeoutMs: 100 }, plugins: { enabled: [] }, logging: { level: "error" } } as AppConfig;
   const runtime = new RuntimeApp(config, logger);
@@ -181,7 +182,7 @@ test("Main lazy QQ tools enforce the current conversation read capability", asyn
   const internals = runtime as unknown as {
     getOrCreateConversation: (value: ConversationAddress, principal: { principalId: string; trust: "OWNER" | "GUEST" }) => { id: string; address: ConversationAddress; trust: "OWNER" | "GUEST" };
     handleMainTool: (action: string, input: unknown, context: unknown) => Promise<unknown>;
-    qq: { getMessage: (value: PlatformMessageRef) => Promise<unknown>; getHistory: (query: unknown) => Promise<unknown>; fetchAttachment: (value: unknown, authorization: unknown) => Promise<unknown> };
+    qq: { readNativeStreamDownload: (value: unknown) => Promise<{ filename: string; mime?: string; size?: number; stream: AsyncIterable<Uint8Array> }> };
     snowlumaMcp: {
       listActions: (category?: string) => Promise<unknown>;
       searchActions: (query: string) => Promise<unknown>;
@@ -193,9 +194,9 @@ test("Main lazy QQ tools enforce the current conversation read capability", asyn
   };
   const conversation = internals.getOrCreateConversation(address, { principalId: "principal:test", trust: "OWNER" });
   internals.getOrCreateConversation(otherAddress, { principalId: "principal:other", trust: "GUEST" });
+  const imageBytes = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
   internals.qq = {
-    getMessage: async (value) => ({ ref: value, payload: { text: "authorized" } }),
-    getHistory: async (query) => [{ query, payload: { text: "history" } }],
+    readNativeStreamDownload: async () => ({ filename: "image.jpg", size: imageBytes.byteLength, stream: (async function* () { yield imageBytes; })() }),
   };
   const snowlumaCalls: Array<{ tool: string; action?: string; params?: Record<string, unknown> }> = [];
   internals.snowlumaMcp = {
@@ -203,7 +204,7 @@ test("Main lazy QQ tools enforce the current conversation read capability", asyn
     searchActions: async (query) => { snowlumaCalls.push({ tool: "search_actions", params: { query } }); return [{ name: "send_private_msg" }]; },
     getAction: async (name) => { snowlumaCalls.push({ tool: "get_action", action: name }); return { name, inputSchema: { type: "object" } }; },
     queryAction: async (action, params) => { snowlumaCalls.push({ tool: "query_action", action, params }); return { action, params }; },
-    invokeAction: async (action, params) => { snowlumaCalls.push({ tool: "invoke_action", action, params }); return { action, accepted: true }; },
+    invokeAction: async (action, params) => { snowlumaCalls.push({ tool: "invoke_action", action, params }); return action.startsWith("download_file_") ? { file_path: "/state/snowluma/mcp/streams/image.jpg", file_size: imageBytes.byteLength } : { action, accepted: true }; },
     stop: async () => {},
   };
   const capabilities = {
@@ -212,23 +213,12 @@ test("Main lazy QQ tools enforce the current conversation read capability", asyn
    const context = { conversationId: conversation.id, requesterId: "owner", requester: { platform: "qq", accountId: "a", userId: "owner" }, trust: "OWNER", address, capabilities, eventId: "artifact-event", message: ref, replyTo: { ...ref, messageId: "7" } };
   try {
     const artifact = await runtime.artifacts.ingestAttachment({ stream: (async function* () { yield Buffer.from("authorized artifact"); })(), filename: "note.txt", mime: "text/plain", conversationId: conversation.id, requesterId: "owner", eventId: "artifact-event", maxBytes: 1000 });
-    assert.deepEqual(await internals.handleMainTool("get_message", { ref }, context), { ref, payload: { text: "authorized" } });
-    assert.deepEqual(await internals.handleMainTool("get_current_message", {}, context), { ref, payload: { text: "authorized" } });
-    assert.deepEqual(await internals.handleMainTool("get_reply_context", {}, context), { ref: { ...ref, messageId: "7" }, payload: { text: "authorized" } });
-    const historicalRef = { ...ref, messageId: "41" };
-    internals.qq = {
-      getMessage: async (value) => ({ message: { attachments: [{ type: "image", id: "image-history" }] }, ref: value }),
-      getHistory: async (query) => [{ query, message: { ref: historicalRef, attachments: [{ type: "image", id: "image-history" }] } }],
-      fetchAttachment: async () => ({ filename: "misleading.png", mime: "application/octet-stream", stream: (async function* () { yield Buffer.from([0xff, 0xd8, 0xff, 0xd9]); })() }),
-    };
-    const history = await internals.handleMainTool("get_history", { limit: 3 }, context) as Array<{ query: { limit: number }; message: { ref: PlatformMessageRef; attachments: Array<{ type: string; id: string }> } }>;
-    assert.equal(history[0]?.query.limit, 3);
-    const fetched = await internals.handleMainTool("get_attachment", { attachment: history[0]!.message.attachments[0], messageRef: history[0]!.message.ref }, context) as { filename: string; mime: string; ref: { artifactId: string }; imageInput: { type: string; data: string; mimeType: string } };
-    assert.equal(fetched.filename, "misleading.png");
+    const fetched = await internals.handleMainTool("invoke_snowluma_action", { action: "download_file_image_stream", params: { file_id: "image-history" } }, context) as { filename: string; mime: string; ref: { artifactId: string }; imageInput: { type: string; data: string; mimeType: string } };
+    assert.equal(fetched.filename, "image.jpg");
     assert.equal(fetched.mime, "image/jpeg");
     assert.equal(fetched.imageInput.type, "image");
     assert.equal(fetched.imageInput.mimeType, "image/jpeg");
-    assert.equal(fetched.imageInput.data, Buffer.from([0xff, 0xd8, 0xff, 0xd9]).toString("base64"));
+    assert.equal(fetched.imageInput.data, imageBytes.toString("base64"));
     assert.ok(runtime.artifacts.get({ authority: "agent-home", artifactId: fetched.ref.artifactId }));
     assert.equal((await internals.handleMainTool("read_artifact", { ref: artifact.ref }, context) as { content: string }).content, "authorized artifact");
     assert.deepEqual(await internals.handleMainTool("list_snowluma_actions", { category: "消息" }, context), [{ name: "send_private_msg", category: "消息" }]);
@@ -238,11 +228,11 @@ test("Main lazy QQ tools enforce the current conversation read capability", asyn
     assert.deepEqual(await internals.handleMainTool("invoke_snowluma_action", { action: "send_private_msg", params: { user_id: 1234, message: [{ type: "text", data: { text: "hi" } }] } }, context), { action: "send_private_msg", accepted: true });
     const guestCaps = deriveCapabilities({ platform: "qq", accountId: "a", userId: "guest", principalId: "principal:guest", trust: "GUEST", conversationId: conversation.id }, address, config.owner, conversation.id);
     await assert.rejects(() => internals.handleMainTool("invoke_snowluma_action", { action: "send_private_msg", params: { user_id: 1234 } }, { ...context, requesterId: "guest", requester: { platform: "qq", accountId: "a", userId: "guest", principalId: "principal:guest" }, trust: "GUEST", capabilities: guestCaps }), /SNOWLUMA_OWNER_REQUIRED/);
-    assert.equal(snowlumaCalls.filter((call) => call.tool === "invoke_action").length, 1);
+    assert.equal(snowlumaCalls.filter((call) => call.tool === "invoke_action").length, 2);
     assert.equal(runtime.db.get<{ count: number }>("SELECT count(*) AS count FROM authorization_audit_events WHERE operation='snowluma.invoke_action' AND decision='DENY'")?.count, 1);
-    await assert.rejects(() => internals.handleMainTool("get_message", { ref: { ...ref, platformConversationId: "group-2" } }, context), /QQ_READ_DENIED/);
+    await assert.rejects(() => internals.handleMainTool("get_current_message", {}, context), /TOOL_NOT_FOUND/);
     await assert.rejects(() => internals.handleMainTool("read_artifact", { ref: artifact.ref }, { ...context, conversationId: "other-conversation" }), /ARTIFACT_CONVERSATION_READ_DENIED/);
-    await assert.rejects(() => internals.handleMainTool("get_history", {}, { ...context, address: { ...address, kind: "private", platformConversationId: "owner" } }), /QQ_HISTORY_NOT_IMPLEMENTED/);
+    assert.ok(snowlumaCalls.some((call) => call.tool === "invoke_action" && call.action === "download_file_image_stream"));
   } finally {
     await runtime.stop();
     await rm(root, { recursive: true, force: true });
