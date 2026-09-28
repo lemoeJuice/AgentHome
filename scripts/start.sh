@@ -3,6 +3,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 source "$ROOT_DIR/scripts/lib.sh"
+umask 077
 mkdir -p "$AGENT_HOME_RUNTIME_DIR"
 PROXY_RELAY_PID_FILE="${AGENT_HOME_PROXY_RELAY_PID_FILE:-$AGENT_HOME_RUNTIME_DIR/proxy-relay.pid}"
 PROXY_RELAY_SETTINGS_FILE="${AGENT_HOME_PROXY_RELAY_SETTINGS_FILE:-$AGENT_HOME_RUNTIME_DIR/proxy-relay.settings}"
@@ -33,9 +34,19 @@ else
   rm -f "$PROXY_RELAY_PID_FILE" "$PROXY_RELAY_SETTINGS_FILE"
   printf '%s\n' 'proxy relay disabled by configuration'
 fi
+if "$PODMAN_COMMAND" container exists "$AGENT_HOME_CONTAINER"; then
+  if [[ "$("$PODMAN_COMMAND" container inspect -f '{{.State.Running}}' "$AGENT_HOME_CONTAINER")" != true ]]; then
+    "$PODMAN_COMMAND" start "$AGENT_HOME_CONTAINER" >/dev/null
+    printf 'Agent Home container started (%s)\n' "$AGENT_HOME_CONTAINER"
+  else
+    printf 'Agent Home container already running (%s)\n' "$AGENT_HOME_CONTAINER"
+  fi
+else
+  printf 'Agent Home container does not exist: %s (run scripts/deploy.sh first)\n' "$AGENT_HOME_CONTAINER" >&2
+  exit 1
+fi
 PID_FILE="${AGENT_HOME_PID_FILE:-$AGENT_HOME_RUNTIME_DIR/gateway.pid}"
 if [[ -s "$PID_FILE" ]] && kill -0 "$(<"$PID_FILE")" 2>/dev/null; then printf '%s\n' 'gateway already running'; exit 0; fi
-if command -v pnpm >/dev/null; then RUNNER=pnpm; else RUNNER=npm; fi
-nohup "$RUNNER" run gateway >"${AGENT_HOME_GATEWAY_LOG:-$AGENT_HOME_RUNTIME_DIR/gateway.log}" 2>&1 &
+nohup node "$ROOT_DIR/dist/cli.js" gateway >"${AGENT_HOME_GATEWAY_LOG:-$AGENT_HOME_RUNTIME_DIR/gateway.log}" 2>&1 &
 printf '%s\n' "$!" >"$PID_FILE"
 printf 'gateway started (pid %s)\n' "$!"
