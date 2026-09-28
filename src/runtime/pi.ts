@@ -92,7 +92,7 @@ type RpcProcess = {
   lastRpcEventType?: string;
 };
 
-export const PI_MAX_NETWORK_RETRIES = 10;
+export const PI_MAX_NETWORK_RETRIES = 5;
 
 export class PiCliHarness implements PiHarness {
   private readonly command: string;

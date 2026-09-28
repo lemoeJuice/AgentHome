@@ -155,7 +155,7 @@ test("PiCliHarness drives a persistent RPC session", async () => {
 });
 
 test("Pi network failures produce actionable categories", () => {
-  assert.equal(PI_MAX_NETWORK_RETRIES, 10);
+  assert.equal(PI_MAX_NETWORK_RETRIES, 5);
   assert.equal(piNetworkFailureHint(new Error("fetch failed: ECONNRESET")), "与模型服务的连接被重置");
   assert.equal(piNetworkFailureHint(new Error("fetch failed")), "模型服务网络请求失败（fetch failed）");
   assert.equal(piNetworkFailureHint(new Error("PI_EXIT:1:ECONNRESET")), "与模型服务的连接被重置");
