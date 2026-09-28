@@ -101,7 +101,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [[ -s "${AGENT_HOME_PID_FILE:-$ROOT_DIR/runtime-state/gateway.pid}" ]] && kill -0 "$(<"${AGENT_HOME_PID_FILE:-$ROOT_DIR/runtime-state/gateway.pid}")" 2>/dev/null; then GATEWAY_WAS_RUNNING=true; "$ROOT_DIR/scripts/stop.sh"; fi
+if [[ -s "${AGENT_HOME_PID_FILE:-$AGENT_HOME_RUNTIME_DIR/gateway.pid}" ]] && kill -0 "$(<"${AGENT_HOME_PID_FILE:-$AGENT_HOME_RUNTIME_DIR/gateway.pid}")" 2>/dev/null; then GATEWAY_WAS_RUNNING=true; "$ROOT_DIR/scripts/stop.sh"; fi
 if "$PODMAN" container exists "$CONTAINER"; then
   CONTAINER_WAS_PRESENT=true
   if [[ "$($PODMAN container inspect -f '{{.State.Running}}' "$CONTAINER")" == true ]]; then CONTAINER_WAS_RUNNING=true; "$PODMAN" stop "$CONTAINER" >/dev/null; fi
@@ -124,10 +124,10 @@ fi
 "$PODMAN" volume rename "$STAGING_VOLUME" "$VOLUME" >/dev/null
 STAGING_VOLUME_CREATED=false
 
-mkdir -p "$ROOT_DIR/runtime-state"
-if [[ -f "$BACKUP/gateway.sqlite" ]]; then cp "$BACKUP/gateway.sqlite" "$ROOT_DIR/runtime-state/gateway.sqlite.tmp"; mv -f "$ROOT_DIR/runtime-state/gateway.sqlite.tmp" "$ROOT_DIR/runtime-state/gateway.sqlite"; fi
-if [[ -f "$BACKUP/plugin-data.tar.gz" ]]; then tar -xzf "$BACKUP/plugin-data.tar.gz" -C "$ROOT_DIR/runtime-state"; fi
-if [[ -f "$BACKUP/gateway-artifacts.tar.gz" ]]; then tar -xzf "$BACKUP/gateway-artifacts.tar.gz" -C "$ROOT_DIR/runtime-state"; fi
+mkdir -p "$AGENT_HOME_RUNTIME_DIR"
+if [[ -f "$BACKUP/gateway.sqlite" ]]; then cp "$BACKUP/gateway.sqlite" "$AGENT_HOME_RUNTIME_DIR/gateway.sqlite.tmp"; mv -f "$AGENT_HOME_RUNTIME_DIR/gateway.sqlite.tmp" "$AGENT_HOME_RUNTIME_DIR/gateway.sqlite"; fi
+if [[ -f "$BACKUP/plugin-data.tar.gz" ]]; then tar -xzf "$BACKUP/plugin-data.tar.gz" -C "$AGENT_HOME_RUNTIME_DIR"; fi
+if [[ -f "$BACKUP/gateway-artifacts.tar.gz" ]]; then tar -xzf "$BACKUP/gateway-artifacts.tar.gz" -C "$AGENT_HOME_RUNTIME_DIR"; fi
 if [[ -f "$BACKUP/deployment-secrets.tar.gz" ]]; then
   mkdir -p "$ROOT_DIR/.agent-home"
   tar -xzf "$BACKUP/deployment-secrets.tar.gz" -C "$ROOT_DIR"

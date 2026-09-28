@@ -8,6 +8,8 @@ fi
 
 FIXED_PODMAN="$ROOT_DIR/.agent-home/podman/bin/podman"
 AGENT_HOME_PODMAN_STORAGE_CONF="$ROOT_DIR/.agent-home/podman/storage.conf"
+AGENT_HOME_RUNTIME_DIR="${AGENT_HOME_RUNTIME_DIR:-$ROOT_DIR/.agent-home/runtime-state}"
+export AGENT_HOME_RUNTIME_DIR
 if [[ -z "${CONTAINERS_STORAGE_CONF:-}" && -r "$AGENT_HOME_PODMAN_STORAGE_CONF" ]]; then
   export CONTAINERS_STORAGE_CONF="$AGENT_HOME_PODMAN_STORAGE_CONF"
 fi

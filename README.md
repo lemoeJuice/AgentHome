@@ -48,6 +48,8 @@ before exporting the state volume.
 
 ## Configuration
 
+Host deployment-generated data is kept under `.agent-home/`: Podman state and credentials live at its root, while Gateway databases, plugin data, artifacts, logs, and PID files live in `.agent-home/runtime-state/`. The former empty top-level `runtime/` directory has been removed; Runtime source code lives in `src/runtime/`.
+
 `config/agent-home.example.json` is the committed application template. `config/agent-home.json` is deployment configuration and is ignored by Git. Configure all authorized Owners in its `owners` array; each identity includes `platform`, `accountId`, and `userId` (for example, two QQ Owners are two entries with `platform: "qq"` and the same `accountId`). With an empty or missing array, Owner-only authorization remains disabled. Podman installation is handled by `scripts/setup-podman-portable.sh` without a user-supplied binary path.
 
 `config/snowluma.env.example` is the committed SnowLuma deployment template. The first setup copies it to the ignored `config/snowluma.env`; it controls service/UI bind addresses, host ports, and declarative EULA/privacy acceptance. `SNOWLUMA_ACCEPT_EULA=1` and `SNOWLUMA_ACCEPT_PRIVACY=1` are passed to the SnowLuma container as ephemeral consent settings; SnowLuma does not persist those environment values as a consent record.

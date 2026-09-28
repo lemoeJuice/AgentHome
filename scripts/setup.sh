@@ -8,7 +8,7 @@ source "$ROOT_DIR/scripts/lib.sh"
 command -v node >/dev/null || { printf '%s\n' 'missing dependency: node >= 22.5' >&2; exit 2; }
 node -e 'const [major, minor] = process.versions.node.split(".").map(Number); if (major < 22 || (major === 22 && minor < 5)) process.exit(1)' || { printf '%s\n' 'node >= 22.5 is required' >&2; exit 2; }
 if command -v pnpm >/dev/null; then PACKAGE_MANAGER=pnpm; elif command -v npm >/dev/null; then PACKAGE_MANAGER=npm; else printf '%s\n' 'missing dependency: pnpm or npm' >&2; exit 2; fi
-mkdir -p config runtime-state/plugin-data backups
+mkdir -p config "$AGENT_HOME_RUNTIME_DIR/plugin-data" backups
 mkdir -p .agent-home
 CONFIG_PATH="${AGENT_HOME_CONFIG:-$ROOT_DIR/config/agent-home.json}"
 if [[ "$CONFIG_PATH" != /* ]]; then CONFIG_PATH="$ROOT_DIR/$CONFIG_PATH"; fi
@@ -64,7 +64,7 @@ scripts/setup-snowluma.sh
 bash scripts/init-container.sh
 if [[ "${AGENT_HOME_INSTALL_PI:-1}" != 0 ]]; then bash scripts/install-pi.sh; fi
 bash "$ROOT_DIR/scripts/pi-provider-onboarding.sh"
-doctor_log="$(mktemp "$ROOT_DIR/runtime-state/deploy-doctor.XXXXXX")"
+doctor_log="$(mktemp "$AGENT_HOME_RUNTIME_DIR/deploy-doctor.XXXXXX")"
 doctor_ok=false
 if "$PACKAGE_MANAGER" run doctor >"$doctor_log" 2>&1; then
   doctor_ok=true
