@@ -44,10 +44,12 @@ export class GatewayApp {
   async start(): Promise<void> {
     this.commands.register({ name: "model", aliases: ["models"], permission: "admin", pluginId: "core.pi-model", kind: "CORE" }, createPiModelCommand(this.config, this.log));
     await loadPlugins(this.config, this.commands, this.actions, this.log);
-    await this.controller.start();
     await this.artifacts.start();
-    this.artifactMaintenance = setInterval(() => { void Promise.all([this.artifacts.cleanupExpired(), Promise.resolve(this.state.cleanupOperationalState())]).catch((error) => this.log.warn("Gateway maintenance failed", { error: String(error) })); }, 60_000).unref();
+    // Runtime recovery may re-register durable Worker bindings as soon as the
+    // Agent Home container starts, so Gateway MCP must be listening first.
     await this.mcp.start();
+    await this.controller.start();
+    this.artifactMaintenance = setInterval(() => { void Promise.all([this.artifacts.cleanupExpired(), Promise.resolve(this.state.cleanupOperationalState())]).catch((error) => this.log.warn("Gateway maintenance failed", { error: String(error) })); }, 60_000).unref();
     await this.router.replayPendingOutbound();
     await this.adapter.start((event) => this.router.handle(event));
     this.log.info("Bot Gateway ready", { platform: this.adapter.platform });

@@ -291,6 +291,12 @@ export const runtimeMigrations = [
       CREATE UNIQUE INDEX IF NOT EXISTS idx_workers_source_mailbox ON worker_executions(source_mailbox_id) WHERE source_mailbox_id IS NOT NULL;
     `,
   },
+  {
+    version: 21,
+    sql: `
+      ALTER TABLE worker_executions ADD COLUMN finish_result_json TEXT;
+    `,
+  },
 ];
 
 export function ensureRuntimeSchema(store: SqliteStore): void {

@@ -1,11 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SqliteStore, migrate } from "../src/db.js";
 import { runtimeMigrations } from "../src/schema.js";
-import { TaskService } from "../src/runtime/tasks.js";
+import { isLiveProcStatInGroup, TaskService } from "../src/runtime/tasks.js";
 import { WORKER_CONTROL_PREFIX } from "../src/runtime/tasks.js";
 import { ArtifactService } from "../src/runtime/artifacts.js";
 import type { PiHarness, PiImageContent, PiProcessIdentity, PiProcessInspection, PiSandbox, PiSession } from "../src/runtime/pi.js";
@@ -91,6 +91,13 @@ class DelayedCreatePi extends TestPi {
 }
 
 const logger = { child: () => logger, info() {}, warn() {}, error() {}, debug() {} } as unknown as Logger;
+
+test("process-group cleanup treats zombie-only groups as terminated", () => {
+  assert.equal(isLiveProcStatInGroup("333 (http) Z 1 328 328 0", 328), false);
+  assert.equal(isLiveProcStatInGroup("333 (http) S 1 328 328 0", 328), true);
+  assert.equal(isLiveProcStatInGroup("333 (http) S 1 329 329 0", 328), false);
+  assert.equal(isLiveProcStatInGroup("malformed", 328), false);
+});
 
 test("question and answer are durable before worker steer", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-task-"));
@@ -475,6 +482,59 @@ test("recovery verifies process ownership before termination and preserves unkno
   assert.ok(db.get("SELECT 1 FROM project_locks WHERE project_id='project-foreign'"));
   assert.equal(db.get("SELECT 1 FROM project_locks WHERE project_id='project-terminal'"), undefined);
   assert.ok(db.get("SELECT 1 FROM runtime_exceptions WHERE worker_id='worker-foreign' AND category='PROCESS_STATE_UNKNOWN'"));
+  db.close(); await rm(root, { recursive: true, force: true });
+});
+
+test("recovery interrupts an orphaned Worker when restoring its MCP binding fails", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-home-recovery-binding-failure-"));
+  const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
+  const pi = new RecoveryPi(); pi.inspections.set(909, "NOT_FOUND");
+  const mcpControl = { registerWorkerBinding: async () => { throw new TypeError("fetch failed"); } } as never;
+  const config = { runtime: { maxWorkers: 2, maxArtifactBytes: 100000, piCommand: "pi", piTimeoutMs: 1000 } } as AppConfig;
+  const tasks = new TaskService(db, pi, new ArtifactService(db, root), config, { workerRoot: root, mcpControl, mcpEndpoint: "http://gateway.test/mcp", workerToolExtensionPath: "/state/worker-tools.js", onEvent: async () => {} }, logger);
+  const timestamp = new Date().toISOString();
+  const caps = { memory: { allowedScopes: ["global_agent"] }, projects: [{ projectId: "project", access: "WRITE" as const }], qq: { readConversations: [], sendConversations: [] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: [], publishTaskIds: [], allowedDestinations: [] }, tasks: { canCreate: false, visibleTaskIds: [], canCancel: true, canFollowUp: true } };
+  db.run("INSERT INTO tasks(id,title,goal,status,requester_json,trust,origin_conversation_id,notification_conversation_id,capabilities_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", "task-binding-recovery", "binding recovery", "binding recovery", "RUNNING", JSON.stringify({ platform: "qq", accountId: "a", userId: "u" }), "OWNER", "c", "c", JSON.stringify(caps), timestamp, timestamp);
+  db.run("INSERT INTO worker_executions(id,task_id,objective,status,harness,harness_session_id,workspace_id,workspace_access,process_id,capabilities_json,mcp_binding_token,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", "worker-binding-recovery", "task-binding-recovery", "recover", "RUNNING", "pi", "pi-worker-owned", "project", "WRITE", 909, JSON.stringify(caps), "persisted-binding", timestamp);
+  db.run("INSERT INTO owned_processes(id,task_id,worker_id,pid,process_group_id,command_summary,started_at,pid_start_time) VALUES (?,?,?,?,?,?,?,?)", "process-binding-recovery", "task-binding-recovery", "worker-binding-recovery", 909, 909, "pi --mode rpc --session", timestamp, "gone");
+  db.run("INSERT INTO project_locks(project_id,mode,owner_worker_id,acquired_at) VALUES (?,?,?,?)", "project", "WRITE", "worker-binding-recovery", timestamp);
+
+  await tasks.recover();
+
+  assert.equal(tasks.getWorker("worker-binding-recovery").status, "INTERRUPTED");
+  assert.equal(tasks.getTask("task-binding-recovery").status, "INTERRUPTED");
+  assert.equal(db.get("SELECT 1 FROM project_locks WHERE project_id='project'"), undefined);
+  assert.ok(db.get("SELECT 1 FROM runtime_exceptions WHERE worker_id='worker-binding-recovery' AND category='SESSION_RESTORE_FAILED'"));
+  db.close(); await rm(root, { recursive: true, force: true });
+});
+
+test("recovery finalizes a persisted finish frame instead of restoring an idle Worker", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-home-recovery-finish-frame-"));
+  const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
+  const pi = new RecoveryPi(); pi.inspections.set(919, "NOT_FOUND");
+  const config = { runtime: { maxWorkers: 2, maxArtifactBytes: 100000, piCommand: "pi", piTimeoutMs: 1000 } } as AppConfig;
+  const events: string[] = [];
+  const tasks = new TaskService(db, pi, new ArtifactService(db, root), config, { workerRoot: root, onEvent: async (event) => { events.push(event.type); } }, logger);
+  const timestamp = new Date().toISOString();
+  const caps = { memory: { allowedScopes: ["global_agent"] }, projects: [{ projectId: "project", access: "WRITE" as const }], qq: { readConversations: [], sendConversations: [] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: [], publishTaskIds: [], allowedDestinations: [] }, tasks: { canCreate: false, visibleTaskIds: [], canCancel: true, canFollowUp: true } };
+  const workerId = "worker-finished-session";
+  const taskId = "task-finished-session";
+  const sessionPath = join(root, "model", "sessions", "workers", workerId, "session.jsonl");
+  await mkdir(join(root, "model", "sessions", "workers", workerId), { recursive: true });
+  await writeFile(sessionPath, `${JSON.stringify({ type: "message", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: `${WORKER_CONTROL_PREFIX}{"type":"finish","outcome":"PARTIAL","summary":"Chromium is missing system libraries; installation timed out."}` }] } })}\n`);
+  db.run("INSERT INTO tasks(id,title,goal,status,requester_json,trust,origin_conversation_id,notification_conversation_id,capabilities_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", taskId, "finished session", "finished session", "RUNNING", JSON.stringify({ platform: "qq", accountId: "a", userId: "u" }), "OWNER", "c", "c", JSON.stringify(caps), timestamp, timestamp);
+  db.run("INSERT INTO worker_executions(id,task_id,objective,status,harness,harness_session_id,harness_session_path,workspace_id,workspace_access,process_id,capabilities_json,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", workerId, taskId, "recover result", "RUNNING", "pi", "pi-worker-finished", sessionPath, "project", "WRITE", 919, JSON.stringify(caps), timestamp);
+  db.run("INSERT INTO owned_processes(id,task_id,worker_id,pid,process_group_id,command_summary,started_at,pid_start_time) VALUES (?,?,?,?,?,?,?,?)", "process-finished-session", taskId, workerId, 919, 919, "pi --mode rpc --session", timestamp, "gone");
+  db.run("INSERT INTO project_locks(project_id,mode,owner_worker_id,acquired_at) VALUES (?,?,?,?)", "project", "WRITE", workerId, timestamp);
+
+  await tasks.recover();
+
+  assert.equal(tasks.getWorker(workerId).status, "COMPLETED");
+  assert.equal(tasks.getTask(taskId).status, "RUNNING");
+  assert.equal(db.get("SELECT 1 FROM project_locks WHERE project_id='project'"), undefined);
+  assert.equal(db.get<{ finish_result_json: string }>("SELECT finish_result_json FROM worker_executions WHERE id=?", workerId)?.finish_result_json, JSON.stringify({ outcome: "PARTIAL", summary: "Chromium is missing system libraries; installation timed out." }));
+  assert.ok(events.includes("TASK_RESULT"));
+  assert.equal(pi.resumed, 0);
   db.close(); await rm(root, { recursive: true, force: true });
 });
 
