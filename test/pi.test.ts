@@ -133,6 +133,12 @@ test("PiCliHarness drives a persistent RPC session", async () => {
     assert.equal(switched.activeSessionsUpdated, 1);
     const settings = JSON.parse(await readFile(join(root, "settings.json"), "utf8")) as { defaultProvider: string; defaultModel: string };
     assert.deepEqual(settings, { defaultProvider: "openai-codex", defaultModel: "gpt-5.6-luna" });
+    const thinking = await harness.setDefaultThinkingLevel("high");
+    assert.deepEqual(thinking, { activeSessionsUpdated: 1, activeSessionFailures: 0 });
+    const thinkingSettings = JSON.parse(await readFile(join(root, "settings.json"), "utf8")) as { defaultThinkingLevel: string; modelThinkingLevels: Record<string, string> };
+    assert.equal(thinkingSettings.defaultThinkingLevel, "high");
+    assert.equal(thinkingSettings.modelThinkingLevels["openai-codex/gpt-5.6-luna"], "high");
+    await assert.rejects(harness.setDefaultThinkingLevel("turbo"), /PI_THINKING_LEVEL_INVALID/);
     const restricted = await boundaryHarness.createSession(join(root, "restricted.jsonl"), { mainTools: true });
     assert.equal(restricted.sessionId, "pi-session-real");
     const restrictedInvocation = JSON.parse(await readFile(join(root, "restricted.jsonl"), "utf8")) as { args: string[] };

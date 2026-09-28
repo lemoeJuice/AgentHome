@@ -142,8 +142,6 @@ export async function loadConfig(path = process.env.AGENT_HOME_CONFIG ?? "./conf
   if (process.env.GATEWAY_MCP_ACTION_TIMEOUT_MS !== undefined) config.gateway.mcpActionTimeoutMs = positiveIntegerEnv("GATEWAY_MCP_ACTION_TIMEOUT_MS", config.gateway.mcpActionTimeoutMs);
   if (!explicitModelProxy && process.env.AGENT_HOME_MODEL_PROXY_URL === undefined) config.network.modelProxyUrl = config.network.proxyRelay.enabled ? `http://host.containers.internal:${config.network.proxyRelay.listenPort}` : undefined;
   if (process.env.AGENT_HOME_LOG_LEVEL) config.logging.level = process.env.AGENT_HOME_LOG_LEVEL as LogLevel;
-  delete (config.runtime as AppConfig["runtime"] & { piProvider?: string }).piProvider;
-  delete (config.runtime as AppConfig["runtime"] & { piModel?: string }).piModel;
   validateConfig(config);
   return config;
 }

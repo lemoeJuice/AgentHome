@@ -36,10 +36,14 @@ test("Pi model command reads Pi's current settings and CLI model catalog", async
 
 test("Pi model command switches a model Pi reports and hot-switches sessions without Runtime restart", async () => {
   const calls: string[][] = [];
-  const state = { provider: "openai-codex", model: "gpt-5.6-luna" };
+  const state = { provider: "openai-codex", model: "gpt-5.6-luna", thinkingLevel: "medium" };
   const run: PiModelCommandRunner = async (args) => {
     calls.push(args);
     if (args.includes("--list-models")) return modelList;
+    if (args.includes("set-pi-thinking-level")) {
+      state.thinkingLevel = args.at(-1)!;
+      return JSON.stringify({ status: "ready", activeSessionsUpdated: 2, activeSessionFailures: 0 });
+    }
     if (args.includes("set-pi-model")) {
       state.provider = "anthropic";
       state.model = "claude-sonnet-4-5";
@@ -49,16 +53,23 @@ test("Pi model command switches a model Pi reports and hot-switches sessions wit
     return "";
   };
   const command = createPiModelCommand(config, logger, run);
+  const variants = await command(context(["variant", "list"]));
+  assert.match(variants.text ?? "", /off, minimal, low, medium, high, xhigh, max/);
   const rejected = await command(context(["set", "anthropic", "missing-model"]));
   assert.match(rejected.text ?? "", /没有/);
   assert.equal(calls.some((args) => args[0] === "restart"), false);
 
   const changed = await command(context(["set", "anthropic", "claude-sonnet-4-5"]));
   assert.match(changed.text ?? "", /已切换/);
-  assert.deepEqual(state, { provider: "anthropic", model: "claude-sonnet-4-5" });
+  assert.deepEqual(state, { provider: "anthropic", model: "claude-sonnet-4-5", thinkingLevel: "medium" });
   assert.match(changed.text ?? "", /热切换 2 个活动 Pi 会话/);
   assert.equal(calls.some((args) => args[0] === "restart"), false);
   assert.equal(calls.some((args) => args.includes("set-pi-model")), true);
+
+  const variant = await command(context(["variant", "high"]));
+  assert.match(variant.text ?? "", /variant.*high/);
+  assert.equal(state.thinkingLevel, "high");
+  assert.equal(calls.some((args) => args.includes("set-pi-thinking-level")), true);
 });
 
 test("Pi model handler accepts group context after Gateway Owner authorization", async () => {

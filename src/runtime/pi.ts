@@ -6,6 +6,7 @@ import { relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Logger } from "../shared/logger.js";
+import { PI_THINKING_LEVELS } from "../shared/pi-model.js";
 import { proxyEnvironment } from "./network.js";
 import { newId } from "../shared/ids.js";
 
@@ -201,6 +202,44 @@ export class PiCliHarness implements PiHarness {
       } catch (error) {
         activeSessionFailures++;
         this.log.warn("Could not hot-switch an active Pi session", { provider, model: modelId, error: String(error) });
+      }
+    }
+    return { activeSessionsUpdated, activeSessionFailures };
+  }
+
+  async setDefaultThinkingLevel(level: string): Promise<{ activeSessionsUpdated: number; activeSessionFailures: number }> {
+    if (!(PI_THINKING_LEVELS as readonly string[]).includes(level)) throw new Error("PI_THINKING_LEVEL_INVALID");
+    await mkdir(this.agentDir, { recursive: true });
+    const settingsPath = join(this.agentDir, "settings.json");
+    let settings: Record<string, unknown> = {};
+    try {
+      const parsed = JSON.parse(await readFile(settingsPath, "utf8")) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) settings = parsed as Record<string, unknown>;
+    } catch { /* The first selected provider creates Pi's settings file. */ }
+    settings.defaultThinkingLevel = level as (typeof PI_THINKING_LEVELS)[number];
+    const provider = typeof settings.defaultProvider === "string" ? settings.defaultProvider : "";
+    const model = typeof settings.defaultModel === "string" ? settings.defaultModel : "";
+    if (provider && model) {
+      const variants = settings.modelThinkingLevels && typeof settings.modelThinkingLevels === "object" && !Array.isArray(settings.modelThinkingLevels)
+        ? settings.modelThinkingLevels as Record<string, unknown>
+        : {};
+      variants[`${provider}/${model}`] = level;
+      settings.modelThinkingLevels = variants;
+    }
+    const tempPath = `${settingsPath}.tmp-${process.pid}`;
+    await writeFile(tempPath, `${JSON.stringify(settings, null, 2)}\n`, { mode: 0o600 });
+    if (process.getuid?.() === 0 && this.launcherUid !== undefined && this.launcherGid !== undefined) await chown(tempPath, this.launcherUid, this.launcherGid);
+    await rename(tempPath, settingsPath);
+
+    let activeSessionsUpdated = 0;
+    let activeSessionFailures = 0;
+    for (const sessionProcess of new Set(this.active.values())) {
+      try {
+        await this.rpc(sessionProcess, { type: "set_thinking_level", level });
+        activeSessionsUpdated++;
+      } catch (error) {
+        activeSessionFailures++;
+        this.log.warn("Could not hot-switch an active Pi thinking level", { level, error: String(error) });
       }
     }
     return { activeSessionsUpdated, activeSessionFailures };

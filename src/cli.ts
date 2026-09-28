@@ -26,7 +26,7 @@ async function main(): Promise<void> {
     await waitForSignal(() => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())));
     return;
   }
-  if (command === "help") { process.stdout.write("agent-home gateway|runtime|control stream|control ping|control backup-prepare|control backup-finish|control set-pi-model <provider> <model>|bootstrap|doctor|status\n"); return; }
+  if (command === "help") { process.stdout.write("agent-home gateway|runtime|control stream|control ping|control backup-prepare|control backup-finish|control set-pi-model <provider> <model>|control set-pi-thinking-level <level>|bootstrap|doctor|status\n"); return; }
   let config: Awaited<ReturnType<typeof loadConfig>>;
   try { config = await loadConfig(); } catch (error) {
     if (command === "doctor" || command === "status") { await doctorUnavailable(String(error)); return; }
@@ -44,6 +44,11 @@ async function main(): Promise<void> {
       const provider = process.argv[4]; const model = process.argv[5];
       if (!provider || !model) throw new Error("USAGE: agent-home control set-pi-model <provider> <model>");
       await runControlRequest(config.paths.runtimeSocket, { type: "set_pi_model", provider, model });
+    }
+    else if (subcommand === "set-pi-thinking-level") {
+      const level = process.argv[4];
+      if (!level) throw new Error("USAGE: agent-home control set-pi-thinking-level <level>");
+      await runControlRequest(config.paths.runtimeSocket, { type: "set_pi_thinking_level", level });
     }
     else throw new Error(`UNKNOWN_CONTROL_COMMAND:${subcommand}`);
     return;
