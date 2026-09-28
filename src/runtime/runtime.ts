@@ -251,6 +251,24 @@ export class RuntimeApp {
       }
       return;
     }
+    if (typeof value === "object" && value !== null && "type" in value && value.type === "set_pi_thinking_level") {
+      const request = value as Record<string, unknown>;
+      if (typeof request.level !== "string") {
+        socket.write(`${JSON.stringify({ status: "failed", errorCode: "PI_THINKING_LEVEL_INVALID" })}\n`);
+        return;
+      }
+      if (this.backupQuiescing || this.backupQuiesced) {
+        socket.write(`${JSON.stringify({ status: "rejected", errorCode: "RUNTIME_QUIESCED" })}\n`);
+        return;
+      }
+      try {
+        const result = await this.pi.setDefaultThinkingLevel(request.level);
+        socket.write(`${JSON.stringify({ status: "ready", level: request.level, ...result })}\n`);
+      } catch (error) {
+        socket.write(`${JSON.stringify({ status: "failed", error: String(error).slice(0, 200) })}\n`);
+      }
+      return;
+    }
     if (this.backupQuiescing || this.backupQuiesced) {
       socket.write(`${JSON.stringify({ status: "rejected", errorCode: "RUNTIME_QUIESCED" })}\n`);
       return;

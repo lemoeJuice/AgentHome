@@ -140,7 +140,7 @@ export class Router {
       const permission = definition.permission === "admin" || definition.permission === "owner" || definition.permission.startsWith("owner.")
         ? "Owner（私聊或群聊）"
         : "直接命令";
-      if (definition.name === "model") return `/model — 查看当前 provider/model；/model list [provider] — 查看 Pi 提供的模型列表；/model set <provider> <model> — 切换默认模型并热切换活动会话（${permission}）${aliases}`;
+      if (definition.name === "model") return `/model — 查看当前 provider/model/variant；/model list [provider] — 查看 Pi 提供的模型列表；/model set <provider> <model> — 切换默认模型；/model variant <level> — 切换 thinking variant（${permission}）${aliases}`;
       if (definition.name === "echo") return `/echo <text> — 原样回复文本，用于测试（${permission}）${aliases}`;
       return `/${definition.name} [参数]（${permission}）${aliases}`;
     });

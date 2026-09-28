@@ -2,12 +2,13 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { AppConfig } from "../config.js";
 import type { Logger } from "../shared/logger.js";
+import { PI_THINKING_LEVELS } from "../shared/pi-model.js";
 import type { CommandContext, CommandResult } from "./registry.js";
 
 const execFileAsync = promisify(execFile);
 const MAX_MODEL_LIST_CHARS = 3200;
 
-type PiSelection = { provider: string | null; model: string | null };
+type PiSelection = { provider: string | null; model: string | null; thinkingLevel: string | null };
 export type PiModelCommandRunner = (args: string[], timeoutMs?: number) => Promise<string>;
 
 export function createPiModelCommand(config: AppConfig, logger: Logger, runner?: PiModelCommandRunner) {
@@ -26,7 +27,7 @@ export function createPiModelCommand(config: AppConfig, logger: Logger, runner?:
   async function readSelection(): Promise<PiSelection> {
     const output = await exec([
       "exec", "--user", "10002:10002", "--env", "HOME=/state/model/home", "--env", `PI_CODING_AGENT_DIR=${piAgentDir}`, container, "node", "--input-type=module", "-e",
-      'import fs from "node:fs";const dir=process.env.PI_CODING_AGENT_DIR||"/state/model/pi/agent";try{const s=JSON.parse(fs.readFileSync(`${dir}/settings.json`,"utf8"));process.stdout.write(JSON.stringify({provider:s.defaultProvider||null,model:s.defaultModel||null}))}catch{process.stdout.write(JSON.stringify({provider:null,model:null}))}',
+      'import fs from "node:fs";const dir=process.env.PI_CODING_AGENT_DIR||"/state/model/pi/agent";try{const s=JSON.parse(fs.readFileSync(`${dir}/settings.json`,"utf8"));const key=s.defaultProvider&&s.defaultModel?`${s.defaultProvider}/${s.defaultModel}`:"";const level=(key&&s.modelThinkingLevels?.[key])||s.defaultThinkingLevel||null;process.stdout.write(JSON.stringify({provider:s.defaultProvider||null,model:s.defaultModel||null,thinkingLevel:level}))}catch{process.stdout.write(JSON.stringify({provider:null,model:null,thinkingLevel:null}))}',
     ]);
     return JSON.parse(output) as PiSelection;
   }
@@ -43,6 +44,14 @@ export function createPiModelCommand(config: AppConfig, logger: Logger, runner?:
     return response;
   }
 
+  async function setVariant(level: string): Promise<{ activeSessionsUpdated?: number; activeSessionFailures?: number }> {
+    const output = await exec(["exec", container, "agent-home", "control", "set-pi-thinking-level", level], 30_000);
+    const response = JSON.parse(output.split(/\r?\n/).at(-1) ?? "null") as { status?: string; activeSessionsUpdated?: number; activeSessionFailures?: number } | null;
+    if (response?.status !== "ready") throw new Error("PI_THINKING_LEVEL_SWITCH_REJECTED");
+    if ((response.activeSessionFailures ?? 0) > 0) log.warn("Some active Pi sessions could not switch thinking level", { level, ...response });
+    return response;
+  }
+
   return async (context: CommandContext): Promise<CommandResult> => {
     const [subcommand, providerArg, ...modelParts] = context.args;
     try {
@@ -50,9 +59,25 @@ export function createPiModelCommand(config: AppConfig, logger: Logger, runner?:
         const selection = await readSelection();
         return {
           text: selection.provider && selection.model
-            ? `当前 Pi 模型：${selection.provider}/${selection.model}\n查看 Pi 可用模型：/model list [provider]\n切换模型：/model set <provider> <model>`
+            ? `当前 Pi 模型：${selection.provider}/${selection.model}\n当前 variant（thinking level）：${selection.thinkingLevel ?? "Pi 默认"}\n查看模型：/model list [provider]\n切换模型：/model set <provider> <model>\n切换 variant：/model variant <level>`
             : "Pi 尚未在 Pi 自身设置中选择默认 provider/model。请运行 scripts/pi-provider-onboarding.sh 完成首次选择。",
         };
+      }
+
+      if (subcommand === "variant" || subcommand === "thinking") {
+        if (!providerArg || providerArg === "list") {
+          const selection = await readSelection();
+          const current = selection.thinkingLevel ? `\n当前默认 variant：${selection.thinkingLevel}` : "";
+          return { text: `Pi variant（thinking level）：${PI_THINKING_LEVELS.join(", ")}\n不同模型支持的级别不同；Pi 会按当前模型处理。${current}\n用法：/model variant <level>` };
+        }
+        if (modelParts.length || !(PI_THINKING_LEVELS as readonly string[]).includes(providerArg)) return { text: `variant 必须是以下之一：${PI_THINKING_LEVELS.join(", ")}` };
+        const selection = await readSelection();
+        if (!selection.provider || !selection.model) return { text: "请先用 /model set <provider> <model> 选择默认模型，再设置 variant。" };
+        const result = await setVariant(providerArg);
+        log.info("Pi thinking level changed", { level: providerArg, activeSessionsUpdated: result.activeSessionsUpdated, requesterId: context.requester.userId });
+        const active = result.activeSessionsUpdated ? `已热切换 ${result.activeSessionsUpdated} 个活动 Pi 会话` : "当前没有活动 Pi 会话";
+        const failed = result.activeSessionFailures ? `；${result.activeSessionFailures} 个活动会话未能切换（新会话仍使用该默认值）` : "";
+        return { text: `Pi variant（thinking level）已设为 ${providerArg}；${active}${failed}。Runtime 未重启。` };
       }
 
       if (subcommand === "list") {
@@ -75,7 +100,7 @@ export function createPiModelCommand(config: AppConfig, logger: Logger, runner?:
         return { text: `Pi 模型已切换为 ${providerArg}/${model}；${active}${failed}。Runtime 未重启。` };
       }
 
-      return { text: "用法：/model；/model list [provider]；/model set <provider> <model>。" };
+      return { text: "用法：/model；/model list [provider]；/model set <provider> <model>；/model variant [list|level]。" };
     } catch (error) {
       log.error("Pi model command failed", { error: String(error) });
       return { text: `读取或切换 Pi 模型失败：${String(error).slice(0, 300)}` };

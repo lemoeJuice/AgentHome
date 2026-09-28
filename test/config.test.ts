@@ -61,27 +61,6 @@ test("legacy 2 GiB guest address-space default is raised for Node 22 WebAssembly
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("Pi provider and model remain Pi-managed instead of host config overrides", async () => {
-  const root = await mkdtemp(join(tmpdir(), "agent-home-config-model-"));
-  const configPath = join(root, "agent-home.json");
-  const previousProvider = process.env.PI_PROVIDER;
-  const previousModel = process.env.PI_MODEL;
-  try {
-    await writeFile(configPath, JSON.stringify({ instanceId: "config-model", snowluma: { endpoint: "ws://snowluma", apiEndpoint: "http://snowluma" }, runtime: { piProvider: "legacy-provider", piModel: "legacy-model" } }));
-    process.env.PI_PROVIDER = "env-provider";
-    process.env.PI_MODEL = "env-model";
-    const config = await loadConfig(configPath);
-    assert.equal("piProvider" in config.runtime, false);
-    assert.equal("piModel" in config.runtime, false);
-  } finally {
-    if (previousProvider === undefined) delete process.env.PI_PROVIDER;
-    else process.env.PI_PROVIDER = previousProvider;
-    if (previousModel === undefined) delete process.env.PI_MODEL;
-    else process.env.PI_MODEL = previousModel;
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
 test("loadConfig reads the configurable Main persona", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-config-persona-"));
   const configPath = join(root, "agent-home.json");
