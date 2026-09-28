@@ -20,5 +20,5 @@ jobs:
       - run: pnpm run typecheck
       - run: pnpm run build
       - run: pnpm test
-      - run: for file in scripts/*.sh; do bash -n "$file"; done
+      - run: for file in scripts/*.sh scripts/*/*.sh; do bash -n "$file"; done
       - run: git diff --check
