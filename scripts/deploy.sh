@@ -20,9 +20,11 @@ if [[ "$CONFIG_PATH" != /* ]]; then CONFIG_PATH="$ROOT_DIR/$CONFIG_PATH"; fi
 case "$CONFIG_PATH" in "$ROOT_DIR"/*) ;; *) fail 'AGENT_HOME_CONFIG must be inside the project directory' ;; esac
 export AGENT_HOME_CONFIG="$CONFIG_PATH"
 
-printf '%s\n' '== Environment and update check =='
 if command -v pnpm >/dev/null; then PACKAGE_MANAGER=pnpm; elif command -v npm >/dev/null; then PACKAGE_MANAGER=npm; else fail 'pnpm or npm is required'; fi
 mkdir -p config "$AGENT_HOME_RUNTIME_DIR/plugin-data" backups .agent-home
+umask 077
+exec > >(tee -a "$AGENT_HOME_RUNTIME_DIR/deploy.log") 2>&1
+printf '%s\n' '== Environment and update check =='
 if [[ ! -s node_modules/.modules.yaml && ! -d node_modules ]]; then
   printf '%s\n' 'host dependencies are missing; setup will install them'
 else
@@ -107,4 +109,5 @@ bash "$ROOT_DIR/scripts/setup.sh"
 printf '%s\n' '== Final QQ login step =='
 bash "$ROOT_DIR/scripts/qq-login.sh"
 
-printf '%s\n' 'deployment complete'
+printf '\n%s\n' '== Foreground service mode ==' 'Logs: .agent-home/runtime-state/deploy.log, gateway.log, proxy-relay.log, and run.log' 'Press Ctrl+C to stop Gateway, Agent Home, and Proxy Relay. SnowLuma remains running.'
+exec "$ROOT_DIR/scripts/run.sh"

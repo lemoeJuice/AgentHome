@@ -15,7 +15,7 @@ Host prerequisite: Node.js `>=22.5` with `npm` or `pnpm`; `deploy.sh` installs p
 
 The deployment flow is safe to rerun after interruption: unchanged source/dependency fingerprints, containers, volumes, and initialized state are reused; startup resumes the remaining setup phases. Changed lockfiles or Agent Home source trigger the required dependency/image refresh automatically. SnowLuma and the base image are checked against the registry. Set `AGENT_HOME_REBUILD_IMAGE=1`, `SNOWLUMA_REFRESH_IMAGE=1`, `AGENT_HOME_REFRESH_DEPS=1`, or `AGENT_HOME_REBOOTSTRAP=1` to force a refresh. `scripts/retry-setup-podman.sh` retries the Podman image/build phase up to 100 times by default.
 
-Podman setup uses an Agent Home-local storage configuration under `.agent-home/podman/`. It selects the native `btrfs` driver on Btrfs, `fuse-overlayfs` when available elsewhere, and `vfs` as a portable fallback. On Btrfs without `fuse-overlayfs`, it builds through a temporary rootless container and `commit` instead of Buildah's unsupported overlay build context. This avoids changing or reusing an incompatible global rootless storage database.
+Agent Home containers use Podman's `--init` process to forward signals and reap orphaned subprocesses. Deployment replaces older containers without it while retaining the state volume. Podman setup uses an Agent Home-local storage configuration under `.agent-home/podman/`. It selects the native `btrfs` driver on Btrfs, `fuse-overlayfs` when available elsewhere, and `vfs` as a portable fallback. On Btrfs without `fuse-overlayfs`, it builds through a temporary rootless container and `commit` instead of Buildah's unsupported overlay build context. This avoids changing or reusing an incompatible global rootless storage database.
 
 Useful commands:
 
@@ -34,6 +34,7 @@ Useful commands:
 ./scripts/start.sh
 ./scripts/stop.sh
 ./scripts/restart.sh
+./scripts/run.sh
 ./scripts/status.sh
 ./scripts/doctor.sh
 ./scripts/test.sh
@@ -59,6 +60,8 @@ Application endpoints and service settings live in `config.json`: `snowluma.endp
 ## Deployment Lifecycle
 
 Use `scripts/deploy.sh` for a new deployment or to check/reconcile an existing one; existing dependencies, images, containers, and initialized state are reused when possible. If the Agent Home volume is missing, the entrypoint offers fresh initialization or backup restore. Set `AGENT_HOME_MIGRATION_BACKUP` to select a backup directory/file non-interactively. Set `AGENT_HOME_REBUILD_IMAGE=1`, `SNOWLUMA_REFRESH_IMAGE=1`, or `AGENT_HOME_REFRESH_DEPS=1` to refresh the corresponding resources. Use `scripts/backup.sh` on the source host to create a portable migration directory. Use `scripts/upgrade.sh` after pulling project updates; it creates a backup, rebuilds the Agent Home image from the current source, replaces the container while retaining the named state volume, reapplies bootstrap configuration, and restarts the host Gateway.
+
+After setup and the optional QQ login prompt, `scripts/deploy.sh` enters foreground mode and continues streaming Gateway, Agent Home, and Proxy Relay logs to the terminal. Logs are persisted under `.agent-home/runtime-state/` (`deploy.log`, `run.log`, and per-service logs). Press `Ctrl+C` or run `scripts/stop.sh` from another terminal to stop Gateway, the Agent Home container, and Proxy Relay. SnowLuma intentionally remains running. Use `scripts/run.sh` to reattach to an existing deployment without rerunning setup.
 
 The common chat model always namespaces platform, account, conversation, thread, and message IDs. `null` means a supported field has no value; `NOT_IMPLEMENTED` is a structured unsupported-field sentinel. SnowLuma is deployed as a separate container on `agent-home-net` using its official Docker framework defaults and persistent QQ volumes.
 
