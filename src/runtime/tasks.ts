@@ -8,10 +8,10 @@ import { attenuateTask, attenuateWorker, capabilityWithin, deriveCapabilities, v
 import { newId, nowIso, messageKey } from "../shared/ids.js";
 import type { ArtifactRef, CapabilitySet, JsonValue, PlatformMessageRef, TaskRecord, TaskRequester, TaskStatus, WorkerExecutionRecord, WorkerStatus } from "../shared/types.js";
 import type { ArtifactService } from "./artifacts.js";
-import { piNetworkFailureHint, type PiHarness, type PiImageContent, type PiProcessIdentity, type PiSandbox, type PiSession } from "./pi.js";
+import { piNetworkFailureHint, type PiHarness, type PiImageContent, type PiProcessIdentity, type PiProcessInspection, type PiSandbox, type PiSession } from "./pi.js";
 import type { GatewayMcpClient } from "./mcp.js";
 import type { Logger } from "../shared/logger.js";
-import { canonicalWorkspaceId, OWNER_RUNTIME_UID, type PrincipalService } from "./principals.js";
+import { canonicalWorkspaceId, type PrincipalService } from "./principals.js";
 import { type ExecutionBackend, type ExecutionContext, type ExecutionRequest } from "./execution.js";
 import { MODEL_RUNTIME_GID, MODEL_RUNTIME_UID } from "./model-plane.js";
 import { PI_IMAGE_INPUT_MAX_BYTES, piImageContent, sniffImageMimeType } from "./images.js";
@@ -628,7 +628,6 @@ export class TaskService implements ExecutionBackend {
       }
     });
     for (const worker of workers) await this.revokeWorkerBinding(worker.id);
-    for (const worker of workers) if (isPrincipalBrokered(worker.process_mode) && worker.runtime_uid && worker.runtime_uid !== OWNER_RUNTIME_UID) await this.cleanupPrincipalProcesses(worker.runtime_uid);
   }
 
   async quiesceForBackup(): Promise<void> {
@@ -651,7 +650,6 @@ export class TaskService implements ExecutionBackend {
       }
     });
     for (const worker of workers) await this.revokeWorkerBinding(worker.id);
-    for (const worker of workers) if (isPrincipalBrokered(worker.process_mode) && worker.runtime_uid && worker.runtime_uid !== OWNER_RUNTIME_UID && !(await this.cleanupPrincipalProcesses(worker.runtime_uid))) throw new Error(`PRINCIPAL_PROCESS_CLEANUP_UNCONFIRMED:${worker.id}`);
   }
 
   async expireGuestTasks(): Promise<number> {
@@ -670,27 +668,33 @@ export class TaskService implements ExecutionBackend {
   async finishWorker(workerId: string, result: { outcome: "COMPLETED" | "PARTIAL" | "FAILED"; summary: string; artifacts?: string[] }): Promise<void> {
     const worker = this.getWorker(workerId);
     if (!["STARTING", "RUNNING", "WAITING_USER"].includes(worker.status) || this.cancellationRequested(worker.taskId)) return;
+    const storedResult = this.db.get<{ finish_result_json: string | null }>("SELECT finish_result_json FROM worker_executions WHERE id=?", workerId)?.finish_result_json;
+    let finalResult = storedResult ? parseWorkerFinishResult(storedResult) : undefined;
+    if (!finalResult) {
+      finalResult = result;
+      this.db.run("UPDATE worker_executions SET finish_result_json=?,updated_at=? WHERE id=? AND status IN ('STARTING','RUNNING','WAITING_USER')", JSON.stringify(finalResult), nowIso(), workerId);
+    }
     if (isPrincipalBrokered(worker.processMode) && worker.runtimeUid) {
-      if (!(await this.terminatePrincipalCommands(workerId)) || (worker.runtimeUid !== OWNER_RUNTIME_UID && !(await this.cleanupPrincipalProcesses(worker.runtimeUid)))) {
+      if (!(await this.terminatePrincipalCommands(workerId))) {
         this.recordException(worker.taskId, workerId, "principal_process_cleanup", "PROCESS_STATE_UNKNOWN", "Principal process cleanup could not be confirmed");
         return;
       }
     }
-    const status: WorkerStatus = result.outcome === "COMPLETED" ? "COMPLETED" : result.outcome === "PARTIAL" ? "COMPLETED" : "FAILED";
+    const status: WorkerStatus = finalResult.outcome === "COMPLETED" ? "COMPLETED" : finalResult.outcome === "PARTIAL" ? "COMPLETED" : "FAILED";
     const timestamp = nowIso();
     const finished = this.db.transaction(() => {
       const update = this.db.run("UPDATE worker_executions SET status=?,finished_at=?,updated_at=? WHERE id=? AND status IN ('STARTING','RUNNING','WAITING_USER')", status, timestamp, timestamp, workerId);
       if (update.changes === 0) return false;
       if (worker.workspaceScopeId ?? worker.workspaceId) this.db.run("DELETE FROM project_locks WHERE project_id=? AND owner_worker_id=?", worker.workspaceScopeId ?? worker.workspaceId as string, workerId);
       this.db.run("DELETE FROM owned_processes WHERE worker_id=?", workerId);
-      this.event(worker.taskId, "WORKER_COMPLETED", workerId, { outcome: result.outcome, summary: result.summary, artifacts: result.artifacts ?? [] });
-      this.event(worker.taskId, "TASK_RESULT", workerId, { outcome: result.outcome, summary: result.summary, artifacts: result.artifacts ?? [] });
+      this.event(worker.taskId, "WORKER_COMPLETED", workerId, { outcome: finalResult.outcome, summary: finalResult.summary, artifacts: finalResult.artifacts ?? [] });
+      this.event(worker.taskId, "TASK_RESULT", workerId, { outcome: finalResult.outcome, summary: finalResult.summary, artifacts: finalResult.artifacts ?? [] });
       const remaining = Number(this.db.get<{ count: number }>("SELECT count(*) AS count FROM worker_executions WHERE task_id=? AND status IN ('PENDING','STARTING','RUNNING','WAITING_USER','STOPPING')", worker.taskId)?.count ?? 0);
       if (remaining === 0) {
         // A Worker result is evidence for Main, not a Task-level completion
         // decision. Keep the Task alive until finishTask() is called.
         this.db.run("UPDATE tasks SET status='RUNNING',updated_at=? WHERE id=?", timestamp, worker.taskId);
-        this.event(worker.taskId, "TASK_AWAITING_COMPLETION", undefined, { outcome: result.outcome });
+        this.event(worker.taskId, "TASK_AWAITING_COMPLETION", undefined, { outcome: finalResult.outcome });
       } else {
         this.db.run("UPDATE tasks SET status='RUNNING',updated_at=? WHERE id=?", timestamp, worker.taskId);
       }
@@ -700,7 +704,7 @@ export class TaskService implements ExecutionBackend {
     this.activeSessions.delete(workerId);
     await this.revokeWorkerBinding(workerId);
     const task = this.getTask(worker.taskId);
-    await this.emit({ type: "TASK_RESULT", taskId: task.id, workerId, payload: { ...result } });
+    await this.emit({ type: "TASK_RESULT", taskId: task.id, workerId, payload: { ...finalResult } });
     void this.schedulePendingWorkers(task.id);
   }
 
@@ -766,7 +770,7 @@ export class TaskService implements ExecutionBackend {
       return;
     }
     if (worker.runtimeUid && isPrincipalBrokered(worker.processMode)) {
-      if (!(await this.terminatePrincipalCommands(workerId)) || (worker.runtimeUid !== OWNER_RUNTIME_UID && !(await this.cleanupPrincipalProcesses(worker.runtimeUid)))) {
+      if (!(await this.terminatePrincipalCommands(workerId))) {
         this.recordException(worker.taskId, workerId, "principal_process_cleanup", "PROCESS_STATE_UNKNOWN", "Principal process cleanup could not be confirmed");
         return;
       }
@@ -804,8 +808,7 @@ export class TaskService implements ExecutionBackend {
       );
     }
     const commandsTerminated = await this.terminatePrincipalCommands(worker.id);
-    const principalProcessesTerminated = !isPrincipalBrokered(worker.process_mode) || !worker.runtime_uid || worker.runtime_uid === OWNER_RUNTIME_UID || await this.cleanupPrincipalProcesses(worker.runtime_uid);
-    return piTerminated && commandsTerminated && principalProcessesTerminated;
+    return piTerminated && commandsTerminated;
   }
 
   async recover(): Promise<void> {
@@ -818,6 +821,7 @@ export class TaskService implements ExecutionBackend {
     }>("SELECT w.id,w.task_id,w.workspace_id,w.harness_session_id,w.harness_session_path,w.process_id,w.status,op.pid AS owned_pid,op.process_group_id,op.pid_start_time FROM worker_executions w LEFT JOIN owned_processes op ON op.worker_id=w.id AND op.process_kind='PI' WHERE w.status IN ('STARTING','RUNNING','WAITING_USER','STOPPING')");
     for (const worker of active) {
       const session = worker.harness_session_id ? { sessionId: worker.harness_session_id, sessionPath: await this.recoverySessionPath(worker.id, worker.harness_session_path) } : undefined;
+      const completedResult = worker.status === "RUNNING" ? await this.recoveredWorkerFinishResult(worker.id, session) : undefined;
       const expected = worker.owned_pid && worker.process_group_id && worker.pid_start_time
         ? { pid: worker.owned_pid, processGroupId: worker.process_group_id, startTime: worker.pid_start_time }
         : undefined;
@@ -849,10 +853,23 @@ export class TaskService implements ExecutionBackend {
           this.recordException(worker.task_id, worker.id, "recovery", "PROCESS_STATE_UNKNOWN", `Worker ${worker.id} process ownership could not be confirmed`);
           continue;
         }
-        if (session && await this.restoreRecoveredSession(worker.id, worker.task_id, worker.workspace_id, "WAITING_USER", session)) {
-          this.db.run("UPDATE tasks SET status='WAITING_USER',updated_at=? WHERE id=?", nowIso(), worker.task_id);
-          await this.replayPendingMailbox(worker.id, session);
-          continue;
+        let restoreFailed = false;
+        if (session) {
+          try {
+            if (await this.restoreRecoveredSession(worker.id, worker.task_id, worker.workspace_id, "WAITING_USER", session)) {
+              this.db.run("UPDATE tasks SET status='WAITING_USER',updated_at=? WHERE id=?", nowIso(), worker.task_id);
+              await this.replayPendingMailbox(worker.id, session);
+              continue;
+            }
+          } catch (error) {
+            restoreFailed = true;
+            this.recordException(worker.task_id, worker.id, "recovery", "SESSION_RESTORE_FAILED", String(error));
+          }
+          if (!await this.confirmRecoveredSessionStopped(session)) {
+            this.recordException(worker.task_id, worker.id, "recovery", "PROCESS_STATE_UNKNOWN", "Worker session restoration failed and its process could not be safely terminated");
+            continue;
+          }
+          if (!restoreFailed) this.recordException(worker.task_id, worker.id, "recovery", "SESSION_RESTORE_FAILED", "Pi could not restore the persisted Worker session");
         }
         this.interruptRecoveredWorker(worker.task_id, worker.id, worker.workspace_id, "session_unavailable", true);
         continue;
@@ -865,15 +882,34 @@ export class TaskService implements ExecutionBackend {
           continue;
         }
         this.recordException(worker.task_id, worker.id, "recovery", "ORPHAN_PROCESS", `terminated owned process ${expected.pid} after Runtime restart`);
-      } else if (processState === "FOREIGN" || processState === "UNKNOWN") {
+      } else if ((processState === "FOREIGN" || processState === "UNKNOWN") && !completedResult) {
         this.recordException(worker.task_id, worker.id, "recovery", "PROCESS_STATE_UNKNOWN", `Worker ${worker.id} process ownership could not be confirmed`);
         this.interruptRecoveredWorker(worker.task_id, worker.id, worker.workspace_id, "process_state_unknown", false);
         continue;
       }
-      if (session && await this.restoreRecoveredSession(worker.id, worker.task_id, worker.workspace_id, "RUNNING", session)) {
-        this.db.run("UPDATE tasks SET status='RUNNING',updated_at=? WHERE id=?", nowIso(), worker.task_id);
-        await this.replayPendingMailbox(worker.id, session);
+      if (completedResult) {
+        const existing = this.db.get<{ finish_result_json: string | null }>("SELECT finish_result_json FROM worker_executions WHERE id=?", worker.id)?.finish_result_json;
+        if (!parseWorkerFinishResult(existing)) this.db.run("UPDATE worker_executions SET finish_result_json=?,updated_at=? WHERE id=?", JSON.stringify(completedResult), nowIso(), worker.id);
+        await this.finishWorker(worker.id, completedResult);
         continue;
+      }
+      let restoreFailed = false;
+      if (session) {
+        try {
+          if (await this.restoreRecoveredSession(worker.id, worker.task_id, worker.workspace_id, "RUNNING", session)) {
+            this.db.run("UPDATE tasks SET status='RUNNING',updated_at=? WHERE id=?", nowIso(), worker.task_id);
+            await this.replayPendingMailbox(worker.id, session);
+            continue;
+          }
+        } catch (error) {
+          restoreFailed = true;
+          this.recordException(worker.task_id, worker.id, "recovery", "SESSION_RESTORE_FAILED", String(error));
+        }
+        if (!await this.confirmRecoveredSessionStopped(session)) {
+          this.recordException(worker.task_id, worker.id, "recovery", "PROCESS_STATE_UNKNOWN", "Worker session restoration failed and its process could not be safely terminated");
+          continue;
+        }
+        if (!restoreFailed) this.recordException(worker.task_id, worker.id, "recovery", "SESSION_RESTORE_FAILED", "Pi could not restore the persisted Worker session");
       }
       this.interruptRecoveredWorker(worker.task_id, worker.id, worker.workspace_id, "runtime_restart", true);
     }
@@ -979,6 +1015,59 @@ export class TaskService implements ExecutionBackend {
       this.event(taskId, "WORKER_RECOVERED", workerId, { status, sessionId: session.sessionId });
     });
     return true;
+  }
+
+  private async recoveredWorkerFinishResult(workerId: string, session: PiSession | undefined): Promise<WorkerResult | undefined> {
+    const stored = this.db.get<{ finish_result_json: string | null }>("SELECT finish_result_json FROM worker_executions WHERE id=?", workerId)?.finish_result_json;
+    const persisted = stored ? parseWorkerFinishResult(stored) : undefined;
+    if (persisted) return persisted;
+    if (!session) return undefined;
+
+    let lines: string[];
+    try { lines = (await readFile(session.sessionPath, "utf8")).split(/\r?\n/).filter(Boolean); }
+    catch { return undefined; }
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      let record: Record<string, unknown>;
+      try { record = JSON.parse(lines[index]!) as Record<string, unknown>; }
+      catch { continue; }
+      if (record.type !== "message" || !record.message || typeof record.message !== "object") continue;
+      const message = record.message as Record<string, unknown>;
+      // Only the latest persisted assistant message can be replayed. A later
+      // user/tool message means the old finish frame is no longer authoritative.
+      if (message.role !== "assistant" || message.stopReason !== "stop") return undefined;
+      const content = message.content;
+      const text = typeof content === "string"
+        ? content
+        : Array.isArray(content)
+          ? content.filter((item): item is { type: string; text: string } => Boolean(item && typeof item === "object" && (item as Record<string, unknown>).type === "text" && typeof (item as Record<string, unknown>).text === "string")).map((item) => item.text).join("")
+          : "";
+      if (!text.trim()) return undefined;
+      let parsed: ReturnType<TaskService["parseWorkerOutput"]>;
+      try { parsed = this.parseWorkerOutput(text); }
+      catch { return undefined; }
+      if (parsed.frames.some((frame) => frame.type === "artifact" || frame.type === "question")) return undefined;
+      const finishes = parsed.frames.filter((frame): frame is Extract<WorkerControlFrame, { type: "finish" }> => frame.type === "finish");
+      if (finishes.length > 1) return undefined;
+      if (finishes.length === 1) return { outcome: finishes[0]!.outcome, summary: finishes[0]!.summary, ...(finishes[0]!.artifacts?.length ? { artifacts: finishes[0]!.artifacts } : {}) };
+      if (parsed.frames.length === 0 && parsed.text.trim()) return { outcome: "COMPLETED", summary: parsed.text.trim() };
+      return undefined;
+    }
+    return undefined;
+  }
+
+  private async confirmRecoveredSessionStopped(session: PiSession): Promise<boolean> {
+    let identity: PiProcessIdentity | undefined;
+    try { identity = await this.pi.processInfo?.(session); }
+    catch { return false; }
+    if (!identity) return this.pi.processId?.(session) === undefined;
+    if (!this.pi.inspectProcess || !this.pi.terminateProcess) return false;
+    let state: PiProcessInspection;
+    try { state = await this.pi.inspectProcess(session, identity); }
+    catch { return false; }
+    if (state === "NOT_FOUND") return true;
+    if (state !== "OWNED") return false;
+    try { return await this.pi.terminateProcess(session, identity); }
+    catch { return false; }
   }
 
   private interruptRecoveredWorker(taskId: string, workerId: string, workspaceId: string | null, reason: string, releaseLock: boolean): void {
@@ -1287,13 +1376,32 @@ export class TaskService implements ExecutionBackend {
   private async terminateProcessGroup(pid: number, processGroupId: number, startTime: string): Promise<boolean> {
     const current = await this.readProcessIdentity(pid);
     if (current && (current.startTime !== startTime || current.processGroupId !== processGroupId)) return false;
-    try { process.kill(-processGroupId, 0); } catch { return true; }
-    try { process.kill(-processGroupId, "SIGTERM"); } catch { return false; }
+    if (!(await this.processGroupHasLiveMembers(processGroupId))) return true;
+    try { process.kill(-processGroupId, "SIGTERM"); } catch { return !(await this.processGroupHasLiveMembers(processGroupId)); }
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 300));
-    try { process.kill(-processGroupId, 0); } catch { return true; }
-    try { process.kill(-processGroupId, "SIGKILL"); } catch { return false; }
+    if (!(await this.processGroupHasLiveMembers(processGroupId))) return true;
+    try { process.kill(-processGroupId, "SIGKILL"); } catch { return !(await this.processGroupHasLiveMembers(processGroupId)); }
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
-    try { process.kill(-processGroupId, 0); return false; } catch { return true; }
+    return !(await this.processGroupHasLiveMembers(processGroupId));
+  }
+
+  private async processGroupHasLiveMembers(processGroupId: number): Promise<boolean> {
+    const entries = await readdir("/proc", { withFileTypes: true });
+    let foundGroupMember = false;
+    for (const entry of entries) {
+      if (!/^\d+$/.test(entry.name)) continue;
+      try {
+        const stat = await readFile(`/proc/${entry.name}/stat`, "utf8");
+        if (isLiveProcStatInGroup(stat, processGroupId)) return true;
+        const close = stat.lastIndexOf(")");
+        if (close >= 0 && Number(stat.slice(close + 2).trim().split(/\s+/)[2]) === processGroupId) foundGroupMember = true;
+      } catch { /* Process exited while inspecting /proc. */ }
+    }
+    if (foundGroupMember) return false;
+    // If /proc did not expose the group, treat a successful signal-0 probe as
+    // unknown/live and fail closed instead of confirming cleanup prematurely.
+    try { process.kill(-processGroupId, 0); return true; }
+    catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
   }
 
   private async terminatePrincipalCommand(workerId: string, child: ChildProcess): Promise<boolean> {
@@ -1327,33 +1435,6 @@ export class TaskService implements ExecutionBackend {
       if (!row.process_group_id || !row.pid_start_time || !(await this.terminateProcessGroup(row.pid, row.process_group_id, row.pid_start_time))) throw new Error(`PRINCIPAL_PROCESS_RECOVERY_UNCONFIRMED:${row.worker_id}`);
       this.db.run("DELETE FROM owned_processes WHERE id=?", row.id);
     }
-  }
-
-  private async cleanupPrincipalProcesses(runtimeUid: number): Promise<boolean> {
-    const entries = await readdir("/proc", { withFileTypes: true });
-    const processGroups = new Set<number>();
-    for (const entry of entries) {
-      if (!/^\d+$/.test(entry.name)) continue;
-      try {
-        const [statLine, status] = await Promise.all([readFile(`/proc/${entry.name}/stat`, "utf8"), readFile(`/proc/${entry.name}/status`, "utf8")]);
-        const close = statLine.lastIndexOf(")");
-        const fields = statLine.slice(close + 2).trim().split(/\s+/);
-        const group = Number(fields[2]);
-        const uidLine = status.split("\n").find((line) => line.startsWith("Uid:"));
-        const effectiveUid = uidLine ? Number(uidLine.trim().split(/\s+/)[2]) : -1;
-        if (effectiveUid === runtimeUid && Number.isInteger(group)) processGroups.add(group);
-      } catch { /* process exited while enumerating */ }
-    }
-    let terminated = true;
-    for (const group of processGroups) {
-      try { process.kill(-group, "SIGTERM"); } catch { continue; }
-    }
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 200));
-    for (const group of processGroups) {
-      try { process.kill(-group, "SIGKILL"); } catch { /* already exited */ }
-      try { process.kill(-group, 0); terminated = false; } catch { /* confirmed gone */ }
-    }
-    return terminated;
   }
 
   private isTerminalTask(status: TaskStatus): boolean {
@@ -1472,6 +1553,23 @@ function parseWorkerControlFrame(content: string): { frame: unknown; trailing: s
 
 function isPrincipalBrokered(mode: string | undefined): boolean {
   return mode === "PRINCIPAL_BROKERED" || mode === "GUEST_BROKERED";
+}
+
+function parseWorkerFinishResult(value: string | null | undefined): WorkerResult | undefined {
+  if (!value) return undefined;
+  try {
+    const parsed = JSON.parse(value) as Record<string, unknown>;
+    if (!["COMPLETED", "PARTIAL", "FAILED"].includes(String(parsed.outcome)) || typeof parsed.summary !== "string") return undefined;
+    if (parsed.artifacts !== undefined && (!Array.isArray(parsed.artifacts) || parsed.artifacts.some((item) => typeof item !== "string"))) return undefined;
+    return { outcome: parsed.outcome as WorkerResult["outcome"], summary: parsed.summary, ...(Array.isArray(parsed.artifacts) && parsed.artifacts.length ? { artifacts: parsed.artifacts as string[] } : {}) };
+  } catch { return undefined; }
+}
+
+export function isLiveProcStatInGroup(stat: string, processGroupId: number): boolean {
+  const close = stat.lastIndexOf(")");
+  if (close < 0) return false;
+  const fields = stat.slice(close + 2).trim().split(/\s+/);
+  return Number(fields[2]) === processGroupId && fields[0] !== "Z" && fields[0] !== "X";
 }
 
 function shellQuote(value: string): string { return `'${value.replaceAll("'", `'\\''`)}'`; }
