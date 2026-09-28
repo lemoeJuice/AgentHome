@@ -16,7 +16,7 @@
       "enabled": true,
       "listenPort": 17890,
       "upstreamHost": "127.0.0.1",
-      "upstreamPort": 7890
+      "upstreamPort": 7897
     }
   },
   "agent": {

@@ -7,7 +7,8 @@ mkdir -p runtime-state
 PROXY_RELAY_PID_FILE="${AGENT_HOME_PROXY_RELAY_PID_FILE:-$ROOT_DIR/runtime-state/proxy-relay.pid}"
 PROXY_RELAY_SETTINGS_FILE="${AGENT_HOME_PROXY_RELAY_SETTINGS_FILE:-$ROOT_DIR/runtime-state/proxy-relay.settings}"
 IFS=$'\t' read -r relay_enabled relay_listen_port relay_upstream_host relay_upstream_port <<<"$(agent_home_proxy_relay_settings)"
-relay_signature="${relay_listen_port}|${relay_upstream_host}|${relay_upstream_port}"
+relay_build="$(ROOT_DIR="$ROOT_DIR" node --input-type=module -e 'import { createHash } from "node:crypto";import { readFileSync } from "node:fs";const root=process.env.ROOT_DIR;const hash=createHash("sha256");for(const file of ["dist/cli.js","dist/proxy-relay.js"])hash.update(readFileSync(`${root}/${file}`));process.stdout.write(hash.digest("hex"));')"
+relay_signature="${relay_listen_port}|${relay_upstream_host}|${relay_upstream_port}|${relay_build}"
 relay_pid=""
 if [[ -s "$PROXY_RELAY_PID_FILE" ]]; then relay_pid="$(<"$PROXY_RELAY_PID_FILE")"; fi
 if [[ "$relay_enabled" == 1 ]]; then

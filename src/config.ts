@@ -39,7 +39,7 @@ export interface AppConfig {
 const defaults: AppConfig = {
   instanceId: "default",
   gateway: { mcpPort: 8787, mcpActionTimeoutMs: 30_000 },
-  network: { proxyRelay: { enabled: true, listenPort: 17890, upstreamHost: "127.0.0.1", upstreamPort: 7890 } },
+  network: { proxyRelay: { enabled: true, listenPort: 17890, upstreamHost: "127.0.0.1", upstreamPort: 7897 } },
   paths: {
     gatewayState: "./runtime-state/gateway.sqlite",
     pluginData: "./runtime-state/plugin-data",
