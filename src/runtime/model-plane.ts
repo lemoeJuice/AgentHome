@@ -1,4 +1,4 @@
-import { chown, chmod, lstat, mkdir, readFile, readdir, realpath, rename, writeFile } from "node:fs/promises";
+import { chown, chmod, copyFile, lstat, mkdir, readFile, readdir, realpath, rename, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import type { SqliteStore } from "../db.js";
@@ -73,14 +73,55 @@ export class ModelPlaneService {
     }
     if (!sourceInfo.isDirectory()) throw new Error("LEGACY_PI_AGENT_DIRECTORY_INVALID");
     await this.validateAgentTree(legacy);
-    try { await lstat(destination); throw new Error("MODEL_AGENT_MIGRATION_COLLISION"); }
+    let destinationInfo;
+    try { destinationInfo = await lstat(destination); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    if (destinationInfo) {
+      if (!destinationInfo.isDirectory() || destinationInfo.isSymbolicLink()) throw new Error("MODEL_AGENT_MIGRATION_COLLISION");
+      await this.validateAgentTree(destination);
+      await this.mergeAgentTree(legacy, destination);
+      return;
+    }
     await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
     await rename(legacy, destination);
     const uid = process.getuid?.() === 0 ? MODEL_RUNTIME_UID : process.getuid?.() ?? 0;
     const gid = process.getgid?.() === 0 ? MODEL_RUNTIME_GID : process.getgid?.() ?? 0;
     await this.chownTree(destination, uid, gid);
     await chmod(destination, 0o700);
+  }
+
+  private async mergeAgentTree(source: string, destination: string): Promise<void> {
+    for (const entry of await readdir(source, { withFileTypes: true })) {
+      const sourcePath = join(source, entry.name);
+      const destinationPath = join(destination, entry.name);
+      const sourceInfo = await lstat(sourcePath);
+      let destinationInfo;
+      try { destinationInfo = await lstat(destinationPath); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+
+      if (sourceInfo.isDirectory()) {
+        if (destinationInfo && (!destinationInfo.isDirectory() || destinationInfo.isSymbolicLink())) throw new Error("MODEL_AGENT_MIGRATION_COLLISION");
+        if (!destinationInfo) await mkdir(destinationPath, { mode: sourceInfo.mode & 0o777 });
+        await this.mergeAgentTree(sourcePath, destinationPath);
+        continue;
+      }
+
+      if (!sourceInfo.isFile() || sourceInfo.isSymbolicLink() || sourceInfo.nlink > 1) throw new Error("MODEL_AGENT_UNSAFE_FILE_ENTRY");
+      if (!destinationInfo) {
+        await copyFile(sourcePath, destinationPath);
+        continue;
+      }
+      if (!destinationInfo.isFile() || destinationInfo.isSymbolicLink() || destinationInfo.nlink > 1) throw new Error("MODEL_AGENT_MIGRATION_COLLISION");
+      const [sourceBytes, destinationBytes] = await Promise.all([readFile(sourcePath), readFile(destinationPath)]);
+      if (sourceBytes.equals(destinationBytes) || isEmptyLegacyAgentPlaceholder(entry.name, sourceBytes)) continue;
+      if (isEmptyLegacyAgentPlaceholder(entry.name, destinationBytes)) {
+        const temporary = `${destinationPath}.migration-${process.pid}`;
+        await writeFile(temporary, sourceBytes, { mode: sourceInfo.mode & 0o777 });
+        await rename(temporary, destinationPath);
+        continue;
+      }
+      throw new Error("MODEL_AGENT_MIGRATION_COLLISION");
+    }
   }
 
   private async migrateSessions(): Promise<void> {
@@ -158,6 +199,14 @@ export class ModelPlaneService {
       if (info.isDirectory()) await this.validateAgentTree(child);
     }
   }
+}
+
+function isEmptyLegacyAgentPlaceholder(name: string, bytes: Buffer): boolean {
+  if (name !== "auth.json" && name !== "models-store.json") return false;
+  try {
+    const value = JSON.parse(bytes.toString("utf8")) as unknown;
+    return Boolean(value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length === 0);
+  } catch { return false; }
 }
 
 async function moveSession(source: string, destination: string): Promise<boolean> {

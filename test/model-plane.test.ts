@@ -46,3 +46,47 @@ test("Model Plane migration moves Pi credentials and session state out of Princi
     assert.equal(owner.gid, process.getgid?.() === 0 ? MODEL_RUNTIME_GID : process.getgid?.());
   } finally { db.close(); await rm(root, { recursive: true, force: true }); }
 });
+
+test("Model Plane migration safely reconciles legacy placeholders with an existing destination", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-home-model-plane-reconcile-"));
+  const db = new SqliteStore(join(root, "agent.db")); migrate(db, runtimeMigrations);
+  const legacy = join(root, "home", ".pi", "agent");
+  const destination = join(root, "model", "pi", "agent");
+  try {
+    await mkdir(legacy, { recursive: true });
+    await mkdir(destination, { recursive: true });
+    await writeFile(join(legacy, "auth.json"), JSON.stringify({ token: "legacy-credential" }));
+    await writeFile(join(legacy, "models-store.json"), "{}\n");
+    await writeFile(join(legacy, "legacy-settings.json"), JSON.stringify({ retained: true }));
+    await writeFile(join(destination, "auth.json"), "{}\n");
+    await writeFile(join(destination, "models-store.json"), JSON.stringify({ catalog: "current" }));
+
+    const plane = new ModelPlaneService(db, root);
+    await plane.ensure();
+
+    assert.deepEqual(JSON.parse(await readFile(join(destination, "auth.json"), "utf8")), { token: "legacy-credential" });
+    assert.deepEqual(JSON.parse(await readFile(join(destination, "models-store.json"), "utf8")), { catalog: "current" });
+    assert.deepEqual(JSON.parse(await readFile(join(destination, "legacy-settings.json"), "utf8")), { retained: true });
+    assert.deepEqual(JSON.parse(await readFile(join(legacy, "auth.json"), "utf8")), { token: "legacy-credential" });
+
+    await plane.ensure();
+    assert.deepEqual(JSON.parse(await readFile(join(destination, "auth.json"), "utf8")), { token: "legacy-credential" });
+  } finally { db.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("Model Plane migration preserves conflicting non-placeholder credentials and fails closed", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-home-model-plane-conflict-"));
+  const db = new SqliteStore(join(root, "agent.db")); migrate(db, runtimeMigrations);
+  const legacy = join(root, "home", ".pi", "agent");
+  const destination = join(root, "model", "pi", "agent");
+  try {
+    await mkdir(legacy, { recursive: true });
+    await mkdir(destination, { recursive: true });
+    await writeFile(join(legacy, "auth.json"), JSON.stringify({ token: "legacy-credential" }));
+    await writeFile(join(destination, "auth.json"), JSON.stringify({ token: "model-plane-credential" }));
+    const plane = new ModelPlaneService(db, root);
+    await assert.rejects(plane.ensure(), /MODEL_AGENT_MIGRATION_COLLISION/);
+    assert.deepEqual(JSON.parse(await readFile(join(legacy, "auth.json"), "utf8")), { token: "legacy-credential" });
+    assert.deepEqual(JSON.parse(await readFile(join(destination, "auth.json"), "utf8")), { token: "model-plane-credential" });
+  } finally { db.close(); await rm(root, { recursive: true, force: true }); }
+});
