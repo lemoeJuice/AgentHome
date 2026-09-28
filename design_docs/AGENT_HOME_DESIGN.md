@@ -172,7 +172,7 @@ Host Controller restart ≠ Worker 自动停止
 └─────────────────────────────────────────────────────┘
 ```
 
-Owner and Guest share the same Trusted Pi Runtime and Principal-scoped ExecutionBackend. Pi receives only fixed trusted Runtime extensions; it has no workspace mount and no unrestricted built-in tools. `guest-persistent-sandbox-design.md` defines the UID/GID filesystem and network boundary.
+Owner and Guest share the same Trusted Pi Runtime and Principal-scoped ExecutionBackend. Pi receives only fixed trusted Runtime extensions; it has no workspace mount and no unrestricted built-in tools. `GUEST_PERSISTENT_SANDBOX_DESIGN.md` defines the UID/GID filesystem and network boundary.
 
 ---
 
