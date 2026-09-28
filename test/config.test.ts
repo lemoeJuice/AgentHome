@@ -118,6 +118,15 @@ test("loadConfig derives the container proxy endpoint from configurable relay po
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test("loadConfig defaults the host proxy relay to Mihomo's HTTP port", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-home-proxy-relay-default-"));
+  const configPath = join(root, "agent-home.json");
+  try {
+    await writeFile(configPath, JSON.stringify({ instanceId: "proxy-relay-default", snowluma: { endpoint: "ws://snowluma", apiEndpoint: "http://snowluma" } }));
+    assert.equal((await loadConfig(configPath)).network.proxyRelay.upstreamPort, 7897);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("loadConfig validates proxy relay ports and upstream host", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-proxy-relay-invalid-"));
   const configPath = join(root, "agent-home.json");

@@ -21,7 +21,7 @@ async function main(): Promise<void> {
   if (command === "hold") { await holdProcess(); return; }
   if (command === "supervise") { await superviseRuntime(); return; }
   if (command === "proxy-relay") {
-    const server = createProxyRelay({ listenPort: Number(process.env.AGENT_HOME_PROXY_RELAY_LISTEN_PORT ?? process.env.AGENT_HOME_PROXY_RELAY_PORT ?? 17890), upstreamHost: process.env.AGENT_HOME_PROXY_RELAY_UPSTREAM_HOST ?? "127.0.0.1", upstreamPort: Number(process.env.AGENT_HOME_PROXY_RELAY_UPSTREAM_PORT ?? process.env.AGENT_HOME_PROXY_UPSTREAM_PORT ?? 7890) });
+    const server = createProxyRelay({ listenPort: Number(process.env.AGENT_HOME_PROXY_RELAY_LISTEN_PORT ?? process.env.AGENT_HOME_PROXY_RELAY_PORT ?? 17890), upstreamHost: process.env.AGENT_HOME_PROXY_RELAY_UPSTREAM_HOST ?? "127.0.0.1", upstreamPort: Number(process.env.AGENT_HOME_PROXY_RELAY_UPSTREAM_PORT ?? process.env.AGENT_HOME_PROXY_UPSTREAM_PORT ?? 7897) });
     await new Promise<void>((resolve, reject) => { server.once("listening", resolve); server.once("error", reject); });
     await waitForSignal(() => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())));
     return;

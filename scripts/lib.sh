@@ -107,7 +107,7 @@ agent_home_model_proxy_url() {
 agent_home_proxy_relay_settings() {
   local config_path="${AGENT_HOME_CONFIG:-$ROOT_DIR/config/agent-home.json}"
   if [[ "$config_path" != /* ]]; then config_path="$ROOT_DIR/$config_path"; fi
-  CONFIG_PATH="$config_path" node --input-type=module -e 'import fs from "node:fs";const config=JSON.parse(fs.readFileSync(process.env.CONFIG_PATH,"utf8"));const relay=config.network?.proxyRelay??{enabled:true,listenPort:17890,upstreamHost:"127.0.0.1",upstreamPort:7890};const values=[relay.enabled===false?"0":"1",relay.listenPort??17890,relay.upstreamHost??"127.0.0.1",relay.upstreamPort??7890];if(values.some((value)=>String(value).includes("\n")||String(value).includes("\t")))process.exit(2);process.stdout.write(values.join("\t"));'
+  CONFIG_PATH="$config_path" node --input-type=module -e 'import fs from "node:fs";const config=JSON.parse(fs.readFileSync(process.env.CONFIG_PATH,"utf8"));const relay=config.network?.proxyRelay??{enabled:true,listenPort:17890,upstreamHost:"127.0.0.1",upstreamPort:7897};const values=[relay.enabled===false?"0":"1",relay.listenPort??17890,relay.upstreamHost??"127.0.0.1",relay.upstreamPort??7897];if(values.some((value)=>String(value).includes("\n")||String(value).includes("\t")))process.exit(2);process.stdout.write(values.join("\t"));'
 }
 
 AGENT_HOME_PROXY_BYPASS="localhost,127.0.0.1,::1,host.containers.internal,$SNOWLUMA_CONTAINER,$AGENT_HOME_CONTAINER"
