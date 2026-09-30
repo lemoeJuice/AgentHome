@@ -217,6 +217,10 @@ export class PrincipalService {
     return resolve(this.stateRoot, "workspaces", "conversations", key, "projects", canonicalWorkspaceId(workspaceId));
   }
 
+  workspaceMemoryPath(conversationId: string, workspaceId: string): string {
+    return join(this.conversationWorkspacePath(conversationId, workspaceId), ".agent", "memory");
+  }
+
   async ensureConversationWorkspacePath(conversationId: string, workspaceId: string): Promise<string> {
     const dirs = await this.ensureConversationWorkspace(conversationId);
     const candidate = resolve(dirs.projects, canonicalWorkspaceId(workspaceId));
@@ -226,6 +230,11 @@ export class PrincipalService {
     const existing = await lstat(realCandidate);
     if (existing.uid !== 0 || existing.gid !== dirs.gid) await this.chownTree(realCandidate, 0, dirs.gid);
     await this.setSharedWorkspaceModes(realCandidate);
+    for (const directory of [join(realCandidate, ".agent"), this.workspaceMemoryPath(conversationId, workspaceId)]) {
+      await mkdir(directory, { recursive: true, mode: 0o2770 });
+      await this.chownTree(directory, 0, dirs.gid);
+      await this.setSharedWorkspaceModes(directory);
+    }
     return realCandidate;
   }
 
