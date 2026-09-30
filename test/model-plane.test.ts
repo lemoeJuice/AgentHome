@@ -7,15 +7,17 @@ import { dirname, join } from "node:path";
 import { SqliteStore, migrate } from "../src/db.js";
 import { runtimeMigrations } from "../src/schema.js";
 import { ModelPlaneService, MODEL_RUNTIME_GID, MODEL_RUNTIME_UID } from "../src/runtime/model-plane.js";
+import { OWNER_RUNTIME_UID } from "../src/runtime/principals.js";
 
 test("Model Plane migration moves Pi credentials and session state out of Principal paths", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-model-plane-migration-"));
   const db = new SqliteStore(join(root, "agent.db"));
   migrate(db, runtimeMigrations);
-  const oldAuth = join(root, "home", ".pi", "agent");
-  const oldMain = join(root, "home", ".pi", "main", "sessions", "conversation-1", "session.jsonl");
+  const ownerHome = join(root, "principals", `uid-${OWNER_RUNTIME_UID}`, "home");
+  const oldAuth = join(ownerHome, ".pi", "agent");
+  const oldMain = join(ownerHome, ".pi", "main", "sessions", "conversation-1", "session.jsonl");
   const oldWorker = join(root, "workers", "orchestrators", "worker-legacy", "session", "session.jsonl");
-  const oldWorkspace = join(root, "home", ".pi", "main", "workspaces", "conversation-1");
+  const oldWorkspace = join(ownerHome, ".pi", "main", "workspaces", "conversation-1");
   const timestamp = new Date().toISOString();
   await mkdir(oldAuth, { recursive: true });
   await mkdir(dirname(oldMain), { recursive: true });
@@ -30,7 +32,7 @@ test("Model Plane migration moves Pi credentials and session state out of Princi
     const plane = new ModelPlaneService(db, root);
     await plane.ensure();
     assert.equal(await readFile(join(plane.paths.agentDir, "auth.json"), "utf8"), "model-only-auth");
-    await assert.rejects(readFile(join(root, "home", ".pi", "agent", "auth.json"), "utf8"));
+    await assert.rejects(readFile(join(ownerHome, ".pi", "agent", "auth.json"), "utf8"));
     const mainPath = db.get<{ main_session_path: string }>("SELECT main_session_path FROM conversations WHERE conversation_id=?", "conversation-1")?.main_session_path;
     const workerPath = db.get<{ harness_session_path: string }>("SELECT harness_session_path FROM worker_executions WHERE id=?", "worker-legacy")?.harness_session_path;
     assert.equal(mainPath, join(plane.paths.mainSessions, createHash("sha256").update("conversation-1").digest("hex"), "session.jsonl"));
@@ -50,7 +52,7 @@ test("Model Plane migration moves Pi credentials and session state out of Princi
 test("Model Plane migration safely reconciles legacy placeholders with an existing destination", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-model-plane-reconcile-"));
   const db = new SqliteStore(join(root, "agent.db")); migrate(db, runtimeMigrations);
-  const legacy = join(root, "home", ".pi", "agent");
+  const legacy = join(root, "principals", `uid-${OWNER_RUNTIME_UID}`, "home", ".pi", "agent");
   const destination = join(root, "model", "pi", "agent");
   try {
     await mkdir(legacy, { recursive: true });
@@ -77,7 +79,7 @@ test("Model Plane migration safely reconciles legacy placeholders with an existi
 test("Model Plane migration preserves conflicting non-placeholder credentials and fails closed", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-model-plane-conflict-"));
   const db = new SqliteStore(join(root, "agent.db")); migrate(db, runtimeMigrations);
-  const legacy = join(root, "home", ".pi", "agent");
+  const legacy = join(root, "principals", `uid-${OWNER_RUNTIME_UID}`, "home", ".pi", "agent");
   const destination = join(root, "model", "pi", "agent");
   try {
     await mkdir(legacy, { recursive: true });

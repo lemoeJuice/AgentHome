@@ -23,12 +23,9 @@ RUN gcc -O2 -Wall -Wextra -o /usr/local/bin/agent-home-guest-exec /tmp/guest-exe
 RUN printf '%s\n' '#!/bin/sh' 'exec node /app/dist/cli.js "$@"' > /usr/local/bin/agent-home \
   && chmod 755 /usr/local/bin/agent-home
 
-ENV HOME=/state/home \
+ENV HOME=/root \
     PI_CODING_AGENT_DIR=/state/model/pi/agent \
     PATH=/state/pi/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-    XDG_CONFIG_HOME=/state/home/.config \
-    XDG_DATA_HOME=/state/home/.local/share \
-    XDG_STATE_HOME=/state/home/.local/state \
     XDG_CACHE_HOME=/cache \
     TMPDIR=/scratch/tmp \
     AGENT_HOME_STATE=/state

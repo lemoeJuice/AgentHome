@@ -2,6 +2,7 @@ import { chown, chmod, copyFile, lstat, mkdir, readFile, readdir, realpath, rena
 import { createHash } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import type { SqliteStore } from "../db.js";
+import { OWNER_RUNTIME_UID } from "./principals.js";
 
 export const MODEL_RUNTIME_UID = 10_002;
 export const MODEL_RUNTIME_GID = 10_002;
@@ -61,7 +62,7 @@ export class ModelPlaneService {
   }
 
   private async migrateLegacyAgentDirectory(): Promise<void> {
-    const legacy = join(this.stateRoot, "home", ".pi", "agent");
+    const legacy = join(this.stateRoot, "principals", `uid-${OWNER_RUNTIME_UID}`, "home", ".pi", "agent");
     const destination = this.paths.agentDir;
     if (resolve(legacy) === destination) return;
     let sourceInfo;

@@ -1153,7 +1153,7 @@ Owner 与 Guest 共用 Pi、Runtime Tool Protocol 和 `ExecutionBackend`。Runti
 
 Pi provider auth 位于 `/state/model/pi/agent`，由 Model Plane UID 10002 持有。Principal execution 不获得 provider token、auth path bind、环境变量副本或临时凭据文件。系统当前没有通用 `secret.read` 或 raw secret export tool；未来需要服务凭据时必须将 `secret.use` 与 `secret.export` 分开，默认不提供 `secret.export`。Model Plane 直接访问模型 provider，不经过 LLM reverse proxy。
 
-Owner workspace 同样属于 `/state/principals/principal:owner`。`/state/home` 和 `/state/projects` 只作为迁移兼容路径指向 Owner Principal 数据；Controller SQLite、Runtime secrets、Model Plane 和 worker session state 不在 execution namespace 中。
+Worker 工作区按 origin Conversation 隔离并共享：同一群聊/私聊的 Tasks 使用该会话的稳定工作区身份和目录，不同 Conversation 使用不同 UID 与目录。调用者 Principal 不因此合并；每个 Worker 的读写权限仍由发起者当前 Capability 快照约束。工作区路径使用 Conversation ID 的 SHA-256 目录名，不把平台 ID 或 Principal ID 直接作为文件路径。个人 Home/Cache/Artifacts 则保留在以 runtime UID 命名的 Principal 目录中；旧的 `/state/home`、`/state/projects` symlink 兼容层不再创建。
 
 Guest execution 另外受 `guest.enabled`、Principal capability、UID/GID filesystem permission 与 Guest UID nftables policy 约束。Model Plane provider networking 不受 Guest egress rules 限制。
 
@@ -1198,16 +1198,16 @@ Privilege-changing command 必须由 deterministic Runtime 处理。
 
 # 18. Workspace
 
-每个 Principal（包括 Owner）使用 Agent Home 内独立、持久的 project workspace。
+每个 Conversation 使用 Agent Home 内独立、持久的 project workspace；同一 Conversation 的不同调用者共享文件，但各自 Task/Worker 的权限仍独立授权。
 
 MVP：
 
 ```text
-/state/principals/<principal-id>/projects/<workspace-id>
+/state/workspaces/conversations/<sha256(conversation-id)>/projects/<workspace-id>
 +
-per-principal workspace scope
+per-conversation execution UID/GID and caller Capability check
 +
-per-project writer lock
+conversation-scoped writer lock
 ```
 
 不要提前加入 Git worktree。

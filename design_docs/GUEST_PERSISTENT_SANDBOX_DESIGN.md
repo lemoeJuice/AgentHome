@@ -1027,13 +1027,13 @@ Execution Plane (TaskService ExecutionBackend)
   Owner UID   Guest UID
 ```
 
-- 固定 Owner UID/GID 为 `10001`；Guest UID/GID 分配范围为 `20000–60000`；Trusted Pi Model Plane 使用 `10002`，不属于任何 Principal。
-- Owner、Guest Worker 都以 `PRINCIPAL_BROKERED` 模式运行：Pi 进程是 Model Plane，命令和 workspace 操作由 `agent-home-guest-exec` 以对应 Principal UID/GID 启动。
+- 固定 Owner UID/GID 为 `10001`；Principal UID/GID 分配范围为 `20000–60000`；Trusted Pi Model Plane 使用 `10002`，不属于任何 Principal。Conversation workspace 使用独立 UID 范围：Owner 私聊 `10003–19999`，Guest/群聊 `60001–65535`。
+- Owner、Guest Worker 都以 `PRINCIPAL_BROKERED` 模式运行：Pi 进程是 Model Plane；workspace command 由 `agent-home-guest-exec` 以当前 Conversation 的 workspace UID/GID 启动，调用者的授权仍使用独立 Principal 和 Capability。
 - Trusted Pi 的 bwrap mount 只提供 Pi command/runtime、`/state/model/pi/agent`、Model Plane session、Unix Runtime Tool socket 和固定 Runtime extension；不 bind Principal workspace。`--no-builtin-tools --no-extensions --no-skills --no-context-files` 禁止项目 extensions 自动加载。
-- Owner Principal 的 home/projects/cache/artifacts 与 Guest 同样位于 `/state/principals/<principal-id>/`。旧 `/state/home`、`/state/projects` 迁移为兼容 symlink；旧 Pi auth/session 会迁入 Model Plane。
+- Principal 的 home/cache/artifacts 位于 `/state/principals/uid-<runtime-uid>/`；项目 workspace 位于 `/state/workspaces/conversations/<sha256(conversation-id)>/projects/`。不创建 `/state/home`、`/state/projects` 兼容 symlink；Pi auth/session 位于 Model Plane。
 - Owner/Guest 的 shell 和 workspace read/write/edit/mkdir/remove/list/stat 工具均由 ExecutionBackend 执行。`ExecutionContext` 的 task、worker、principal、uid/gid、role、capability、workspace 由 Runtime 的持久记录生成；模型只发送 operation 参数。
 - Model Plane auth 位于 `/state/model/pi/agent`，UID 10002 所有，Principal UID 无目录访问权。Pi provider 凭据不进入 Principal home、workspace、tool env 或 Worker process；Execution Plane 不提供 Pi auth mount。
-- Model Plane 直接连接模型 provider；Guest UID nftables 限制只匹配 Guest 范围，不阻挡 Model Plane provider 网络。
+- Model Plane 直接连接模型 provider；Guest 和 guest/group Conversation workspace UID nftables 限制不阻挡 Model Plane provider 网络。
 - `guest.enabled` 默认为关闭；启用执行要求外层 rootless Podman user namespace 映射完整 Principal UID 范围、容器 root 能 setuid/setgid、`NET_ADMIN` 可用、nftables 安装成功。state volume 不使用 `:U`，保留 numeric owner。
 - CPU/AS/NPROC/FSIZE/NOFILE 当前由 helper 的 RLIMIT 与 wall-clock/output/workspace 检查控制；Pi/Node 22 的 undici WebAssembly 需要 16 GiB `RLIMIT_AS` address-space ceiling 才能启动，但这不是 16 GiB resident-memory/cgroup 限制。尚无 per-worker cgroup 和 filesystem quota。现有 Guest active-worker quota 保持每 Principal 单 Worker；Owner process cleanup 按 Worker process group，避免跨 Worker UID 清理。
 - 当前没有通用 `secret.read`、`secret.use` 或 `secret.export` Principal tool。Pi provider credentials 只属于 Model Plane；未来普通服务凭据的 `secret.use`/`secret.export` 需要单独授权 API，raw export 默认关闭。

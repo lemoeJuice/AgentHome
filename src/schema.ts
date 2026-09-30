@@ -297,6 +297,16 @@ export const runtimeMigrations = [
       ALTER TABLE worker_executions ADD COLUMN finish_result_json TEXT;
     `,
   },
+  {
+    version: 22,
+    sql: `
+      CREATE TABLE IF NOT EXISTS conversation_workspaces (
+        conversation_id TEXT PRIMARY KEY REFERENCES conversations(conversation_id),
+        runtime_uid INTEGER NOT NULL UNIQUE, runtime_gid INTEGER NOT NULL UNIQUE,
+        created_at TEXT NOT NULL
+      );
+    `,
+  },
 ];
 
 export function ensureRuntimeSchema(store: SqliteStore): void {

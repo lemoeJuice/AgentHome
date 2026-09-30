@@ -53,6 +53,19 @@ function fakePrincipals(root: string): PrincipalService {
       await mkdir(path, { recursive: true, mode: 0o700 });
       return path;
     },
+    async ensureConversationWorkspace(conversationId: string) {
+      const base = join(root, "conversation-workspaces", conversationId);
+      const dirs = { root: base, home: join(base, "home"), projects: join(base, "projects"), cache: join(base, "cache"), uid: 30001, gid: 30001 };
+      await Promise.all(Object.values(dirs).filter((value): value is string => typeof value === "string").map((path) => mkdir(path, { recursive: true, mode: 0o700 })));
+      return dirs;
+    },
+    async ensureConversationWorkspacePath(conversationId: string, workspaceId: string) {
+      const path = join(root, "conversation-workspaces", conversationId, "projects", workspaceId);
+      await mkdir(path, { recursive: true, mode: 0o700 });
+      return path;
+    },
+    conversationWorkspacePath(conversationId: string, workspaceId: string) { return join(root, "conversation-workspaces", conversationId, "projects", workspaceId); },
+    async conversationWorkspaceProcessEnvironment(conversationId: string) { return { ...process.env, HOME: join(root, "conversation-workspaces", conversationId, "home") }; },
     workspacePathSync(principalId: string, workspaceId: string) { return join(principalRoot(principalId), "projects", workspaceId); },
     principalProcessEnvironment(principalId: string) { return { ...process.env, HOME: join(principalRoot(principalId), "home") }; },
   } as unknown as PrincipalService;
@@ -78,16 +91,16 @@ test("Guest default Worker profile is writable and Pi tool dispatch keeps Princi
   const workerId = "worker_guest-write";
   const workerCaps = { ...taskCaps, projects: [{ projectId: "default", access: "WRITE" as const }] };
   const timestamp = new Date().toISOString();
-  db.run("INSERT INTO worker_executions(id,task_id,objective,status,harness,workspace_id,workspace_access,capabilities_json,updated_at,principal_id,runtime_uid,runtime_gid,workspace_scope_id,process_mode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", workerId, task.id, "create a file", "RUNNING", "pi", "default", "WRITE", JSON.stringify(workerCaps), timestamp, requester.principalId!, 20001, 20001, `principal:${requester.principalId}:default`, "PRINCIPAL_BROKERED");
+  db.run("INSERT INTO worker_executions(id,task_id,objective,status,harness,workspace_id,workspace_access,capabilities_json,updated_at,principal_id,runtime_uid,runtime_gid,workspace_scope_id,process_mode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", workerId, task.id, "create a file", "RUNNING", "pi", "default", "WRITE", JSON.stringify(workerCaps), timestamp, requester.principalId!, 30001, 30001, "conversation:conversation:default", "PRINCIPAL_BROKERED");
 
   try {
     const execution = await service.executionContext(workerId);
-    const expectedWorkspace = await principals.workspacePath(requester.principalId!, "default");
+    const expectedWorkspace = await principals.ensureConversationWorkspacePath("conversation", "default");
     assert.equal(execution.taskId, task.id);
     assert.equal(execution.principalId, requester.principalId);
     assert.equal(execution.role, "GUEST");
-    assert.equal(execution.uid, 20001);
-    assert.equal(execution.gid, 20001);
+    assert.equal(execution.uid, 30001);
+    assert.equal(execution.gid, 30001);
     assert.equal(execution.workspaceId, "default");
     assert.equal(execution.workspace, expectedWorkspace);
     assert.equal(execution.workspaceAccess, "WRITE");
@@ -115,7 +128,7 @@ test("Guest default Worker profile is writable and Pi tool dispatch keeps Princi
       const current = await service.executionContext(resolved.workerId!);
       assert.equal(current.principalId, requester.principalId);
       assert.equal(current.workspace, expectedWorkspace);
-      assert.equal(current.uid, 20001);
+      assert.equal(current.uid, 30001);
       assert.deepEqual(current.capabilities.projects, [{ projectId: "default", access: "WRITE" }]);
       if (action === "workspace_write") return await service.writeFile(current, String((input as Record<string, unknown>).path), String((input as Record<string, unknown>).content));
       throw new Error("TEST_ACTION_UNEXPECTED");
@@ -153,11 +166,11 @@ test("Guest Worker cannot write another Principal workspace and read-only profil
   const caps = capabilities();
   const service = new TaskService(db, {} as never, new ArtifactService(db, root), config, { workerRoot: root, principals, guestExecCommand: await createExecHelper(root) }, logger);
   const task = service.createTask({ title: "isolation", goal: "isolation", requester, trust: "GUEST", originConversationId: "conversation", notificationConversationId: "conversation", parentCapabilities: caps });
-  const otherWorkspace = await principals.workspacePath("principal_other", "default");
+  const otherWorkspace = await principals.ensureConversationWorkspacePath("conversation-other", "default");
   const timestamp = new Date().toISOString();
   const insertWorker = (id: string, access: "READ" | "WRITE", projectAccess: "READ" | "WRITE") => {
     const workerCaps = { ...caps, projects: [{ projectId: "default", access: projectAccess }] };
-    db.run("INSERT INTO worker_executions(id,task_id,objective,status,harness,workspace_id,workspace_access,capabilities_json,updated_at,principal_id,runtime_uid,runtime_gid,workspace_scope_id,process_mode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", id, task.id, id, "RUNNING", "pi", "default", access, JSON.stringify(workerCaps), timestamp, requester.principalId!, 20001, 20001, `principal:${requester.principalId}:default`, "PRINCIPAL_BROKERED");
+    db.run("INSERT INTO worker_executions(id,task_id,objective,status,harness,workspace_id,workspace_access,capabilities_json,updated_at,principal_id,runtime_uid,runtime_gid,workspace_scope_id,process_mode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", id, task.id, id, "RUNNING", "pi", "default", access, JSON.stringify(workerCaps), timestamp, requester.principalId!, 30001, 30001, "conversation:conversation:default", "PRINCIPAL_BROKERED");
   };
   insertWorker("worker-guest-write", "WRITE", "WRITE");
   insertWorker("worker-guest-readonly", "READ", "READ");
@@ -183,7 +196,7 @@ test("reconstructed Principal Worker context fails closed and differentiates wor
   const service = new TaskService(db, {} as never, new ArtifactService(db, root), testConfig(), { workerRoot: root, principals, guestExecCommand: await createExecHelper(root) }, logger);
   const task = service.createTask({ title: "recovered", goal: "recovered", requester, trust: "GUEST", originConversationId: "conversation", notificationConversationId: "conversation", parentCapabilities: caps });
   const timestamp = new Date().toISOString();
-  const insert = (id: string, snapshot: CapabilitySet | null) => db.run("INSERT INTO worker_executions(id,task_id,objective,status,harness,workspace_id,workspace_access,capabilities_json,updated_at,principal_id,runtime_uid,runtime_gid,workspace_scope_id,process_mode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", id, task.id, id, "RUNNING", "pi", "default", "WRITE", snapshot ? JSON.stringify(snapshot) : null, timestamp, requester.principalId!, 20001, 20001, `principal:${requester.principalId}:default`, "PRINCIPAL_BROKERED");
+  const insert = (id: string, snapshot: CapabilitySet | null) => db.run("INSERT INTO worker_executions(id,task_id,objective,status,harness,workspace_id,workspace_access,capabilities_json,updated_at,principal_id,runtime_uid,runtime_gid,workspace_scope_id,process_mode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", id, task.id, id, "RUNNING", "pi", "default", "WRITE", snapshot ? JSON.stringify(snapshot) : null, timestamp, requester.principalId!, 30001, 30001, "conversation:conversation:default", "PRINCIPAL_BROKERED");
   insert("worker-recovered", { ...caps, projects: [{ projectId: "default", access: "WRITE" }] });
   insert("worker-no-capability-snapshot", null);
   insert("worker-missing-project-capability", { ...caps, projects: [] });
@@ -194,7 +207,7 @@ test("reconstructed Principal Worker context fails closed and differentiates wor
     const rebuilt = await rebuiltService.executionContext("worker-recovered");
     assert.deepEqual(rebuilt, first);
     assert.equal(rebuilt.contextSource, "durable-worker-record");
-    assert.equal(rebuilt.workspace, await principals.workspacePath(requester.principalId!, "default"));
+    assert.equal(rebuilt.workspace, await principals.ensureConversationWorkspacePath("conversation", "default"));
     await assert.rejects(() => service.readFile(rebuilt, "not-present.txt"), /WORKSPACE_PATH_NOT_FOUND/);
     await service.recover();
     const reconstructedWorker = service.getWorker("worker-no-capability-snapshot");
