@@ -17,6 +17,19 @@ test("loadConfig reads multiple Bot Owner identities from the main config", asyn
   }
 });
 
+test("loadConfig keeps the System Admin allowlist independent from Owner identities", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-home-config-system-admin-"));
+  const configPath = join(root, "agent-home.json");
+  try {
+    await writeFile(configPath, JSON.stringify({ instanceId: "system-admin-config", owners: [{ platform: "qq", accountId: "a", userId: "owner" }], systemAdmins: [], snowluma: { endpoint: "ws://snowluma", apiEndpoint: "http://snowluma" } }));
+    const config = await loadConfig(configPath);
+    assert.deepEqual(config.owners, [{ platform: "qq", accountId: "a", userId: "owner" }]);
+    assert.deepEqual(config.systemAdmins, []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("loadConfig accepts an unconfigured deployment without an Owner", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-config-no-owner-"));
   const configPath = join(root, "agent-home.json");

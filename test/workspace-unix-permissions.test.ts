@@ -11,9 +11,9 @@ test("workspace group and umask allow different Principals to create and edit sh
   if (probe.error) { context.skip("requires a C compiler for the production UID/GID helper"); return; }
   const root = await mkdtemp(join(tmpdir(), "agent-home-unix-workspace-"));
   const workspace = join(root, "workspace");
-  const helper = join(root, "guest-exec");
+  const helper = join(root, "principal-exec");
   try {
-    execFileSync("cc", ["-Wall", "-Wextra", "-Werror", "-O2", "-o", helper, "src/runtime/guest-exec.c"]);
+    execFileSync("cc", ["-Wall", "-Wextra", "-Werror", "-O2", "-o", helper, "src/runtime/principal-exec.c"]);
     const workspaceGid = 30001;
     const principalA = { uid: 20001, gid: 20001 };
     const principalB = { uid: 20002, gid: 20002 };

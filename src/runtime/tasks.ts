@@ -105,8 +105,6 @@ export class TaskService implements ExecutionBackend {
   async createWorker(input: { taskId: string; objective: string; workspaceId?: string; workspaceAccess?: "READ" | "WRITE"; requestedCapabilities?: Partial<CapabilitySet>; artifactRefs?: ArtifactRef[]; sourceMailboxId?: string; actor: CapabilitySet; actorPrincipalId?: string; actorRequester?: TaskRequester }): Promise<WorkerExecutionRecord> {
     const task = this.getTask(input.taskId);
     if (this.isTerminalTask(task.status) || this.cancellationRequested(task.id)) throw new Error("TASK_CREATE_WORKER_DENIED");
-    const isGuest = task.trust === "GUEST" && Boolean(this.options.principals);
-    if (isGuest && !this.config.guest.enabled) throw new Error("GUEST_TASK_EXECUTION_DISABLED");
     const effectivePrincipalId = task.requester.principalId ?? input.actorPrincipalId ?? input.actorRequester?.principalId;
     const principal = effectivePrincipalId ? this.options.principals?.get(effectivePrincipalId) : undefined;
     if (this.options.principals && !principal) throw new Error("WORKER_PRINCIPAL_REQUIRED");
@@ -120,7 +118,6 @@ export class TaskService implements ExecutionBackend {
     if (!actor.tasks.canCreate || !this.taskVisibleToActor(task, actor, actorPrincipalId, input.actorRequester)) throw new Error("TASK_CREATE_WORKER_DENIED");
     if (principalExecution && workspaceId && !workspaceAccess) throw new Error("PROJECT_ACCESS_DENIED");
     if (workspaceId && workspaceAccess && !task.capabilities.projects.some((project) => (project.projectId === "*" || project.projectId === workspaceId) && (project.access === "WRITE" || project.access === workspaceAccess))) throw new Error("PROJECT_ACCESS_DENIED");
-    if (isGuest && !principal) throw new Error("GUEST_PRINCIPAL_REQUIRED");
     if (principal && this.options.principals) {
       await this.options.principals.ensurePrincipalDirectories(principal.principalId);
       if (workspaceId) await this.options.principals.ensureConversationWorkspacePath(task.originConversationId, workspaceId);
@@ -134,7 +131,6 @@ export class TaskService implements ExecutionBackend {
     if (this.activeWorkerCount() >= this.limit("maxWorkersTotal")) throw new Error("WORKER_TOTAL_QUOTA_EXCEEDED");
     if (workspaceScopeId && this.activeProjectWorkerCount(workspaceScopeId) >= this.limit("maxWorkersPerProject")) throw new Error("WORKER_PROJECT_QUOTA_EXCEEDED");
     if (this.activeRequesterWorkerCount(task.requester) >= this.limit("maxWorkersPerRequester")) throw new Error("WORKER_REQUESTER_QUOTA_EXCEEDED");
-    if (isGuest && task.requester.principalId && this.activeRequesterWorkerCount(task.requester) >= this.config.guest.maxWorkersPerPrincipal) throw new Error("GUEST_WORKER_PRINCIPAL_QUOTA_EXCEEDED");
     const workerId = newId("worker");
     const requestedCapabilities = input.requestedCapabilities ?? defaultWorkerCapabilityRequest(task, workspaceId, workspaceAccess);
     let capabilities: CapabilitySet;
@@ -175,7 +171,6 @@ export class TaskService implements ExecutionBackend {
     if (worker.processMode !== "PRINCIPAL_BROKERED" && worker.processMode !== "GUEST_BROKERED") throw new Error("WORKER_EXECUTION_BACKEND_REQUIRED");
     const principal = this.options.principals.get(worker.principalId);
     if (!worker.workspaceId || !worker.workspaceAccess) throw new Error("WORKER_PRINCIPAL_IDENTITY_MISMATCH");
-    if (task.trust === "GUEST" && !this.config.guest.enabled) throw new Error("GUEST_PROCESS_EXEC_DENIED");
     const dirs = await this.options.principals.ensureConversationWorkspace(task.originConversationId);
     if (worker.runtimeUid !== principal.runtimeUid || worker.runtimeGid !== principal.runtimeGid || worker.workspaceGid !== dirs.gid) throw new Error("WORKER_PRINCIPAL_WORKSPACE_IDENTITY_MISMATCH");
     const workspace = await this.options.principals.ensureConversationWorkspacePath(task.originConversationId, worker.workspaceId);
@@ -236,15 +231,14 @@ export class TaskService implements ExecutionBackend {
     }
     const worker = this.getWorker(current.workerId);
     const task = this.getTask(current.taskId);
-    const guest = task.trust === "GUEST";
     if (!["STARTING", "RUNNING", "WAITING_USER"].includes(worker.status) || this.cancellationRequested(task.id)) throw new Error("WORKER_NOT_RUNNING");
     if (typeof input.command !== "string" || !input.command.trim() || input.command.length > (runtimeGeneratedCommand ? 600_000 : 32_768)) throw new Error("WORKER_COMMAND_INVALID");
-    const remainingTaskMs = guest ? this.remainingGuestTaskMs(task) : Number.POSITIVE_INFINITY;
+    const remainingTaskMs = task.deadlineAt ? this.remainingTaskMs(task) : Number.POSITIVE_INFINITY;
     const principalDirs = await this.options.principals!.ensurePrincipalDirectories(current.principalId);
     const root = await realpath(current.workspace);
-    const cwd = await this.resolveGuestWorkingDirectory(root, input.cwd);
-    if (guest) await this.assertGuestQuota(principalDirs, root);
-    const commandTimeout = guest ? this.config.guest.commandTimeoutMs : this.config.runtime.piTimeoutMs;
+    const cwd = await this.resolveWorkspaceWorkingDirectory(root, input.cwd);
+    await this.assertPrincipalQuota(principalDirs, root);
+    const commandTimeout = this.config.guest.commandTimeoutMs;
     const timeoutMs = Math.max(1, Math.min(Number.isSafeInteger(input.timeoutMs) ? Number(input.timeoutMs) : commandTimeout, commandTimeout, remainingTaskMs));
     const helper = this.options.principalExecCommand ?? "/usr/local/bin/agent-home-principal-exec";
     const environment = { ...this.options.principals!.principalProcessEnvironment(current.principalId, this.config.network?.modelProxyUrl), HOME: current.home, WORKSPACE: current.workspace, AGENT_PERSONAL_MEMORY: this.options.principals!.principalMemoryPath(current.principalId), AGENT_WORKSPACE_MEMORY: this.options.principals!.workspaceMemoryPath(task.originConversationId, current.workspaceId) };
@@ -285,14 +279,14 @@ export class TaskService implements ExecutionBackend {
       if (signal === "SIGTERM") setTimeout(() => { try { process.kill(-child.pid!, "SIGKILL"); } catch { /* process group exited */ } }, 1500).unref();
     };
     const timer = setTimeout(() => { quotaError = "PRINCIPAL_COMMAND_TIMEOUT"; killGroup("SIGTERM"); }, timeoutMs);
-    const quotaTimer = guest ? setInterval(() => {
+    const quotaTimer = setInterval(() => {
       quotaCheck = quotaCheck.then(async () => {
-        if (!settled && await this.guestQuotaExceeded(principalDirs, root)) {
-          quotaError = "GUEST_WORKSPACE_QUOTA_EXCEEDED";
+        if (!settled && await this.principalQuotaExceeded(principalDirs, root)) {
+          quotaError = "PRINCIPAL_WORKSPACE_QUOTA_EXCEEDED";
           killGroup("SIGTERM");
         }
-      }).catch((error) => { quotaError = `GUEST_QUOTA_CHECK_FAILED:${String(error).slice(0, 100)}`; killGroup("SIGTERM"); });
-    }, 2000).unref() : undefined;
+      }).catch((error) => { quotaError = `PRINCIPAL_QUOTA_CHECK_FAILED:${String(error).slice(0, 100)}`; killGroup("SIGTERM"); });
+    }, 2000).unref();
     const append = (current: string, chunk: Buffer): string => {
       outputBytes += chunk.byteLength;
       if (outputBytes > 1_048_576) {
@@ -328,29 +322,29 @@ export class TaskService implements ExecutionBackend {
     return this.execute(context, input);
   }
 
-  async prepareGuestToolContext(worker: WorkerExecutionRecord, task: TaskRecord): Promise<{ token: string; socketPath: string }> {
+  async prepareWorkerToolContext(worker: WorkerExecutionRecord, task: TaskRecord): Promise<{ token: string; socketPath: string }> {
     const context = this.options.createWorkerToolContext?.(worker, task);
     if (!context) throw new Error("WORKER_TOOL_CONTEXT_UNAVAILABLE");
     return context;
   }
 
-  private async resolveGuestWorkingDirectory(workspaceRoot: string, cwd?: string): Promise<string> {
+  private async resolveWorkspaceWorkingDirectory(workspaceRoot: string, cwd?: string): Promise<string> {
     if (!cwd) return workspaceRoot;
-    if (resolve(cwd) === cwd || cwd.startsWith("/") || cwd.split(/[\\/]/).includes("..")) throw new Error("GUEST_CWD_OUTSIDE_WORKSPACE");
+    if (resolve(cwd) === cwd || cwd.startsWith("/") || cwd.split(/[\\/]/).includes("..")) throw new Error("WORKSPACE_CWD_OUTSIDE_ROOT");
     const candidate = resolve(workspaceRoot, cwd);
-    if (!pathWithin(workspaceRoot, candidate)) throw new Error("GUEST_CWD_OUTSIDE_WORKSPACE");
+    if (!pathWithin(workspaceRoot, candidate)) throw new Error("WORKSPACE_CWD_OUTSIDE_ROOT");
     await mkdir(candidate, { recursive: true, mode: 0o700 });
     const real = await realpath(candidate);
-    if (!pathWithin(workspaceRoot, real)) throw new Error("GUEST_CWD_OUTSIDE_WORKSPACE");
+    if (!pathWithin(workspaceRoot, real)) throw new Error("WORKSPACE_CWD_OUTSIDE_ROOT");
     return real;
   }
 
-  private async assertGuestQuota(principalDirs: { root: string; home: string; projects: string; cache: string; agent: string; artifacts: string }, workspace: string): Promise<void> {
-    const exceeded = await this.guestQuotaExceeded(principalDirs, workspace);
-    if (exceeded) throw new Error("GUEST_WORKSPACE_QUOTA_EXCEEDED");
+  private async assertPrincipalQuota(principalDirs: { root: string; home: string; projects: string; cache: string; agent: string; artifacts: string }, workspace: string): Promise<void> {
+    const exceeded = await this.principalQuotaExceeded(principalDirs, workspace);
+    if (exceeded) throw new Error("PRINCIPAL_WORKSPACE_QUOTA_EXCEEDED");
   }
 
-  private async guestQuotaExceeded(principalDirs: { root: string; home: string; projects: string; cache: string; agent: string; artifacts: string }, workspace: string): Promise<boolean> {
+  private async principalQuotaExceeded(principalDirs: { root: string; home: string; projects: string; cache: string; agent: string; artifacts: string }, workspace: string): Promise<boolean> {
     let workspaceBytes = 0;
     for (const directory of [principalDirs.home, principalDirs.projects, principalDirs.agent, principalDirs.artifacts]) {
       workspaceBytes += await directoryBytes(directory, this.config.guest.workspaceQuotaBytes - workspaceBytes);
@@ -387,7 +381,7 @@ export class TaskService implements ExecutionBackend {
     const task = this.getTask(worker.taskId);
     if (this.options.principals && !worker.principalId) { await this.failWorker(worker.id, "WORKER_PRINCIPAL_REQUIRED"); return; }
     const principalBrokered = isPrincipalBrokered(worker.processMode);
-    if (task.trust === "GUEST" && this.remainingGuestTaskMs(task) <= 0) { await this.failWorker(worker.id, "GUEST_TASK_TIMEOUT"); return; }
+    if (task.deadlineAt && this.remainingTaskMs(task) <= 0) { await this.failWorker(worker.id, "TASK_TIMEOUT"); return; }
     const modelUid = this.options.modelRuntimeUid ?? MODEL_RUNTIME_UID;
     const modelGid = this.options.modelRuntimeGid ?? MODEL_RUNTIME_GID;
     const sessionPath = this.workerSessionPath(worker.id);
@@ -401,7 +395,7 @@ export class TaskService implements ExecutionBackend {
         await this.options.principals.ensurePrincipalDirectories(worker.principalId);
         projectPath = await this.options.principals.ensureConversationWorkspacePath(task.originConversationId, worker.workspaceId ?? "default");
         await this.ensureSystemPrivateDirectory(dirname(sessionPath), modelUid, modelGid);
-        workerToolContext = await this.prepareGuestToolContext(worker, task);
+        workerToolContext = await this.prepareWorkerToolContext(worker, task);
       } else {
         await this.ensureSystemPrivateDirectory(dirname(sessionPath));
         await mkdir(projectPath, { recursive: true, mode: 0o700 });
@@ -470,7 +464,7 @@ export class TaskService implements ExecutionBackend {
     ].join("\n");
     try {
       const useWorkerExtension = Boolean(this.options.workerToolExtensionPath && (mcpToken || principalBrokered));
-      const timeoutMs = task.trust === "GUEST" ? Math.min(this.config.runtime.piTimeoutMs, this.remainingGuestTaskMs(task)) : this.config.runtime.piTimeoutMs;
+      const timeoutMs = task.deadlineAt ? Math.min(this.config.runtime.piTimeoutMs, this.remainingTaskMs(task)) : this.config.runtime.piTimeoutMs;
       const outputPromise = this.pi.send(session, prompt, { cwd: piCwd, sandbox, timeoutMs, taskId: task.id, workerId: worker.id, ...(useWorkerExtension ? { extensionPath: this.options.workerToolExtensionPath } : {}), ...(principalBrokered ? { mainTools: true } : {}), ...(imageInputs.length ? { images: imageInputs } : {}) });
       const output = await outputPromise;
       await this.handleWorkerOutput(worker.id, output);
@@ -658,14 +652,14 @@ export class TaskService implements ExecutionBackend {
     for (const worker of workers) await this.revokeWorkerBinding(worker.id);
   }
 
-  async expireGuestTasks(): Promise<number> {
-    const rows = this.db.all<{ id: string }>("SELECT id FROM tasks WHERE trust='GUEST' AND status IN ('CREATED','QUEUED','RUNNING','WAITING_USER','PAUSED','INTERRUPTED')");
+  async expireDeadlinedTasks(): Promise<number> {
+    const rows = this.db.all<{ id: string }>("SELECT id FROM tasks WHERE deadline_at IS NOT NULL AND status IN ('CREATED','QUEUED','RUNNING','WAITING_USER','PAUSED','INTERRUPTED')");
     let expired = 0;
     for (const row of rows) {
       const task = this.getTask(row.id);
-      if (this.remainingGuestTaskMs(task) > 0) continue;
-      this.recordException(task.id, undefined, "guest_task", "GUEST_TASK_TIMEOUT", "Guest Task exceeded its configured wall-clock limit");
-      await this.requestCancel(task.id, undefined, undefined, undefined, "GUEST_TASK_TIMEOUT");
+      if (this.remainingTaskMs(task) > 0) continue;
+      this.recordException(task.id, undefined, "principal_task", "TASK_TIMEOUT", "Task exceeded its configured wall-clock limit");
+      await this.requestCancel(task.id, undefined, undefined, undefined, "TASK_TIMEOUT");
       expired += 1;
     }
     return expired;
@@ -728,7 +722,7 @@ export class TaskService implements ExecutionBackend {
           taskId: worker.taskId,
           workerId,
           ...(worker.principalId ? { sourcePrincipalId: worker.principalId } : {}),
-          ...(this.getTask(worker.taskId).trust === "GUEST" ? { principalQuotaBytes: this.config.guest.artifactQuotaBytes } : {}),
+          ...(worker.principalId ? { principalQuotaBytes: this.config.guest.artifactQuotaBytes } : {}),
           mime: input.mime,
           sourceType: "WORKER_OUTPUT",
           allowedRoots: [workspace],
@@ -1003,7 +997,7 @@ export class TaskService implements ExecutionBackend {
       await this.options.principals.ensurePrincipalDirectories(worker.principalId);
       await this.options.principals.ensureConversationWorkspacePath(this.getTask(worker.taskId).originConversationId, workspaceId ?? "default");
       await this.ensureSystemPrivateDirectory(dirname(session.sessionPath), modelUid, modelGid);
-      workerToolContext = await this.prepareGuestToolContext(worker, task);
+      workerToolContext = await this.prepareWorkerToolContext(worker, task);
     } else {
       await this.ensureSystemPrivateDirectory(dirname(session.sessionPath));
       await mkdir(projectPath, { recursive: true, mode: 0o700 });
@@ -1447,9 +1441,9 @@ export class TaskService implements ExecutionBackend {
     return ["COMPLETED", "PARTIAL", "FAILED", "CANCELLED"].includes(status);
   }
 
-  private remainingGuestTaskMs(task: TaskRecord): number {
-    if (task.trust !== "GUEST") return this.config.runtime.piTimeoutMs;
-    const deadline = task.deadlineAt ? Date.parse(task.deadlineAt) : Date.parse(task.createdAt) + (this.config.guest?.taskTimeoutMs ?? 30 * 60 * 1000);
+  private remainingTaskMs(task: TaskRecord): number {
+    if (!task.deadlineAt) return Number.POSITIVE_INFINITY;
+    const deadline = Date.parse(task.deadlineAt);
     return Math.max(0, deadline - Date.now());
   }
 

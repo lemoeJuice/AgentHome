@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { chown, chmod, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
@@ -23,8 +24,13 @@ let systemSecret;
 let modelSecret;
 let ownerTestRoot;
 
+const principalExecHelper = "/usr/local/bin/agent-home-principal-exec";
+const helper = existsSync(principalExecHelper) ? principalExecHelper : "/usr/local/bin/agent-home-guest-exec";
 const runIdentity = (uid, gid, command, cwd, env = process.env, timeout = 90_000) => {
-  const result = spawnSync("/usr/local/bin/agent-home-principal-exec", [String(uid), String(gid), String(gid), "60", "17179869184", "64", "536870912", "--", "/bin/bash", "-c", command], {
+  const identityArgs = helper === principalExecHelper
+    ? [String(uid), String(gid), String(gid), "60", "17179869184", "64", "536870912", "--", "/bin/bash", "-c", command]
+    : [String(uid), String(gid), "60", "17179869184", "64", "536870912", "--", "/bin/bash", "-c", command];
+  const result = spawnSync(helper, identityArgs, {
     cwd,
     env,
     encoding: "utf8",
@@ -108,7 +114,7 @@ try {
   await writeFile(buildScript, 'require("node:fs").writeFileSync("built.txt", "ok")\n');
   await chown(packageJson, principals.get(a.principalId).runtimeUid, principals.get(a.principalId).runtimeGid);
   await chown(buildScript, principals.get(a.principalId).runtimeUid, principals.get(a.principalId).runtimeGid);
-  const npm = runAs(a, "npm install --offline --no-audit --no-fund && npm run build && node --version && npm --version && python3 --version && git --version && (go version || true) && stat -c '%u:%g' built.txt", npmProject);
+  const npm = runAs(a, "npm install --offline --no-audit --no-fund && npm run build && node --version && npm --version && python3 --version && git --version && (go version || true) && stat -c '%n %u:%g' built.txt", npmProject);
   assert.equal(npm.status, 0, npm.stderr);
   assert.ok(npm.stdout.includes("built.txt"), npm.stdout);
   assert.ok(npm.stdout.includes(`${principals.get(a.principalId).runtimeUid}:${principals.get(a.principalId).runtimeGid}`), npm.stdout);

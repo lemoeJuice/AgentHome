@@ -64,7 +64,7 @@ build_without_overlay_context() (
   if [[ -f package-lock.json ]]; then "$PODMAN" cp package-lock.json "$build_container:/app/package-lock.json"; fi
   "$PODMAN" cp tsconfig.json "$build_container:/app/tsconfig.json"
   "$PODMAN" cp src "$build_container:/app/src"
-  "$PODMAN" cp src/runtime/guest-exec.c "$build_container:/tmp/guest-exec.c"
+  "$PODMAN" cp src/runtime/principal-exec.c "$build_container:/tmp/principal-exec.c"
   if [[ -d "$ROOT_DIR/node_modules" ]]; then
     printf '%s\n' 'using the lockfile-verified host node_modules cache for the isolated image build'
     "$PODMAN" cp "$ROOT_DIR/node_modules" "$build_container:/app/node_modules"
@@ -72,7 +72,7 @@ build_without_overlay_context() (
     "$PODMAN" exec --workdir /app "$build_container" sh -c 'if [ -f package-lock.json ]; then npm ci; else npm install; fi'
   fi
   "$PODMAN" exec --workdir /app "$build_container" npm run build
-  "$PODMAN" exec "$build_container" gcc -O2 -Wall -Wextra -o /usr/local/bin/agent-home-principal-exec /tmp/guest-exec.c
+  "$PODMAN" exec "$build_container" gcc -O2 -Wall -Wextra -o /usr/local/bin/agent-home-principal-exec /tmp/principal-exec.c
   "$PODMAN" exec "$build_container" chmod 755 /usr/local/bin/agent-home-principal-exec
   "$PODMAN" exec "$build_container" ln -sf agent-home-principal-exec /usr/local/bin/agent-home-guest-exec
   "$PODMAN" exec "$build_container" sh -c 'useradd --create-home --uid 10001 agent && mkdir -p /state /cache /scratch /run/agent-home && chmod 711 /state && chmod 700 /cache /scratch /run/agent-home'

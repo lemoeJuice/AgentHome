@@ -100,7 +100,7 @@ test("derived private conversation scopes do not fall back to a group scope", ()
   const conversation = { platform: "qq", accountId: "a", kind: "private" as const, platformConversationId: "guest", threadId: null };
   const guest = deriveCapabilities({ platform: "qq", accountId: "a", userId: "guest", trust: "GUEST", conversationId: "conv" }, conversation, { platform: "qq", accountId: "a", userId: "owner" }, "conv");
   const owner = deriveCapabilities({ platform: "qq", accountId: "a", userId: "owner", trust: "OWNER", conversationId: "conv" }, conversation, { platform: "qq", accountId: "a", userId: "owner" }, "conv");
-  assert.deepEqual(guest.memory.allowedScopes, ["user:guest"]);
+  assert.deepEqual(guest.memory.allowedScopes, ["user:guest", "workspace:conv"]);
   assert.ok(owner.memory.allowedScopes.includes("owner_private"));
   assert.ok(!guest.memory.allowedScopes.some((scope) => scope.startsWith("group:")));
 });
@@ -111,9 +111,9 @@ test("private Memory scope follows explicit Principal identity", () => {
   const first = deriveCapabilities({ platform: "qq", accountId: "a", userId: "qq-user", principalId: "principal:shared", trust: "GUEST", conversationId: "conv-1" }, conversation, owner, "conv-1");
   const second = deriveCapabilities({ platform: "telegram", accountId: "b", userId: "tg-user", principalId: "principal:shared", trust: "GUEST", conversationId: "conv-2" }, { ...conversation, platform: "telegram", accountId: "b", platformConversationId: "tg-user" }, owner, "conv-2");
   const unbound = deriveCapabilities({ platform: "telegram", accountId: "b", userId: "tg-user", trust: "GUEST", conversationId: "conv-3" }, { ...conversation, platform: "telegram", accountId: "b", platformConversationId: "tg-user" }, owner, "conv-3");
-  assert.deepEqual(first.memory.allowedScopes, ["user:principal:shared"]);
-  assert.deepEqual(second.memory.allowedScopes, ["user:principal:shared"]);
-  assert.deepEqual(unbound.memory.allowedScopes, ["user:tg-user"]);
+  assert.deepEqual(first.memory.allowedScopes, ["user:principal:shared", "workspace:conv-1"]);
+  assert.deepEqual(second.memory.allowedScopes, ["user:principal:shared", "workspace:conv-2"]);
+  assert.deepEqual(unbound.memory.allowedScopes, ["user:tg-user", "workspace:conv-3"]);
 });
 
 test("MemoryService shares explicitly bound user scope but isolates unbound identity", () => {
@@ -181,9 +181,21 @@ test("Guest Task execution can be enabled without sharing Principal Memory", () 
   assert.equal(guest.tasks.canCreate, true);
   assert.equal(guest.tasks.canCancel, true);
   assert.deepEqual(guest.projects, [{ projectId: "*", access: "WRITE" }]);
-  assert.deepEqual(guest.memory.allowedScopes, ["user:guest"]);
+  assert.deepEqual(guest.memory.allowedScopes, ["user:guest", "workspace:group-conv"]);
   assert.deepEqual(privateOwner.projects, owner.projects);
   assert.equal(privateOwner.tasks.canCreate, true);
+});
+
+test("Workspace memory follows the conversation for different Principals", () => {
+  const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
+  const memory = new MemoryService(db);
+  const writer = { requesterId: "alice", principalId: "principal-a", trust: "GUEST" as const, allowedScopes: ["user:principal-a", "workspace:conversation-x"] as import("../src/shared/types.js").MemoryScope[], conversationId: "conversation-x" };
+  const teammate = { requesterId: "bob", principalId: "principal-b", trust: "GUEST" as const, allowedScopes: ["user:principal-b", "workspace:conversation-x"] as import("../src/shared/types.js").MemoryScope[], conversationId: "conversation-x" };
+  const otherConversation = { requesterId: "alice", principalId: "principal-a", trust: "GUEST" as const, allowedScopes: ["user:principal-a", "workspace:conversation-y"] as import("../src/shared/types.js").MemoryScope[], conversationId: "conversation-y" };
+  memory.remember({ access: writer, scope: "workspace:conversation-x", content: "shared decision" });
+  assert.equal(memory.retrieve({ text: "shared decision", access: teammate }).items.some((item) => item.content === "shared decision"), true);
+  assert.equal(memory.retrieve({ text: "shared decision", access: otherConversation }).items.some((item) => item.content === "shared decision"), false);
+  db.close();
 });
 
 test("memory facts preserve temporal supersession and portable export", () => {

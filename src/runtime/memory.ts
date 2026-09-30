@@ -514,7 +514,7 @@ export class MemoryService {
   private authorizedScopes(access: MemoryAccessContext): MemoryScope[] {
     if (!access.requesterId || !["OWNER", "GUEST"].includes(access.trust) || !Array.isArray(access.allowedScopes)) throw new Error("MEMORY_ACCESS_INVALID");
     const principalScope = access.principalId ?? access.requesterId;
-    const canonical: MemoryScope[] = [`user:${principalScope}`, ...((access.projectIds ?? []).filter((id) => typeof id === "string" && id).map((id) => `project:${id}` as MemoryScope))];
+    const canonical: MemoryScope[] = [`user:${principalScope}`, ...(access.conversationId ? [`workspace:${access.conversationId}` as MemoryScope] : []), ...((access.projectIds ?? []).filter((id) => typeof id === "string" && id).map((id) => `project:${id}` as MemoryScope))];
     if (access.trust === "OWNER") canonical.push("global_agent");
     if (this.owners.length && access.conversationId) {
       const conversation = this.db.get<{ kind: "private" | "group"; trust: "OWNER" | "GUEST" }>("SELECT kind,trust FROM conversations WHERE conversation_id=?", access.conversationId);
@@ -732,5 +732,5 @@ function validateImportRecords(input: MemoryExport, access: MemoryAccessContext 
 }
 
 function isMemoryScope(value: unknown): value is MemoryScope {
-  return typeof value === "string" && /^(global_agent|owner_private|user:[^\s]+|group:[^\s]+|project:[^\s]+)$/.test(value);
+  return typeof value === "string" && /^(global_agent|owner_private|user:[^\s]+|group:[^\s]+|workspace:[^\s]+|project:[^\s]+)$/.test(value);
 }

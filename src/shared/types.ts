@@ -119,7 +119,7 @@ export interface ControlAck {
 }
 
 export type Trust = "OWNER" | "GUEST";
-export type MemoryScope = "owner_private" | "global_agent" | `user:${string}` | `group:${string}` | `project:${string}`;
+export type MemoryScope = "owner_private" | "global_agent" | `user:${string}` | `group:${string}` | `workspace:${string}` | `project:${string}`;
 
 export interface RequesterContext {
   platform: string;

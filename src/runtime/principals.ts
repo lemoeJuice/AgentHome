@@ -11,10 +11,8 @@ export const PRINCIPAL_UID_MAX = 60_000;
 export const OWNER_PRINCIPAL_ID = "principal:owner";
 export const OWNER_RUNTIME_UID = 10_001;
 export const OWNER_RUNTIME_GID = 10_001;
-export const OWNER_WORKSPACE_UID_MIN = 10_003;
-export const OWNER_WORKSPACE_UID_MAX = 19_999;
-export const WORKSPACE_RUNTIME_UID_MIN = 60_001;
-export const WORKSPACE_RUNTIME_UID_MAX = 65_535;
+export const WORKSPACE_RUNTIME_GID_MIN = 60_001;
+export const WORKSPACE_RUNTIME_GID_MAX = 65_535;
 
 export interface PrincipalRecord {
   principalId: string;
@@ -89,12 +87,21 @@ export class PrincipalService {
   }
 
   resolveIdentity(platform: string, accountId: string, externalId: string, configuredOwners?: { platform: string; accountId: string; userId: string } | Array<{ platform: string; accountId: string; userId: string }>): { principalId: string; trust: Trust } {
-    const isConfiguredOwner = (configuredOwners ? (Array.isArray(configuredOwners) ? configuredOwners : [configuredOwners]) : []).some((owner) => platform === owner.platform && accountId === owner.accountId && externalId === owner.userId);
+    const owners = configuredOwners ? (Array.isArray(configuredOwners) ? configuredOwners : [configuredOwners]) : [];
+    const isConfiguredOwner = owners.some((owner) => platform === owner.platform && accountId === owner.accountId && externalId === owner.userId);
     return this.db.transaction(() => {
       if (isConfiguredOwner) {
-        this.ensureRuntimeIdentity(OWNER_PRINCIPAL_ID, "OWNER");
-        this.db.run("INSERT INTO platform_identities(platform,account_id,user_id,principal_id) VALUES (?,?,?,?) ON CONFLICT(platform,account_id,user_id) DO UPDATE SET principal_id=excluded.principal_id", platform, accountId, externalId, OWNER_PRINCIPAL_ID);
-        return { principalId: OWNER_PRINCIPAL_ID, trust: "OWNER" as const };
+        const bound = this.db.all<{ platform: string; account_id: string; user_id: string }>("SELECT platform,account_id,user_id FROM platform_identities WHERE principal_id=? ORDER BY platform,account_id,user_id", OWNER_PRINCIPAL_ID);
+        const canonicalOwner = bound[0] ? { platform: bound[0].platform, accountId: bound[0].account_id, userId: bound[0].user_id } : owners[0];
+        const canonical = canonicalOwner?.platform === platform && canonicalOwner.accountId === accountId && canonicalOwner.userId === externalId;
+        const existing = this.db.get<{ principal_id: string }>("SELECT principal_id FROM platform_identities WHERE platform=? AND account_id=? AND user_id=?", platform, accountId, externalId);
+        let principalId: string;
+        if (canonical) principalId = OWNER_PRINCIPAL_ID;
+        else if (existing && existing.principal_id !== OWNER_PRINCIPAL_ID) principalId = existing.principal_id;
+        else principalId = existing?.principal_id === OWNER_PRINCIPAL_ID ? newId("principal") : existing?.principal_id ?? newId("principal");
+        this.ensureRuntimeIdentity(principalId, "OWNER");
+        this.db.run("INSERT INTO platform_identities(platform,account_id,user_id,principal_id) VALUES (?,?,?,?) ON CONFLICT(platform,account_id,user_id) DO UPDATE SET principal_id=excluded.principal_id", platform, accountId, externalId, principalId);
+        return { principalId, trust: "OWNER" as const };
       }
       const existing = this.db.get<{ principal_id: string; trust: Trust }>("SELECT p.principal_id,p.trust FROM platform_identities i JOIN principals p ON p.principal_id=i.principal_id WHERE i.platform=? AND i.account_id=? AND i.user_id=?", platform, accountId, externalId);
       if (existing) {
@@ -152,17 +159,17 @@ export class PrincipalService {
       const conversation = this.db.get<{ conversation_id: string }>("SELECT conversation_id FROM conversations WHERE conversation_id=?", conversationId);
       if (!conversation) throw new Error("CONVERSATION_WORKSPACE_NOT_FOUND");
       const row = this.db.get<{ runtime_uid: number; runtime_gid: number }>("SELECT runtime_uid,runtime_gid FROM conversation_workspaces WHERE conversation_id=?", conversationId);
-      const used = new Set(this.db.all<{ runtime_uid: number }>("SELECT runtime_uid FROM conversation_workspaces").map((item) => Number(item.runtime_uid)));
-      const minUid = WORKSPACE_RUNTIME_UID_MIN;
-      const maxUid = WORKSPACE_RUNTIME_UID_MAX;
-      if (row && row.runtime_uid >= minUid && row.runtime_uid <= maxUid) return { uid: row.runtime_uid, gid: row.runtime_gid };
-      if (row) used.delete(row.runtime_uid);
-      let uid = minUid;
-      while (uid <= maxUid && used.has(uid)) uid++;
-      if (uid > maxUid) throw new Error("CONVERSATION_WORKSPACE_UID_RANGE_EXHAUSTED");
-      if (row) this.db.run("UPDATE conversation_workspaces SET runtime_uid=?,runtime_gid=? WHERE conversation_id=?", uid, uid, conversationId);
-      else this.db.run("INSERT INTO conversation_workspaces(conversation_id,runtime_uid,runtime_gid,created_at) VALUES (?,?,?,?)", conversationId, uid, uid, nowIso());
-      return { uid, gid: uid };
+      const used = new Set(this.db.all<{ runtime_gid: number }>("SELECT runtime_gid FROM conversation_workspaces").map((item) => Number(item.runtime_gid)));
+      const minGid = WORKSPACE_RUNTIME_GID_MIN;
+      const maxGid = WORKSPACE_RUNTIME_GID_MAX;
+      if (row && row.runtime_gid >= 10_003 && row.runtime_gid <= maxGid) return { uid: row.runtime_uid, gid: row.runtime_gid };
+      if (row) used.delete(row.runtime_gid);
+      let gid = minGid;
+      while (gid <= maxGid && used.has(gid)) gid++;
+      if (gid > maxGid) throw new Error("CONVERSATION_WORKSPACE_GID_RANGE_EXHAUSTED");
+      if (row) this.db.run("UPDATE conversation_workspaces SET runtime_uid=?,runtime_gid=? WHERE conversation_id=?", row.runtime_uid, gid, conversationId);
+      else this.db.run("INSERT INTO conversation_workspaces(conversation_id,runtime_uid,runtime_gid,created_at) VALUES (?,?,?,?)", gid, gid, nowIso());
+      return { uid: row?.runtime_uid ?? gid, gid };
     });
     const key = createHash("sha256").update(conversationId).digest("hex");
     const root = join(this.stateRoot, "workspaces", "conversations", key);
@@ -183,33 +190,6 @@ export class PrincipalService {
     await chown(projects, 0, gid);
     await chmod(projects, 0o711);
     return { root, home, projects, cache, uid, gid };
-  }
-
-  async conversationWorkspaceProcessEnvironment(conversationId: string, proxyUrl?: string): Promise<NodeJS.ProcessEnv> {
-    const dirs = await this.ensureConversationWorkspace(conversationId);
-    return {
-      HOME: dirs.home,
-      USER: "conversation",
-      LOGNAME: "conversation",
-      XDG_CACHE_HOME: join(dirs.cache, "xdg"),
-      XDG_CONFIG_HOME: join(dirs.home, ".config"),
-      XDG_DATA_HOME: join(dirs.home, ".local", "share"),
-      XDG_STATE_HOME: join(dirs.home, ".local", "state"),
-      NPM_CONFIG_CACHE: join(dirs.cache, "npm"),
-      NPM_CONFIG_PREFIX: join(dirs.home, ".npm-global"),
-      PYTHONUSERBASE: join(dirs.home, ".local"),
-      PIP_CACHE_DIR: join(dirs.cache, "pip"),
-      UV_CACHE_DIR: join(dirs.cache, "uv"),
-      UV_TOOL_DIR: join(dirs.home, ".local", "uv-tools"),
-      UV_TOOL_BIN_DIR: join(dirs.home, ".local", "bin"),
-      GOPATH: join(dirs.home, "go"),
-      GOCACHE: join(dirs.cache, "go-build"),
-      GOMODCACHE: join(dirs.cache, "go-mod"),
-      TMPDIR: join(dirs.home, "tmp"),
-      PATH: `${join(dirs.home, ".npm-global", "bin")}:${join(dirs.home, ".local", "bin")}:${process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}`,
-      LANG: "C.UTF-8",
-      ...proxyEnvironment(proxyUrl),
-    };
   }
 
   conversationWorkspacePath(conversationId: string, workspaceId: string): string {
@@ -304,8 +284,8 @@ export class PrincipalService {
     const agent = join(this.principalRoot(principalId), "agent");
     return {
       HOME: home,
-      USER: principalId === OWNER_PRINCIPAL_ID ? "agent" : "guest",
-      LOGNAME: principalId === OWNER_PRINCIPAL_ID ? "agent" : "guest",
+      USER: "principal",
+      LOGNAME: "principal",
       XDG_CACHE_HOME: join(cache, "xdg"),
       XDG_CONFIG_HOME: join(home, ".config"),
       XDG_DATA_HOME: join(home, ".local", "share"),
