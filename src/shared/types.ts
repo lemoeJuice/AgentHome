@@ -191,6 +191,7 @@ export interface WorkerExecutionRecord {
   principalId?: string;
   runtimeUid?: number;
   runtimeGid?: number;
+  workspaceGid?: number;
   processMode?: "PI" | "GUEST_BROKERED" | "PRINCIPAL_BROKERED";
   artifactRefs?: ArtifactRef[];
   capabilities?: CapabilitySet;
