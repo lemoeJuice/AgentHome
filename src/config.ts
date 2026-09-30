@@ -121,8 +121,10 @@ export async function loadConfig(path = process.env.AGENT_HOME_CONFIG ?? "./conf
   const configuredOwners = fileConfig.owners ?? (legacyOwner ? [legacyOwner] : []);
   if (!Array.isArray(configuredOwners) || configuredOwners.some((owner) => !owner || typeof owner.platform !== "string" || typeof owner.accountId !== "string" || typeof owner.userId !== "string")) throw new Error("CONFIG_INVALID: owners");
   const owners = configuredOwners.filter((owner) => owner.platform && owner.accountId && owner.userId && !owner.userId.startsWith("REPLACE_"));
+  if (fileConfig.systemAdmins !== undefined && (!Array.isArray(fileConfig.systemAdmins) || fileConfig.systemAdmins.some((admin) => !admin || typeof admin.platform !== "string" || typeof admin.accountId !== "string" || typeof admin.userId !== "string"))) throw new Error("CONFIG_INVALID: systemAdmins");
+  const systemAdmins = fileConfig.systemAdmins?.filter((admin) => admin.platform && admin.accountId && admin.userId && !admin.userId.startsWith("REPLACE_"));
   const { owner: _legacyOwner, ...withoutLegacyOwner } = fileConfig;
-  fileConfig = { ...withoutLegacyOwner, ...(fileConfig.owners !== undefined || legacyOwner ? { owners } : {}) };
+  fileConfig = { ...withoutLegacyOwner, ...(fileConfig.owners !== undefined || legacyOwner ? { owners } : {}), ...(systemAdmins ? { systemAdmins } : {}) };
   if (fileConfig.owners !== undefined) fileConfig.owners = owners;
   const config = merge(defaults, fileConfig);
   const explicitModelProxy = Boolean(fileConfig.network && Object.prototype.hasOwnProperty.call(fileConfig.network, "modelProxyUrl"));

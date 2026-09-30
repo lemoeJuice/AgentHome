@@ -17,7 +17,7 @@ export function deriveCapabilities(requester: RequesterContext, conversation: Co
   const isOwner = requester.trust === "OWNER" && isOwnerIdentity;
   const trust: Trust = isOwner ? "OWNER" : "GUEST";
   const principalScope = requester.principalId ?? requester.userId;
-  const baseScopes: MemoryScope[] = [`user:${principalScope}`];
+  const baseScopes: MemoryScope[] = [`user:${principalScope}`, `workspace:${conversationId}`];
   if (trust === "OWNER") baseScopes.push("global_agent");
   if (trust === "OWNER" && conversation.kind === "private") baseScopes.push("owner_private");
   const canCreate = trust === "OWNER" || policy.guestTaskExecutionEnabled === true;
@@ -48,7 +48,7 @@ export function validateCapabilitySet(value: unknown): CapabilitySet {
     if (!Array.isArray(candidate) || candidate.some((item) => typeof item !== "string" || !item)) throw new Error(error);
     return [...new Set(candidate)];
   };
-  const allowedScopes = strings(memory?.allowedScopes, "CAPABILITY_MEMORY_INVALID").filter((scope): scope is MemoryScope => /^(global_agent|owner_private|user:[^\s]+|group:[^\s]+|project:[^\s]+)$/.test(scope));
+  const allowedScopes = strings(memory?.allowedScopes, "CAPABILITY_MEMORY_INVALID").filter((scope): scope is MemoryScope => /^(global_agent|owner_private|user:[^\s]+|group:[^\s]+|workspace:[^\s]+|project:[^\s]+)$/.test(scope));
   if (allowedScopes.length !== strings(memory?.allowedScopes, "CAPABILITY_MEMORY_INVALID").length) throw new Error("CAPABILITY_MEMORY_INVALID");
   if (!Array.isArray(projects) || projects.some((item) => !item || typeof item !== "object" || typeof (item as Record<string, unknown>).projectId !== "string" || !(item as Record<string, unknown>).projectId || !["READ", "WRITE"].includes(String((item as Record<string, unknown>).access)))) throw new Error("CAPABILITY_PROJECT_INVALID");
   const normalizedProjects = (projects as Array<Record<string, unknown>>).map((item) => ({ projectId: item.projectId as string, access: item.access as "READ" | "WRITE" }));

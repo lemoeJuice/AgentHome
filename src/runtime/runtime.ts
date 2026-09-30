@@ -16,9 +16,9 @@ import { PiCliHarness, PiTurnError, piNetworkFailureHint, type PiImageContent } 
 import { ArtifactService } from "./artifacts.js";
 import { MemoryService } from "./memory.js";
 import { TaskService, type RuntimeEvent } from "./tasks.js";
-import { PrincipalService, OWNER_PRINCIPAL_ID, PRINCIPAL_UID_MAX, PRINCIPAL_UID_MIN, WORKSPACE_RUNTIME_UID_MAX } from "./principals.js";
+import { PrincipalService, OWNER_PRINCIPAL_ID, OWNER_RUNTIME_UID, PRINCIPAL_UID_MAX, PRINCIPAL_UID_MIN } from "./principals.js";
 import { MODEL_RUNTIME_GID, MODEL_RUNTIME_UID, ModelPlaneService } from "./model-plane.js";
-import { installGuestEgressFilter } from "./guest-network.js";
+import { installPrincipalEgressFilter } from "./principal-network.js";
 import { SnowLumaQQCapability } from "../qq/capability.js";
 import { GatewayMcpClient } from "./mcp.js";
 import { checkSnowLumaMcpInstallation, SnowLumaMcpClient } from "./snowluma-mcp.js";
@@ -121,9 +121,9 @@ export class RuntimeApp {
       await mkdir(toolDirectory, { recursive: true });
       await chown(toolDirectory, 0, this.modelRuntimeGid);
       await chmod(toolDirectory, 0o710);
-      installGuestEgressFilter(PRINCIPAL_UID_MIN, WORKSPACE_RUNTIME_UID_MAX, "/etc/resolv.conf", this.config.network?.modelProxyUrl);
+      installPrincipalEgressFilter(OWNER_RUNTIME_UID, PRINCIPAL_UID_MAX, "/etc/resolv.conf", this.config.network?.modelProxyUrl);
     } else if (this.config.guest?.enabled) {
-      throw new Error("GUEST_EXECUTION_REQUIRES_ROOTFUL_OUTER_CONTAINER_USERNS");
+      throw new Error("PRINCIPAL_EXECUTION_REQUIRES_ROOTFUL_OUTER_CONTAINER_USERNS");
     }
     await this.toolServer.start();
     this.artifactMaintenance = setInterval(() => { void this.artifacts.cleanupExpired().catch((error) => this.log.warn("Artifact cleanup failed", { error: String(error) })); }, 60_000).unref();
@@ -658,7 +658,7 @@ export class RuntimeApp {
           conversationId: context.conversationId,
           requesterId: context.requesterId,
           ...(context.requester.principalId ? { principalId: context.requester.principalId } : {}),
-          ...(context.trust === "GUEST" ? { principalQuotaBytes: this.config.guest.artifactQuotaBytes } : {}),
+          ...(context.requester.principalId ? { principalQuotaBytes: this.config.guest.artifactQuotaBytes } : {}),
           ...(context.eventId ? { eventId: context.eventId } : {}),
           maxBytes: this.config.runtime.maxArtifactBytes,
         });
@@ -917,7 +917,7 @@ export class RuntimeApp {
     if (!summary) return;
     const conversation = this.db.get<{ kind: ConversationAddress["kind"] }>("SELECT kind FROM conversations WHERE conversation_id=?", task.originConversationId);
     const principal = task.requester.principalId ?? task.requester.userId;
-    const candidates: MemoryScope[] = conversation?.kind === "group" ? [`group:${task.originConversationId}`, `user:${principal}`, "global_agent"] : [`user:${principal}`, "global_agent"];
+    const candidates: MemoryScope[] = [`workspace:${task.originConversationId}`, `user:${principal}`, "global_agent"];
     const scope = candidates.find((candidate) => task.capabilities.memory.allowedScopes.includes(candidate));
     if (!scope) return;
     this.memory.ingestTaskEpisode({
@@ -973,7 +973,7 @@ export class RuntimeApp {
     } catch (error) {
       this.log.warn("Memory maintenance failed", { error: String(error) });
     }
-    void this.tasks.expireGuestTasks().catch((error) => this.log.warn("Guest task deadline enforcement failed", { error: String(error) }));
+    void this.tasks.expireDeadlinedTasks().catch((error) => this.log.warn("Task deadline enforcement failed", { error: String(error) }));
   }
 
   private claimOutboundIntent(intentId: string): void {
@@ -1069,7 +1069,7 @@ export class RuntimeApp {
   }
 
   private conversationScopes(conversationId: string, address: ConversationAddress, principalId: string, trust: Trust): string[] {
-    const scopes = [`user:${principalId}`];
+    const scopes = [`user:${principalId}`, `workspace:${conversationId}`];
     if (trust === "OWNER") scopes.push("global_agent");
     if (trust === "OWNER" && address.kind === "private") scopes.push("owner_private");
     return scopes;

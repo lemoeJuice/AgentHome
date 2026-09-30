@@ -17,11 +17,15 @@ test("Principal runtime identities are stable, unique and independent of platfor
     service.ensureOwnerPrincipal();
     service.backfillRuntimeIds();
     const configuredOwners = [{ platform: "qq", accountId: "default", userId: "owner-1" }, { platform: "qq", accountId: "default", userId: "owner-2" }];
+    db.run("INSERT INTO platform_identities(platform,account_id,user_id,principal_id) VALUES (?,?,?,?)", "qq", "default", "owner-1", OWNER_PRINCIPAL_ID);
+    db.run("INSERT INTO platform_identities(platform,account_id,user_id,principal_id) VALUES (?,?,?,?)", "qq", "default", "owner-2", OWNER_PRINCIPAL_ID);
     const ownerOne = service.resolveIdentity("qq", "default", "owner-1", configuredOwners);
     const ownerTwo = service.resolveIdentity("qq", "default", "owner-2", configuredOwners);
     assert.equal(ownerOne.principalId, OWNER_PRINCIPAL_ID);
-    assert.equal(ownerTwo.principalId, OWNER_PRINCIPAL_ID);
+    assert.notEqual(ownerTwo.principalId, OWNER_PRINCIPAL_ID);
+    assert.notEqual(ownerTwo.principalId, ownerOne.principalId);
     assert.equal(ownerTwo.trust, "OWNER");
+    assert.notEqual(service.get(ownerOne.principalId).runtimeUid, service.get(ownerTwo.principalId).runtimeUid);
     const first = service.resolveIdentity("qq", "account-a", "external-10001");
     const second = service.resolveIdentity("telegram", "bot-b", "external-10001");
     const same = service.resolveIdentity("qq", "account-a", "external-10001");

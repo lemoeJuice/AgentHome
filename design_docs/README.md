@@ -16,6 +16,12 @@ Recommended reading order:
 7. `TASK_RUNTIME_DESIGN.md`
 8. `AUTHORIZATION_CAPABILITY_DESIGN.md`
 9. `ARTIFACT_FILE_DESIGN.md`
+10. `PRINCIPAL_WORKSPACE_SYSTEM_ADMIN_DESIGN.md`
+11. `UID_GID_MEMORY_DESIGN.md`
+
+`PRINCIPAL_WORKSPACE_SYSTEM_ADMIN_DESIGN.md` and `UID_GID_MEMORY_DESIGN.md`
+are the current identity/workspace/memory baselines. Older Guest sandbox and
+role-based designs are historical where they differ from these documents.
 
 Key current implementation choices:
 - language: TypeScript + Node.js

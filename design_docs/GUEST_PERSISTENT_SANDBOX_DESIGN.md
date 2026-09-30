@@ -1,5 +1,9 @@
 # Guest 持久化沙箱与多用户隔离设计
 
+> 历史设计文档。Principal/Workspace 身份、Worker UID/GID 和共享 Memory
+> 以 `PRINCIPAL_WORKSPACE_SYSTEM_ADMIN_DESIGN.md` 与 `UID_GID_MEMORY_DESIGN.md`
+> 为准；本文件中按 Owner/Guest 区分 Worker Unix 身份或 workspace 的段落已被替代。
+
 ## 1. 目标
 
 系统需要允许 Guest 用户真正执行任务，而不是只能使用少量只读功能。
