@@ -247,7 +247,7 @@ export class TaskService implements ExecutionBackend {
     const commandTimeout = guest ? this.config.guest.commandTimeoutMs : this.config.runtime.piTimeoutMs;
     const timeoutMs = Math.max(1, Math.min(Number.isSafeInteger(input.timeoutMs) ? Number(input.timeoutMs) : commandTimeout, commandTimeout, remainingTaskMs));
     const helper = this.options.principalExecCommand ?? "/usr/local/bin/agent-home-principal-exec";
-    const environment = { ...this.options.principals!.principalProcessEnvironment(current.principalId, this.config.network?.modelProxyUrl), HOME: current.home, WORKSPACE: current.workspace };
+    const environment = { ...this.options.principals!.principalProcessEnvironment(current.principalId, this.config.network?.modelProxyUrl), HOME: current.home, WORKSPACE: current.workspace, AGENT_PERSONAL_MEMORY: this.options.principals!.principalMemoryPath(current.principalId), AGENT_WORKSPACE_MEMORY: this.options.principals!.workspaceMemoryPath(task.originConversationId, current.workspaceId) };
     const child = spawn(helper, [String(current.uid), String(current.gid), String(current.workspaceGid), String(this.config.guest.cpuSeconds), String(this.config.guest.memoryBytes), String(this.config.guest.pids), String(this.config.guest.maxFileBytes), "--", "/bin/bash", "-c", input.command], { cwd, env: environment, detached: true, stdio: ["ignore", "pipe", "pipe"] });
     const active = this.activePrincipalCommands.get(worker.id) ?? new Set<ChildProcess>();
     active.add(child);
