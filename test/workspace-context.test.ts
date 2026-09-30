@@ -42,6 +42,8 @@ function fakePrincipals(root: string): PrincipalService {
   const principalRoot = (principalId: string) => join(root, "principals", principalId);
   return {
     get: principal,
+    principalMemoryPath(principalId: string) { return join(principalRoot(principalId), "home", ".agent", "memory"); },
+    workspaceMemoryPath(conversationId: string, workspaceId: string) { return join(root, "conversation-workspaces", conversationId, "projects", workspaceId, ".agent", "memory"); },
     async ensurePrincipalDirectories(principalId: string) {
       const base = principalRoot(principalId);
       const dirs = { root: base, home: join(base, "home"), projects: join(base, "projects"), cache: join(base, "cache"), artifacts: join(base, "artifacts"), agent: join(base, "agent") };
@@ -108,6 +110,8 @@ test("Guest default Worker profile is writable and Pi tool dispatch keeps Princi
     assert.deepEqual(execution.capabilities.projects, [{ projectId: "default", access: "WRITE" }]);
     assert.equal(execution.contextSource, "durable-worker-record");
     assert.notEqual(execution.workspace, join(root, "projects", "default"));
+    const envResult = await service.execute(execution, { command: "printf '%s\\n%s\\n%s\\n%s' \"$HOME\" \"$WORKSPACE\" \"$AGENT_PERSONAL_MEMORY\" \"$AGENT_WORKSPACE_MEMORY\"" });
+    assert.deepEqual(String((envResult as { stdout: string }).stdout).trim().split("\n"), [join(root, "principals", requester.principalId!, "home"), expectedWorkspace, join(root, "principals", requester.principalId!, "home", ".agent", "memory"), join(expectedWorkspace, ".agent", "memory")]);
 
     const context: RuntimeToolContext = {
       conversationId: "conversation",
