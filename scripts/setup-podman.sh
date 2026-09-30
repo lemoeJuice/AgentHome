@@ -77,12 +77,9 @@ build_without_overlay_context() (
   "$PODMAN" exec "$build_container" sh -c 'useradd --create-home --uid 10001 agent && mkdir -p /state /cache /scratch /run/agent-home && chmod 711 /state && chmod 700 /cache /scratch /run/agent-home'
   "$PODMAN" exec "$build_container" sh -c "printf '%s\\n' '#!/bin/sh' 'exec node /app/dist/cli.js \"\$@\"' > /usr/local/bin/agent-home && chmod 755 /usr/local/bin/agent-home"
   "$PODMAN" commit --pause=false \
-     --change 'ENV HOME=/state/home' \
+     --change 'ENV HOME=/root' \
     --change 'ENV PATH=/state/pi/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
-    --change 'ENV XDG_CONFIG_HOME=/state/home/.config' \
-    --change 'ENV XDG_DATA_HOME=/state/home/.local/share' \
-    --change 'ENV XDG_STATE_HOME=/state/home/.local/state' \
-    --change 'ENV XDG_CACHE_HOME=/cache' \
+     --change 'ENV XDG_CACHE_HOME=/cache' \
     --change 'ENV TMPDIR=/scratch/tmp' \
     --change 'ENV AGENT_HOME_STATE=/state' \
     --change 'WORKDIR /app' \

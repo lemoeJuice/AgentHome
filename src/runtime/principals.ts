@@ -1,4 +1,5 @@
-import { chown, chmod, lchown, lstat, mkdir, readdir, readlink, realpath, rename, symlink, unlink } from "node:fs/promises";
+import { chown, chmod, lchown, lstat, mkdir, readdir, realpath } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { join, relative, resolve } from "node:path";
 import type { SqliteStore } from "../db.js";
 import type { Trust } from "../shared/types.js";
@@ -10,6 +11,10 @@ export const PRINCIPAL_UID_MAX = 60_000;
 export const OWNER_PRINCIPAL_ID = "principal:owner";
 export const OWNER_RUNTIME_UID = 10_001;
 export const OWNER_RUNTIME_GID = 10_001;
+export const OWNER_WORKSPACE_UID_MIN = 10_003;
+export const OWNER_WORKSPACE_UID_MAX = 19_999;
+export const WORKSPACE_RUNTIME_UID_MIN = 60_001;
+export const WORKSPACE_RUNTIME_UID_MAX = 65_535;
 
 export interface PrincipalRecord {
   principalId: string;
@@ -63,7 +68,7 @@ export class PrincipalService {
         this.db.run("UPDATE worker_executions SET principal_id=?,runtime_uid=?,runtime_gid=? WHERE task_id=? AND (principal_id IS NULL OR principal_id='')", principalId as string, principal.runtimeUid, principal.runtimeGid, row.id);
       });
     }
-    const tasks = this.db.all<{ id: string; principal_id: string | null; requester_json: string; trust: Trust; created_at: string; deadline_at: string | null }>("SELECT id,principal_id,requester_json,trust,created_at,deadline_at FROM tasks");
+    const tasks = this.db.all<{ id: string; principal_id: string | null; requester_json: string; trust: Trust; created_at: string; deadline_at: string | null; origin_conversation_id: string }>("SELECT id,principal_id,requester_json,trust,created_at,deadline_at,origin_conversation_id FROM tasks");
     for (const task of tasks) {
       let principalId = task.principal_id;
       if (!principalId) {
@@ -77,8 +82,8 @@ export class PrincipalService {
         const workers = this.db.all<{ id: string; workspace_id: string | null }>("SELECT id,workspace_id FROM worker_executions WHERE task_id=?", task.id);
         for (const worker of workers) {
           const workspaceId = worker.workspace_id ?? "default";
-          const workspaceScope = `principal:${principalId}:${workspaceId}`;
-          this.db.run("UPDATE worker_executions SET principal_id=?,runtime_uid=?,runtime_gid=?,process_mode='PRINCIPAL_BROKERED',workspace_id=COALESCE(workspace_id,'default'),workspace_access=COALESCE(workspace_access,'WRITE'),workspace_scope_id=? WHERE id=?", principalId, principal.runtimeUid, principal.runtimeGid, workspaceScope, worker.id);
+          const workspaceScope = `conversation:${task.origin_conversation_id}:${workspaceId}`;
+          this.db.run("UPDATE worker_executions SET principal_id=?,process_mode='PRINCIPAL_BROKERED',workspace_id=COALESCE(workspace_id,'default'),workspace_access=COALESCE(workspace_access,'WRITE'),workspace_scope_id=? WHERE id=?", principalId, workspaceScope, worker.id);
         }
       });
     }
@@ -124,27 +129,7 @@ export class PrincipalService {
     const cache = join(root, "cache");
     const artifacts = join(root, "artifacts");
     const agent = join(root, "agent");
-    if (principalId === OWNER_PRINCIPAL_ID) {
-      await mkdir(root, { recursive: true, mode: 0o700 });
-      await this.relocateOwnerDirectory(join(this.stateRoot, "home"), home);
-      await this.relocateOwnerDirectory(join(this.stateRoot, "projects"), join(root, "projects"));
-      const legacyAgentLink = join(root, "agent");
-      try {
-        const legacyAgentInfo = await lstat(legacyAgentLink);
-        if (legacyAgentInfo.isSymbolicLink()) {
-          const target = await realpath(legacyAgentLink).catch(() => "");
-          const allowedTargets = [resolve(this.stateRoot, "home", ".pi", "agent"), resolve(this.stateRoot, "model", "pi", "agent")];
-          if (target && !allowedTargets.includes(target)) throw new Error("OWNER_AGENT_LINK_MISMATCH");
-          await unlink(legacyAgentLink);
-        } else if (!legacyAgentInfo.isDirectory()) throw new Error("OWNER_AGENT_DIRECTORY_INVALID");
-      } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-      await this.ensureOwnedDirectory(home, principal.runtimeUid, principal.runtimeGid, 0o700);
-      await this.ensureOwnedDirectory(agent, principal.runtimeUid, principal.runtimeGid, 0o700);
-      await this.ensureDirectoryLink(join(this.stateRoot, "home"), home);
-      await this.ensureDirectoryLink(join(this.stateRoot, "projects"), join(root, "projects"));
-    }
     for (const directory of [home, cache, artifacts, agent, join(home, ".local"), join(home, ".local", "bin"), join(home, ".local", "share"), join(home, ".local", "state"), join(home, ".local", "uv-tools"), join(home, ".config"), join(home, ".npm-global"), join(home, ".npm-global", "bin"), join(cache, "xdg"), join(cache, "npm"), join(cache, "pip"), join(cache, "uv"), join(cache, "go-build"), join(cache, "go-mod"), join(home, "go"), join(home, "tmp")]) {
-      if (principalId === OWNER_PRINCIPAL_ID && (directory === home || directory === agent)) continue;
       await this.ensureOwnedDirectory(directory, principal.runtimeUid, principal.runtimeGid, 0o700);
     }
     let projects = join(root, "projects");
@@ -155,6 +140,84 @@ export class PrincipalService {
 
   async ensureOwnerDirectories(): Promise<void> {
     await this.ensurePrincipalDirectories(OWNER_PRINCIPAL_ID);
+  }
+
+  async ensureConversationWorkspace(conversationId: string): Promise<{ root: string; home: string; projects: string; cache: string; uid: number; gid: number }> {
+    if (!conversationId || conversationId.length > 512) throw new Error("CONVERSATION_WORKSPACE_ID_INVALID");
+    this.assertSystemRoot();
+    const { uid, gid } = this.db.transaction(() => {
+      const conversation = this.db.get<{ trust: Trust }>("SELECT trust FROM conversations WHERE conversation_id=?", conversationId);
+      if (!conversation) throw new Error("CONVERSATION_WORKSPACE_NOT_FOUND");
+      const row = this.db.get<{ runtime_uid: number; runtime_gid: number }>("SELECT runtime_uid,runtime_gid FROM conversation_workspaces WHERE conversation_id=?", conversationId);
+      const used = new Set(this.db.all<{ runtime_uid: number }>("SELECT runtime_uid FROM conversation_workspaces").map((item) => Number(item.runtime_uid)));
+      const minUid = conversation.trust === "OWNER" ? OWNER_WORKSPACE_UID_MIN : WORKSPACE_RUNTIME_UID_MIN;
+      const maxUid = conversation.trust === "OWNER" ? OWNER_WORKSPACE_UID_MAX : WORKSPACE_RUNTIME_UID_MAX;
+      if (row && row.runtime_uid >= minUid && row.runtime_uid <= maxUid) return { uid: row.runtime_uid, gid: row.runtime_gid };
+      if (row) used.delete(row.runtime_uid);
+      let uid = minUid;
+      while (uid <= maxUid && used.has(uid)) uid++;
+      if (uid > maxUid) throw new Error("CONVERSATION_WORKSPACE_UID_RANGE_EXHAUSTED");
+      if (row) this.db.run("UPDATE conversation_workspaces SET runtime_uid=?,runtime_gid=? WHERE conversation_id=?", uid, uid, conversationId);
+      else this.db.run("INSERT INTO conversation_workspaces(conversation_id,runtime_uid,runtime_gid,created_at) VALUES (?,?,?,?)", conversationId, uid, uid, nowIso());
+      return { uid, gid: uid };
+    });
+    const key = createHash("sha256").update(conversationId).digest("hex");
+    const root = join(this.stateRoot, "workspaces", "conversations", key);
+    await mkdir(join(this.stateRoot, "workspaces", "conversations"), { recursive: true, mode: 0o711 });
+    await chown(join(this.stateRoot, "workspaces"), 0, 0);
+    await chmod(join(this.stateRoot, "workspaces"), 0o711);
+    await chown(join(this.stateRoot, "workspaces", "conversations"), 0, 0);
+    await chmod(join(this.stateRoot, "workspaces", "conversations"), 0o711);
+    await this.ensureOwnedDirectory(root, uid, gid, 0o700);
+    const home = join(root, "home");
+    const projects = join(root, "projects");
+    const cache = join(root, "cache");
+    for (const directory of [home, projects, cache, join(home, ".local"), join(home, ".local", "bin"), join(home, ".npm-global"), join(home, ".npm-global", "bin"), join(home, "tmp"), join(cache, "xdg"), join(cache, "npm"), join(cache, "pip"), join(cache, "uv"), join(cache, "go-build"), join(cache, "go-mod")]) {
+      await this.ensureOwnedDirectory(directory, uid, gid, 0o700);
+    }
+    return { root, home, projects, cache, uid, gid };
+  }
+
+  async conversationWorkspaceProcessEnvironment(conversationId: string, proxyUrl?: string): Promise<NodeJS.ProcessEnv> {
+    const dirs = await this.ensureConversationWorkspace(conversationId);
+    return {
+      HOME: dirs.home,
+      USER: "conversation",
+      LOGNAME: "conversation",
+      XDG_CACHE_HOME: join(dirs.cache, "xdg"),
+      XDG_CONFIG_HOME: join(dirs.home, ".config"),
+      XDG_DATA_HOME: join(dirs.home, ".local", "share"),
+      XDG_STATE_HOME: join(dirs.home, ".local", "state"),
+      NPM_CONFIG_CACHE: join(dirs.cache, "npm"),
+      NPM_CONFIG_PREFIX: join(dirs.home, ".npm-global"),
+      PYTHONUSERBASE: join(dirs.home, ".local"),
+      PIP_CACHE_DIR: join(dirs.cache, "pip"),
+      UV_CACHE_DIR: join(dirs.cache, "uv"),
+      UV_TOOL_DIR: join(dirs.home, ".local", "uv-tools"),
+      UV_TOOL_BIN_DIR: join(dirs.home, ".local", "bin"),
+      GOPATH: join(dirs.home, "go"),
+      GOCACHE: join(dirs.cache, "go-build"),
+      GOMODCACHE: join(dirs.cache, "go-mod"),
+      TMPDIR: join(dirs.home, "tmp"),
+      PATH: `${join(dirs.home, ".npm-global", "bin")}:${join(dirs.home, ".local", "bin")}:${process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}`,
+      LANG: "C.UTF-8",
+      ...proxyEnvironment(proxyUrl),
+    };
+  }
+
+  conversationWorkspacePath(conversationId: string, workspaceId: string): string {
+    const key = createHash("sha256").update(conversationId).digest("hex");
+    return resolve(this.stateRoot, "workspaces", "conversations", key, "projects", canonicalWorkspaceId(workspaceId));
+  }
+
+  async ensureConversationWorkspacePath(conversationId: string, workspaceId: string): Promise<string> {
+    const dirs = await this.ensureConversationWorkspace(conversationId);
+    const candidate = resolve(dirs.projects, canonicalWorkspaceId(workspaceId));
+    await mkdir(candidate, { recursive: true, mode: 0o700 });
+    const realCandidate = await realpath(candidate);
+    if (!isWithin(await realpath(dirs.projects), realCandidate)) throw new Error("WORKSPACE_PATH_ESCAPE");
+    await this.ensureOwnedDirectory(realCandidate, dirs.uid, dirs.gid, 0o700);
+    return realCandidate;
   }
 
   private async ensureSystemDirectories(): Promise<void> {
@@ -266,34 +329,10 @@ export class PrincipalService {
 
   private principalRoot(principalId: string): string {
     if (!/^(?:principal:owner|principal_[A-Za-z0-9_-]+)$/.test(principalId)) throw new Error("PRINCIPAL_ID_INVALID");
-    const root = resolve(this.stateRoot, "principals", principalId);
+    const principal = this.get(principalId);
+    const root = resolve(this.stateRoot, "principals", `uid-${principal.runtimeUid}`);
     if (!isWithin(resolve(this.stateRoot, "principals"), root)) throw new Error("PRINCIPAL_PATH_INVALID");
     return root;
-  }
-
-  private async relocateOwnerDirectory(legacyPath: string, targetPath: string): Promise<void> {
-    let targetExists = false;
-    try {
-      const targetInfo = await lstat(targetPath);
-      if (targetInfo.isSymbolicLink()) {
-        const resolved = await realpath(targetPath).catch(() => "");
-        if (resolved !== resolve(legacyPath)) throw new Error(`OWNER_DATA_MIGRATION_TARGET_MISMATCH:${targetPath}`);
-        await unlink(targetPath);
-      } else targetExists = true;
-    } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-    let legacyInfo;
-    try { legacyInfo = await lstat(legacyPath); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-    if (legacyInfo?.isSymbolicLink()) {
-      const resolved = await realpath(legacyPath).catch(() => "");
-      if (resolved === resolve(targetPath)) return;
-      throw new Error(`OWNER_DATA_MIGRATION_LINK_MISMATCH:${legacyPath}`);
-    }
-    if (legacyInfo && !targetExists) {
-      await rename(legacyPath, targetPath);
-      return;
-    }
-    if (legacyInfo && targetExists) throw new Error(`OWNER_DATA_MIGRATION_COLLISION:${legacyPath}`);
-    if (!targetExists) await mkdir(targetPath, { recursive: true, mode: 0o700 });
   }
 
   private async ensureOwnedDirectory(path: string, uid: number, gid: number, mode: number): Promise<void> {
@@ -311,17 +350,6 @@ export class PrincipalService {
       await this.chownTree(path, uid, gid);
     }
     await chmod(path, mode);
-  }
-
-  private async ensureDirectoryLink(path: string, target: string): Promise<void> {
-    try {
-      const info = await lstat(path);
-      if (!info.isSymbolicLink() || await readlink(path) !== target) throw new Error("PRINCIPAL_DIRECTORY_LINK_MISMATCH");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      await symlink(target, path, "dir");
-      await lchown(path, 0, 0);
-    }
   }
 
   private async chownTree(path: string, uid: number, gid: number): Promise<void> {

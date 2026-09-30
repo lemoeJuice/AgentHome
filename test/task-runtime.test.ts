@@ -234,7 +234,7 @@ test("a second writer is queued behind the durable project lock", async () => {
   const first = await tasks.createWorker({ taskId: task.id, objective: "one", workspaceId: "project", workspaceAccess: "WRITE", actor: caps });
   const second = await tasks.createWorker({ taskId: task.id, objective: "two", workspaceId: "project", workspaceAccess: "WRITE", actor: caps });
   assert.equal(first.status, "STARTING"); assert.equal(second.status, "PENDING");
-  assert.equal(db.get<{ owner_worker_id: string }>("SELECT owner_worker_id FROM project_locks WHERE project_id='project'")?.owner_worker_id, first.id);
+  assert.equal(db.get<{ owner_worker_id: string }>("SELECT owner_worker_id FROM project_locks WHERE project_id='conversation:c:project'")?.owner_worker_id, first.id);
   await new Promise((resolve) => setTimeout(resolve, 20));
   db.close(); await rm(root, { recursive: true, force: true });
 });
@@ -418,18 +418,22 @@ test("Owner and Guest Workers persist the same Principal-brokered execution mode
     async ensurePrincipalDirectories(principalId: string) { const base = join(root, "principals", principalId); return { root: base, home: join(base, "home"), projects: join(base, "projects"), cache: join(base, "cache"), artifacts: join(base, "artifacts"), agent: join(base, "agent") }; },
     async workspacePath(principalId: string, workspaceId: string) { return join(root, "principals", principalId, "projects", workspaceId); },
     workspacePathSync(principalId: string, workspaceId: string) { return join(root, "principals", principalId, "projects", workspaceId); },
+    async ensureConversationWorkspace(conversationId: string) { const base = join(root, "conversation-workspaces", conversationId); return { root: base, home: join(base, "home"), projects: join(base, "projects"), cache: join(base, "cache"), uid: 30001, gid: 30001 }; },
+    async ensureConversationWorkspacePath(conversationId: string, workspaceId: string) { return join(root, "conversation-workspaces", conversationId, "projects", workspaceId); },
+    conversationWorkspacePath(conversationId: string, workspaceId: string) { return join(root, "conversation-workspaces", conversationId, "projects", workspaceId); },
   } as unknown as PrincipalService;
   const config = { owner: { platform: "qq", accountId: "a", userId: "owner" }, guest: { enabled: true, maxWorkersPerPrincipal: 1, taskTimeoutMs: 30_000, commandTimeoutMs: 5000, cpuSeconds: 60, memoryBytes: 100_000_000, pids: 20, maxFileBytes: 10_000_000, workspaceQuotaBytes: 10_000_000, cacheQuotaBytes: 10_000_000, artifactQuotaBytes: 10_000_000 }, runtime: { maxWorkers: 2, maxArtifactBytes: 100_000, piCommand: "pi", piTimeoutMs: 1000 } } as AppConfig;
   const service = new TaskService(db, new TestPi(), new ArtifactService(db, root), config, { workerRoot: root, principals }, logger);
   try {
     const modes: string[] = [];
+    const workspacePaths: string[] = [];
     for (const principalId of ["principal:owner", "principal:guest"]) {
       const trust = principalId === "principal:owner" ? "OWNER" : "GUEST";
       const task = service.createTask({ title: trust, goal: trust, requester: { platform: "qq", accountId: "a", userId: principalId, principalId }, trust, originConversationId: "c", notificationConversationId: "c", parentCapabilities: caps });
       const worker = await service.createWorker({ taskId: task.id, objective: "verify execution plane", actor: caps, actorPrincipalId: principalId });
       const durable = db.get<{ process_mode: string; runtime_uid: number; workspace_id: string; workspace_access: string }>("SELECT process_mode,runtime_uid,workspace_id,workspace_access FROM worker_executions WHERE id=?", worker.id);
       modes.push(durable?.process_mode ?? "missing");
-      assert.equal(durable?.runtime_uid, principalId === "principal:owner" ? 10001 : 20001);
+      assert.equal(durable?.runtime_uid, 30001);
       assert.equal(durable?.workspace_id, "default");
       assert.equal(durable?.workspace_access, "WRITE");
       assert.deepEqual(worker.capabilities?.projects, [{ projectId: "default", access: "WRITE" }]);
@@ -438,9 +442,11 @@ test("Owner and Guest Workers persist the same Principal-brokered execution mode
       assert.equal(execution.workerId, worker.id);
       assert.equal(execution.principalId, principalId);
       assert.equal(execution.role, trust);
-      assert.equal(execution.uid, principalId === "principal:owner" ? 10001 : 20001);
-      assert.equal(execution.gid, principalId === "principal:owner" ? 10001 : 20001);
+      assert.equal(execution.uid, 30001);
+      assert.equal(execution.gid, 30001);
       assert.equal(execution.workspaceId, "default");
+      assert.equal(execution.workspaceScopeId, "conversation:c:default");
+      workspacePaths.push(principals.conversationWorkspacePath("c", "default"));
       assert.equal(execution.workspaceAccess, "WRITE");
       assert.equal(execution.executionProfile, "PRINCIPAL_READ_WRITE");
       assert.equal(execution.contextSource, "durable-worker-record");
@@ -449,7 +455,9 @@ test("Owner and Guest Workers persist the same Principal-brokered execution mode
     const readonlyTask = service.createTask({ title: "readonly", goal: "readonly", requester: { platform: "qq", accountId: "a", userId: "principal:guest-readonly", principalId: "principal:guest-readonly" }, trust: "GUEST", originConversationId: "c", notificationConversationId: "c", parentCapabilities: readonlyCaps });
     const readonlyWorker = await service.createWorker({ taskId: readonlyTask.id, objective: "read only", actor: readonlyCaps, actorPrincipalId: "principal:guest-readonly" });
     assert.equal(readonlyWorker.workspaceAccess, "READ");
+    assert.equal(readonlyWorker.workspaceScopeId, "conversation:c:default");
     assert.deepEqual(readonlyWorker.capabilities?.projects, [{ projectId: "default", access: "READ" }]);
+    assert.equal(workspacePaths[0], workspacePaths[1], "separate callers in one Conversation share the Workspace path");
     assert.deepEqual(modes, ["PRINCIPAL_BROKERED", "PRINCIPAL_BROKERED"]);
   } finally { db.close(); await rm(root, { recursive: true, force: true }); }
 });
@@ -466,7 +474,7 @@ test("recovery verifies process ownership before termination and preserves unkno
     db.run("INSERT INTO tasks(id,title,goal,status,requester_json,trust,origin_conversation_id,notification_conversation_id,capabilities_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", taskId, taskId, taskId, "RUNNING", JSON.stringify({ platform: "qq", accountId: "a", userId: "u" }), "OWNER", "c", "c", JSON.stringify(caps), timestamp, timestamp);
     db.run("INSERT INTO worker_executions(id,task_id,objective,status,harness,harness_session_id,workspace_id,workspace_access,process_id,capabilities_json,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", workerId, taskId, "recover", status, "pi", `pi-${workerId}`, projectId, "WRITE", pid, JSON.stringify(caps), timestamp);
     db.run("INSERT INTO owned_processes(id,task_id,worker_id,pid,process_group_id,command_summary,started_at,pid_start_time) VALUES (?,?,?,?,?,?,?,?)", `process-${workerId}`, taskId, workerId, pid, pid, "pi --mode rpc --session", timestamp, "boot");
-    db.run("INSERT INTO project_locks(project_id,mode,owner_worker_id,acquired_at) VALUES (?,?,?,?)", projectId, "WRITE", workerId, timestamp);
+    db.run("INSERT INTO project_locks(project_id,mode,owner_worker_id,acquired_at) VALUES (?,?,?,?)", `conversation:c:${projectId}`, "WRITE", workerId, timestamp);
   };
   insert("task-owned", "worker-owned", 101, "RUNNING", "project-owned");
   insert("task-stale", "worker-stale", 202, "RUNNING", "project-stale");
@@ -477,10 +485,10 @@ test("recovery verifies process ownership before termination and preserves unkno
   assert.equal(tasks.getWorker("worker-owned").status, "RUNNING");
   assert.equal(tasks.getWorker("worker-stale").status, "INTERRUPTED");
   assert.equal(tasks.getWorker("worker-foreign").status, "INTERRUPTED");
-  assert.ok(db.get("SELECT 1 FROM project_locks WHERE project_id='project-owned'"));
-  assert.equal(db.get("SELECT 1 FROM project_locks WHERE project_id='project-stale'"), undefined);
-  assert.ok(db.get("SELECT 1 FROM project_locks WHERE project_id='project-foreign'"));
-  assert.equal(db.get("SELECT 1 FROM project_locks WHERE project_id='project-terminal'"), undefined);
+  assert.ok(db.get("SELECT 1 FROM project_locks WHERE project_id='conversation:c:project-owned'"));
+  assert.equal(db.get("SELECT 1 FROM project_locks WHERE project_id='conversation:c:project-stale'"), undefined);
+  assert.ok(db.get("SELECT 1 FROM project_locks WHERE project_id='conversation:c:project-foreign'"));
+  assert.equal(db.get("SELECT 1 FROM project_locks WHERE project_id='conversation:c:project-terminal'"), undefined);
   assert.ok(db.get("SELECT 1 FROM runtime_exceptions WHERE worker_id='worker-foreign' AND category='PROCESS_STATE_UNKNOWN'"));
   db.close(); await rm(root, { recursive: true, force: true });
 });
@@ -497,13 +505,13 @@ test("recovery interrupts an orphaned Worker when restoring its MCP binding fail
   db.run("INSERT INTO tasks(id,title,goal,status,requester_json,trust,origin_conversation_id,notification_conversation_id,capabilities_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", "task-binding-recovery", "binding recovery", "binding recovery", "RUNNING", JSON.stringify({ platform: "qq", accountId: "a", userId: "u" }), "OWNER", "c", "c", JSON.stringify(caps), timestamp, timestamp);
   db.run("INSERT INTO worker_executions(id,task_id,objective,status,harness,harness_session_id,workspace_id,workspace_access,process_id,capabilities_json,mcp_binding_token,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", "worker-binding-recovery", "task-binding-recovery", "recover", "RUNNING", "pi", "pi-worker-owned", "project", "WRITE", 909, JSON.stringify(caps), "persisted-binding", timestamp);
   db.run("INSERT INTO owned_processes(id,task_id,worker_id,pid,process_group_id,command_summary,started_at,pid_start_time) VALUES (?,?,?,?,?,?,?,?)", "process-binding-recovery", "task-binding-recovery", "worker-binding-recovery", 909, 909, "pi --mode rpc --session", timestamp, "gone");
-  db.run("INSERT INTO project_locks(project_id,mode,owner_worker_id,acquired_at) VALUES (?,?,?,?)", "project", "WRITE", "worker-binding-recovery", timestamp);
+  db.run("INSERT INTO project_locks(project_id,mode,owner_worker_id,acquired_at) VALUES (?,?,?,?)", "conversation:c:project", "WRITE", "worker-binding-recovery", timestamp);
 
   await tasks.recover();
 
   assert.equal(tasks.getWorker("worker-binding-recovery").status, "INTERRUPTED");
   assert.equal(tasks.getTask("task-binding-recovery").status, "INTERRUPTED");
-  assert.equal(db.get("SELECT 1 FROM project_locks WHERE project_id='project'"), undefined);
+  assert.equal(db.get("SELECT 1 FROM project_locks WHERE project_id='conversation:c:project'"), undefined);
   assert.ok(db.get("SELECT 1 FROM runtime_exceptions WHERE worker_id='worker-binding-recovery' AND category='SESSION_RESTORE_FAILED'"));
   db.close(); await rm(root, { recursive: true, force: true });
 });

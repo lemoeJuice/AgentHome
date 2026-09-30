@@ -16,7 +16,7 @@ import { PiCliHarness, PiTurnError, piNetworkFailureHint, type PiImageContent } 
 import { ArtifactService } from "./artifacts.js";
 import { MemoryService } from "./memory.js";
 import { TaskService, type RuntimeEvent } from "./tasks.js";
-import { PrincipalService, OWNER_PRINCIPAL_ID, PRINCIPAL_UID_MAX, PRINCIPAL_UID_MIN } from "./principals.js";
+import { PrincipalService, OWNER_PRINCIPAL_ID, PRINCIPAL_UID_MAX, PRINCIPAL_UID_MIN, WORKSPACE_RUNTIME_UID_MAX } from "./principals.js";
 import { MODEL_RUNTIME_GID, MODEL_RUNTIME_UID, ModelPlaneService } from "./model-plane.js";
 import { installGuestEgressFilter } from "./guest-network.js";
 import { SnowLumaQQCapability } from "../qq/capability.js";
@@ -121,7 +121,7 @@ export class RuntimeApp {
       await mkdir(toolDirectory, { recursive: true });
       await chown(toolDirectory, 0, this.modelRuntimeGid);
       await chmod(toolDirectory, 0o710);
-      installGuestEgressFilter(PRINCIPAL_UID_MIN, PRINCIPAL_UID_MAX, "/etc/resolv.conf", this.config.network?.modelProxyUrl);
+      installGuestEgressFilter(PRINCIPAL_UID_MIN, WORKSPACE_RUNTIME_UID_MAX, "/etc/resolv.conf", this.config.network?.modelProxyUrl);
     } else if (this.config.guest?.enabled) {
       throw new Error("GUEST_EXECUTION_REQUIRES_ROOTFUL_OUTER_CONTAINER_USERNS");
     }
@@ -720,7 +720,7 @@ export class RuntimeApp {
     const conversation = this.getConversation(task.originConversationId);
     const token = newId("worker-tool");
     const principal = this.principals.get(task.requester.principalId);
-    this.log.debug("Pi Worker tool context bound", { taskId: task.id, workerId: worker.id, principalId: principal.principalId, role: principal.role, uid: principal.runtimeUid, gid: principal.runtimeGid, workspaceId: worker.workspaceId, workspace: worker.workspaceId ? this.principals.workspacePathSync(principal.principalId, worker.workspaceId) : undefined, workspaceAccess: worker.workspaceAccess, capabilities: { projects: worker.capabilities.projects }, executionProfile: worker.processMode === "PRINCIPAL_BROKERED" || worker.processMode === "GUEST_BROKERED" ? (worker.workspaceAccess === "WRITE" ? "PRINCIPAL_READ_WRITE" : "PRINCIPAL_READ_ONLY") : (worker.workspaceAccess === "WRITE" ? "LEGACY_READ_WRITE" : "LEGACY_READ_ONLY"), scope: worker.workspaceScopeId ?? worker.workspaceId, contextSource: "durable-task-and-worker-records" });
+    this.log.debug("Pi Worker tool context bound", { taskId: task.id, workerId: worker.id, principalId: principal.principalId, role: principal.role, uid: worker.runtimeUid, gid: worker.runtimeGid, workspaceId: worker.workspaceId, workspace: worker.workspaceId ? this.principals.conversationWorkspacePath(task.originConversationId, worker.workspaceId) : undefined, workspaceAccess: worker.workspaceAccess, capabilities: { projects: worker.capabilities.projects }, executionProfile: worker.processMode === "PRINCIPAL_BROKERED" || worker.processMode === "GUEST_BROKERED" ? (worker.workspaceAccess === "WRITE" ? "PRINCIPAL_READ_WRITE" : "PRINCIPAL_READ_ONLY") : (worker.workspaceAccess === "WRITE" ? "LEGACY_READ_WRITE" : "LEGACY_READ_ONLY"), scope: worker.workspaceScopeId ?? worker.workspaceId, contextSource: "durable-worker-records" });
     this.workerToolContexts.set(token, {
       conversationId: task.originConversationId,
       requesterId: task.requester.userId,
@@ -730,7 +730,7 @@ export class RuntimeApp {
       capabilities: worker.capabilities,
       taskId: task.id,
       workerId: worker.id,
-      executionContextId: `${task.id}:${worker.id}:${task.requester.principalId}`,
+      executionContextId: `${task.id}:${worker.id}:${task.requester.principalId}:${task.originConversationId}`,
     });
     return { token, socketPath: this.toolSocketPath };
   }

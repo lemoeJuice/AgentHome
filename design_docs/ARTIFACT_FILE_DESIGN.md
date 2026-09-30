@@ -222,7 +222,7 @@ Ownership 用于授权和生命周期，不代表 filesystem Unix owner。
 ```text
 /state/inbox
 /state/artifacts
-/state/projects
+/state/workspaces/conversations/<conversation-key>/projects
 /scratch
 ```
 
@@ -241,7 +241,7 @@ Ownership 用于授权和生命周期，不代表 filesystem Unix owner。
 
 用于需要在 Task 完成后仍可引用的生成物。
 
-## `/state/projects`
+## Conversation project workspaces
 
 项目工作区。
 
@@ -260,7 +260,7 @@ Runtime restart / container recreation 可以丢失。
 例如 Worker 读取：
 
 ```text
-/state/projects/moneko/package.json
+/state/workspaces/conversations/<conversation-key>/projects/moneko/package.json
 ```
 
 不意味着它自动成为可发送 Artifact。
@@ -318,7 +318,7 @@ task scratch output
 不允许默认扫描整个：
 
 ```text
-/state/home
+/state/principals/uid-<runtime-uid>/home
 /state/secrets
 ```
 
@@ -343,7 +343,7 @@ realpath ∈ allowed roots
 不能只做：
 
 ```text
-string startsWith("/state/projects/foo")
+string startsWith("/state/workspaces/conversations/<conversation-key>/projects/foo")
 ```
 
 否则可能被：

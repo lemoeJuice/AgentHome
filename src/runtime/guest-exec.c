@@ -16,6 +16,10 @@
 #define PRINCIPAL_UID_MAX 60000
 #define MODEL_RUNTIME_UID 10002
 #define OWNER_RUNTIME_UID 10001
+#define OWNER_WORKSPACE_UID_MIN 10003
+#define OWNER_WORKSPACE_UID_MAX 19999
+#define WORKSPACE_RUNTIME_UID_MIN 60001
+#define WORKSPACE_RUNTIME_UID_MAX 65535
 
 static void fail(const char *message) {
   perror(message);
@@ -52,7 +56,7 @@ int main(int argc, char **argv) {
   }
   unsigned long long uidValue = number(argv[1], "uid");
   unsigned long long gidValue = number(argv[2], "gid");
-  if ((uidValue != OWNER_RUNTIME_UID && uidValue != MODEL_RUNTIME_UID && (uidValue < PRINCIPAL_UID_MIN || uidValue > PRINCIPAL_UID_MAX)) || gidValue != uidValue) {
+  if ((uidValue != OWNER_RUNTIME_UID && uidValue != MODEL_RUNTIME_UID && !((uidValue >= OWNER_WORKSPACE_UID_MIN && uidValue <= OWNER_WORKSPACE_UID_MAX) || (uidValue >= PRINCIPAL_UID_MIN && uidValue <= PRINCIPAL_UID_MAX) || (uidValue >= WORKSPACE_RUNTIME_UID_MIN && uidValue <= WORKSPACE_RUNTIME_UID_MAX))) || gidValue != uidValue) {
     fprintf(stderr, "GUEST_EXEC_IDENTITY_OUT_OF_RANGE\n");
     return 126;
   }

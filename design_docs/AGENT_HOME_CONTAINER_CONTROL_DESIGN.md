@@ -1186,10 +1186,10 @@ Runtime socket / PID / lock 等当前启动状态。
 可配置：
 
 ```text
-HOME=/state/home
-XDG_CONFIG_HOME=/state/home/.config
-XDG_DATA_HOME=/state/home/.local/share
-XDG_STATE_HOME=/state/home/.local/state
+HOME=/state/principals/uid-<runtime-uid>/home
+XDG_CONFIG_HOME=/state/principals/uid-<runtime-uid>/home/.config
+XDG_DATA_HOME=/state/principals/uid-<runtime-uid>/home/.local/share
+XDG_STATE_HOME=/state/principals/uid-<runtime-uid>/home/.local/state
 XDG_CACHE_HOME=/cache
 TMPDIR=/scratch/tmp
 ```

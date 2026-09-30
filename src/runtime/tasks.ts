@@ -123,8 +123,11 @@ export class TaskService implements ExecutionBackend {
     if (isGuest && !principal) throw new Error("GUEST_PRINCIPAL_REQUIRED");
     if (principal && this.options.principals) {
       await this.options.principals.ensurePrincipalDirectories(principal.principalId);
-      if (workspaceId) await this.options.principals.workspacePath(principal.principalId, workspaceId);
+      if (workspaceId) await this.options.principals.ensureConversationWorkspacePath(task.originConversationId, workspaceId);
     }
+    const conversationWorkspace = principal && workspaceId
+      ? await this.options.principals!.ensureConversationWorkspace(task.originConversationId)
+      : undefined;
     const workspaceScopeId = workspaceId ? this.workspaceScopeId(task, workspaceId) : undefined;
     const workerCount = Number(this.db.get<{ count: number }>("SELECT count(*) AS count FROM worker_executions WHERE task_id=? AND status IN ('PENDING','STARTING','RUNNING','WAITING_USER','STOPPING')", input.taskId)?.count ?? 0);
     if (workerCount >= this.config.runtime.maxWorkers) throw new Error("WORKER_QUOTA_EXCEEDED");
@@ -142,14 +145,15 @@ export class TaskService implements ExecutionBackend {
     const lockAcquired = lockRequired && this.tryAcquireLock(workspaceScopeId as string, workerId);
     const status: WorkerStatus = lockRequired && !lockAcquired ? "PENDING" : "STARTING";
     const timestamp = nowIso();
-    const worker: WorkerExecutionRecord = { id: workerId, taskId: input.taskId, objective: input.objective, status, harness: "pi", processMode: principalExecution ? "PRINCIPAL_BROKERED" : "PI", ...(effectivePrincipalId ? { principalId: effectivePrincipalId } : {}), ...(principal ? { runtimeUid: principal.runtimeUid, runtimeGid: principal.runtimeGid } : {}), ...(workspaceId ? { workspaceId } : {}), ...(workspaceScopeId ? { workspaceScopeId } : {}), ...(workspaceAccess ? { workspaceAccess } : {}), ...(input.artifactRefs?.length ? { artifactRefs: input.artifactRefs } : {}), updatedAt: timestamp };
+    const worker: WorkerExecutionRecord = { id: workerId, taskId: input.taskId, objective: input.objective, status, harness: "pi", processMode: principalExecution ? "PRINCIPAL_BROKERED" : "PI", ...(effectivePrincipalId ? { principalId: effectivePrincipalId } : {}), ...(conversationWorkspace ? { runtimeUid: conversationWorkspace.uid, runtimeGid: conversationWorkspace.gid } : principal ? { runtimeUid: principal.runtimeUid, runtimeGid: principal.runtimeGid } : {}), ...(workspaceId ? { workspaceId } : {}), ...(workspaceScopeId ? { workspaceScopeId } : {}), ...(workspaceAccess ? { workspaceAccess } : {}), ...(input.artifactRefs?.length ? { artifactRefs: input.artifactRefs } : {}), updatedAt: timestamp };
     worker.capabilities = capabilities;
     const executionProfile = describeExecutionProfile(worker);
-    this.log.debug("Worker execution profile selected", { taskId: task.id, workerId, principalId: effectivePrincipalId, role: principal?.role ?? task.trust, uid: principal?.runtimeUid ?? worker.runtimeUid, gid: principal?.runtimeGid ?? worker.runtimeGid, workspaceId, workspace: workspaceId && principal ? this.options.principals?.workspacePathSync(principal.principalId, workspaceId) : workspaceId ? join(this.options.workerRoot, "projects", workspaceId) : undefined, workspaceAccess, capabilities: { projects: capabilities.projects }, executionProfile, scope: workspaceScopeId ?? workspaceId, contextSource: principalExecution ? "durable-task-and-worker-records" : "legacy-worker-record" });
-    if (workspaceAccess === "READ") this.log.warn("Read-only Worker profile persisted", { taskId: task.id, workerId, principalId: effectivePrincipalId, role: principal?.role ?? task.trust, uid: principal?.runtimeUid ?? worker.runtimeUid, gid: principal?.runtimeGid ?? worker.runtimeGid, workspaceId, workspace: workspaceId && principal ? this.options.principals?.workspacePathSync(principal.principalId, workspaceId) : undefined, capabilities: { projects: capabilities.projects }, executionProfile, scope: workspaceScopeId ?? workspaceId, contextSource: principalExecution ? "durable-task-and-worker-records" : "legacy-worker-record" });
+    const workspacePath = workspaceId && this.options.principals ? this.options.principals.conversationWorkspacePath(task.originConversationId, workspaceId) : workspaceId ? join(this.options.workerRoot, "projects", workspaceId) : undefined;
+    this.log.debug("Worker execution profile selected", { taskId: task.id, workerId, principalId: effectivePrincipalId, role: principal?.role ?? task.trust, uid: worker.runtimeUid ?? principal?.runtimeUid, gid: worker.runtimeGid ?? principal?.runtimeGid, workspaceId, workspace: workspacePath, workspaceAccess, capabilities: { projects: capabilities.projects }, executionProfile, scope: workspaceScopeId ?? workspaceId, contextSource: principalExecution ? "conversation-workspace-and-caller-capabilities" : "legacy-worker-record" });
+    if (workspaceAccess === "READ") this.log.warn("Read-only Worker profile persisted", { taskId: task.id, workerId, principalId: effectivePrincipalId, role: principal?.role ?? task.trust, uid: worker.runtimeUid ?? principal?.runtimeUid, gid: worker.runtimeGid ?? principal?.runtimeGid, workspaceId, workspace: workspacePath, workspaceAccess, capabilities: { projects: capabilities.projects }, executionProfile, scope: workspaceScopeId ?? workspaceId, contextSource: principalExecution ? "conversation-workspace-and-caller-capabilities" : "legacy-worker-record" });
     try {
       this.db.transaction(() => {
-        this.db.run("INSERT INTO worker_executions(id,task_id,objective,status,harness,workspace_id,workspace_access,capabilities_json,artifact_refs_json,mcp_binding_token,updated_at,principal_id,runtime_uid,runtime_gid,workspace_scope_id,process_mode,source_mailbox_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", workerId, input.taskId, input.objective, status, "pi", workspaceId ?? null, workspaceAccess ?? null, JSON.stringify(capabilities), input.artifactRefs?.length ? JSON.stringify(input.artifactRefs) : null, null, timestamp, effectivePrincipalId ?? null, principal?.runtimeUid ?? null, principal?.runtimeGid ?? null, workspaceScopeId ?? null, worker.processMode ?? "PI", input.sourceMailboxId ?? null);
+        this.db.run("INSERT INTO worker_executions(id,task_id,objective,status,harness,workspace_id,workspace_access,capabilities_json,artifact_refs_json,mcp_binding_token,updated_at,principal_id,runtime_uid,runtime_gid,workspace_scope_id,process_mode,source_mailbox_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", workerId, input.taskId, input.objective, status, "pi", workspaceId ?? null, workspaceAccess ?? null, JSON.stringify(capabilities), input.artifactRefs?.length ? JSON.stringify(input.artifactRefs) : null, null, timestamp, effectivePrincipalId ?? null, worker.runtimeUid ?? null, worker.runtimeGid ?? null, workspaceScopeId ?? null, worker.processMode ?? "PI", input.sourceMailboxId ?? null);
         this.event(input.taskId, "WORKER_CREATED", workerId, { status });
         this.db.run("UPDATE tasks SET status=?,updated_at=? WHERE id=? AND status IN ('CREATED','QUEUED')", status === "PENDING" ? "QUEUED" : "RUNNING", timestamp, input.taskId);
       });
@@ -170,17 +174,17 @@ export class TaskService implements ExecutionBackend {
     if (!worker.principalId || !task.requester.principalId || worker.principalId !== task.requester.principalId || !this.options.principals) throw new Error("WORKER_PRINCIPAL_REQUIRED");
     if (worker.processMode !== "PRINCIPAL_BROKERED" && worker.processMode !== "GUEST_BROKERED") throw new Error("WORKER_EXECUTION_BACKEND_REQUIRED");
     const principal = this.options.principals.get(worker.principalId);
-    if (principal.role !== task.trust) throw new Error("WORKER_PRINCIPAL_ROLE_MISMATCH");
-    if (worker.runtimeUid !== principal.runtimeUid || worker.runtimeGid !== principal.runtimeGid || !worker.workspaceId || !worker.workspaceAccess) throw new Error("WORKER_PRINCIPAL_IDENTITY_MISMATCH");
+    if (!worker.workspaceId || !worker.workspaceAccess) throw new Error("WORKER_PRINCIPAL_IDENTITY_MISMATCH");
     if (task.trust === "GUEST" && !this.config.guest.enabled) throw new Error("GUEST_PROCESS_EXEC_DENIED");
-    const dirs = await this.options.principals.ensurePrincipalDirectories(principal.principalId);
-    const workspace = await this.options.principals.workspacePath(principal.principalId, worker.workspaceId);
+    const dirs = await this.options.principals.ensureConversationWorkspace(task.originConversationId);
+    if (worker.runtimeUid !== dirs.uid || worker.runtimeGid !== dirs.gid) throw new Error("WORKER_CONVERSATION_WORKSPACE_IDENTITY_MISMATCH");
+    const workspace = await this.options.principals.ensureConversationWorkspacePath(task.originConversationId, worker.workspaceId);
     const capabilities = worker.capabilities;
     if (!capabilities) throw new Error("WORKER_CAPABILITY_SNAPSHOT_MISSING");
     const workspaceCapability = capabilities.projects.find((project) => project.projectId === "*" || project.projectId === worker.workspaceId);
     if (!workspaceCapability) throw new Error("WORKSPACE_CAPABILITY_MISSING");
     if (worker.workspaceAccess === "WRITE" && workspaceCapability.access !== "WRITE") throw new Error("WORKSPACE_WRITE_CAPABILITY_MISSING");
-    const context: ExecutionContext = { executionContextId: `${task.id}:${worker.id}:${principal.principalId}`, taskId: task.id, workerId: worker.id, principalId: principal.principalId, workspaceId: worker.workspaceId, ...(worker.workspaceScopeId ? { workspaceScopeId: worker.workspaceScopeId } : {}), uid: principal.runtimeUid, gid: principal.runtimeGid, role: principal.role, capabilities, workspace, workspaceAccess: worker.workspaceAccess, executionProfile: describeExecutionProfile(worker), contextSource: "durable-worker-record", home: dirs.home, ...(worker.harnessSessionId ? { sessionId: worker.harnessSessionId } : {}) };
+    const context: ExecutionContext = { executionContextId: `${task.id}:${worker.id}:${principal.principalId}:${task.originConversationId}`, taskId: task.id, workerId: worker.id, principalId: principal.principalId, workspaceId: worker.workspaceId, ...(worker.workspaceScopeId ? { workspaceScopeId: worker.workspaceScopeId } : {}), uid: dirs.uid, gid: dirs.gid, role: principal.role, capabilities, workspace, workspaceAccess: worker.workspaceAccess, executionProfile: describeExecutionProfile(worker), contextSource: "durable-worker-record", home: dirs.home, ...(worker.harnessSessionId ? { sessionId: worker.harnessSessionId } : {}) };
     this.log.debug("Worker ExecutionContext reconstructed", executionContextLogFields(context));
     return context;
   }
@@ -241,7 +245,7 @@ export class TaskService implements ExecutionBackend {
     const commandTimeout = guest ? this.config.guest.commandTimeoutMs : this.config.runtime.piTimeoutMs;
     const timeoutMs = Math.max(1, Math.min(Number.isSafeInteger(input.timeoutMs) ? Number(input.timeoutMs) : commandTimeout, commandTimeout, remainingTaskMs));
     const helper = this.options.guestExecCommand ?? "/usr/local/bin/agent-home-guest-exec";
-    const environment = this.options.principals!.principalProcessEnvironment(current.principalId, this.config.network?.modelProxyUrl);
+    const environment = await this.options.principals!.conversationWorkspaceProcessEnvironment(task.originConversationId, this.config.network?.modelProxyUrl);
     const child = spawn(helper, [String(current.uid), String(current.gid), String(this.config.guest.cpuSeconds), String(this.config.guest.memoryBytes), String(this.config.guest.pids), String(this.config.guest.maxFileBytes), "--", "/bin/bash", "-c", input.command], { cwd, env: environment, detached: true, stdio: ["ignore", "pipe", "pipe"] });
     const active = this.activePrincipalCommands.get(worker.id) ?? new Set<ChildProcess>();
     active.add(child);
@@ -354,7 +358,7 @@ export class TaskService implements ExecutionBackend {
   }
 
   private workspaceScopeId(task: TaskRecord, workspaceId: string): string {
-    return task.requester.principalId ? `principal:${task.requester.principalId}:${workspaceId}` : workspaceId;
+    return `conversation:${task.originConversationId}:${workspaceId}`;
   }
 
   private async readProcessIdentity(pid: number): Promise<{ processGroupId: number; startTime: string } | undefined> {
@@ -393,7 +397,7 @@ export class TaskService implements ExecutionBackend {
         if (!worker.principalId || !this.options.principals || worker.runtimeUid === undefined || worker.runtimeGid === undefined) throw new Error("WORKER_PRINCIPAL_FILESYSTEM_REQUIRED");
         if (process.getuid?.() !== 0) throw new Error("PRINCIPAL_EXECUTION_REQUIRES_SYSTEM_ROOT");
         await this.options.principals.ensurePrincipalDirectories(worker.principalId);
-        projectPath = await this.options.principals.workspacePath(worker.principalId, worker.workspaceId ?? "default");
+        projectPath = await this.options.principals.ensureConversationWorkspacePath(task.originConversationId, worker.workspaceId ?? "default");
         await this.ensureSystemPrivateDirectory(dirname(sessionPath), modelUid, modelGid);
         workerToolContext = await this.prepareGuestToolContext(worker, task);
       } else {
@@ -995,7 +999,7 @@ export class TaskService implements ExecutionBackend {
       if (!worker.principalId || !this.options.principals) return false;
       if (process.getuid?.() !== 0) return false;
       await this.options.principals.ensurePrincipalDirectories(worker.principalId);
-      await this.options.principals.workspacePath(worker.principalId, workspaceId ?? "default");
+      await this.options.principals.ensureConversationWorkspacePath(this.getTask(worker.taskId).originConversationId, workspaceId ?? "default");
       await this.ensureSystemPrivateDirectory(dirname(session.sessionPath), modelUid, modelGid);
       workerToolContext = await this.prepareGuestToolContext(worker, task);
     } else {
@@ -1316,7 +1320,7 @@ export class TaskService implements ExecutionBackend {
   }
 
   private workerWorkspace(worker: WorkerExecutionRecord): string {
-    if (worker.workspaceId && worker.principalId && this.options.principals) return this.options.principals.workspacePathSync(worker.principalId, worker.workspaceId);
+    if (worker.workspaceId && this.options.principals) return this.options.principals.conversationWorkspacePath(this.getTask(worker.taskId).originConversationId, worker.workspaceId);
     const fallback = worker.workspaceId ? join(this.options.workerRoot, "projects", canonicalWorkspaceId(worker.workspaceId)) : join(this.options.workerRoot, "scratch", worker.id);
     this.log.warn("Non-Principal Worker workspace fallback selected", { taskId: worker.taskId, workerId: worker.id, principalId: worker.principalId, workspaceId: worker.workspaceId, workspace: fallback, executionProfile: describeExecutionProfile(worker), scope: worker.workspaceScopeId ?? worker.workspaceId, contextSource: worker.principalId && !this.options.principals ? "principal-service-unavailable" : "legacy-worker-without-principal" });
     return fallback;
