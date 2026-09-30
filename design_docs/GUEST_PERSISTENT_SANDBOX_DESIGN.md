@@ -1032,7 +1032,7 @@ Execution Plane (TaskService ExecutionBackend)
 ```
 
 - 固定 Owner UID/GID 为 `10001`；Principal UID/GID 分配范围为 `20000–60000`；Trusted Pi Model Plane 使用 `10002`，不属于任何 Principal。Conversation workspace 使用独立 UID 范围：Owner 私聊 `10003–19999`，Guest/群聊 `60001–65535`。
-- Owner、Guest Worker 都以 `PRINCIPAL_BROKERED` 模式运行：Pi 进程是 Model Plane；workspace command 由 `agent-home-guest-exec` 以当前 Conversation 的 workspace UID/GID 启动，调用者的授权仍使用独立 Principal 和 Capability。
+- 当前 Worker 身份和权限模型已由 `PRINCIPAL_WORKSPACE_SYSTEM_ADMIN_DESIGN.md` 与 `UID_GID_MEMORY_DESIGN.md` 取代；本文件其余 Owner/Guest Unix 身份段落仅保留作历史背景。
 - Trusted Pi 的 bwrap mount 只提供 Pi command/runtime、`/state/model/pi/agent`、Model Plane session、Unix Runtime Tool socket 和固定 Runtime extension；不 bind Principal workspace。`--no-builtin-tools --no-extensions --no-skills --no-context-files` 禁止项目 extensions 自动加载。
 - Principal 的 home/cache/artifacts 位于 `/state/principals/uid-<runtime-uid>/`；项目 workspace 位于 `/state/workspaces/conversations/<sha256(conversation-id)>/projects/`。不创建 `/state/home`、`/state/projects` 兼容 symlink；Pi auth/session 位于 Model Plane。
 - Owner/Guest 的 shell 和 workspace read/write/edit/mkdir/remove/list/stat 工具均由 ExecutionBackend 执行。`ExecutionContext` 的 task、worker、principal、uid/gid、role、capability、workspace 由 Runtime 的持久记录生成；模型只发送 operation 参数。

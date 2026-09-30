@@ -140,7 +140,7 @@ async function updateBootstrapConfig(config: AppConfig, owners: ReturnType<typeo
   const path = join(config.paths.stateRoot, "config", "bootstrap.json");
   const current = JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
   current.owners = owners;
-  current.systemAdmins = config.systemAdmins ?? owners;
+  current.systemAdmins = config.systemAdmins ?? [];
   current.runtime = { ...(current.runtime as Record<string, unknown> ?? {}), piAgentDir: join(config.paths.stateRoot, "model", "pi", "agent") };
   delete current.owner;
   await writeFile(path, `${JSON.stringify(current, null, 2)}\n`, { mode: 0o600 });
