@@ -357,7 +357,7 @@ export class PiCliHarness implements PiHarness {
       const principalExec = launcherUid !== undefined && launcherGid !== undefined && (launcherUid !== globalThis.process.getuid?.() || launcherGid !== globalThis.process.getgid?.());
       const command = principalExec ? globalThis.process.env.AGENT_HOME_PRINCIPAL_EXEC_COMMAND ?? "/usr/local/bin/agent-home-principal-exec" : invocation.command;
       const args = principalExec
-        ? [String(launcherUid), String(launcherGid), String(launcherGid), String(options.sandbox?.launcherCpuSeconds ?? 3600), String(options.sandbox?.launcherMemoryBytes ?? 128 * 1024 * 1024 * 1024), String(options.sandbox?.launcherPids ?? 512), String(options.sandbox?.launcherMaxFileBytes ?? 2 * 1024 * 1024 * 1024), "--", invocation.command, ...invocation.args]
+        ? [String(launcherUid), String(launcherGid), "0", String(options.sandbox?.launcherCpuSeconds ?? 3600), String(options.sandbox?.launcherMemoryBytes ?? 128 * 1024 * 1024 * 1024), String(options.sandbox?.launcherPids ?? 512), String(options.sandbox?.launcherMaxFileBytes ?? 2 * 1024 * 1024 * 1024), "--", invocation.command, ...invocation.args]
         : invocation.args;
       const env = principalExec ? { PATH: globalThis.process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" } : invocation.env;
       const child = spawn(command, args, { cwd: invocation.cwd, env, detached: true, stdio: ["pipe", "pipe", "pipe"] });

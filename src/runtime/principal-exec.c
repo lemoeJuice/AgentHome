@@ -56,7 +56,7 @@ int main(int argc, char **argv) {
   unsigned long long uidValue = number(argv[1], "uid");
   unsigned long long gidValue = number(argv[2], "gid");
   unsigned long long workspaceGidValue = number(argv[3], "workspace-gid");
-  if ((uidValue != OWNER_RUNTIME_UID && uidValue != MODEL_RUNTIME_UID && !(uidValue >= PRINCIPAL_UID_MIN && uidValue <= PRINCIPAL_UID_MAX)) || (gidValue != OWNER_RUNTIME_UID && gidValue != MODEL_RUNTIME_UID && !(gidValue >= PRINCIPAL_UID_MIN && gidValue <= PRINCIPAL_UID_MAX)) || (workspaceGidValue < WORKSPACE_GID_MIN || workspaceGidValue > WORKSPACE_GID_MAX)) {
+  if ((uidValue != OWNER_RUNTIME_UID && uidValue != MODEL_RUNTIME_UID && !(uidValue >= PRINCIPAL_UID_MIN && uidValue <= PRINCIPAL_UID_MAX)) || (gidValue != OWNER_RUNTIME_UID && gidValue != MODEL_RUNTIME_UID && !(gidValue >= PRINCIPAL_UID_MIN && gidValue <= PRINCIPAL_UID_MAX)) || (workspaceGidValue != 0 && (workspaceGidValue < WORKSPACE_GID_MIN || workspaceGidValue > WORKSPACE_GID_MAX))) {
     fprintf(stderr, "PRINCIPAL_EXEC_IDENTITY_OUT_OF_RANGE\n");
     return 126;
   }
@@ -71,8 +71,12 @@ int main(int argc, char **argv) {
   set_limit(RLIMIT_FSIZE, fileBytes, "file-size");
   set_limit(RLIMIT_NOFILE, 1024, "open-files");
   if (prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0) != 0) fail("PR_SET_PDEATHSIG");
-  gid_t workspaceGroup = (gid_t)workspaceGidValue;
-  if (setgroups(1, &workspaceGroup) != 0) fail("setgroups");
+  if (workspaceGidValue == 0) {
+    if (setgroups(0, NULL) != 0) fail("setgroups");
+  } else {
+    gid_t workspaceGroup = (gid_t)workspaceGidValue;
+    if (setgroups(1, &workspaceGroup) != 0) fail("setgroups");
+  }
   if (setresgid((gid_t)gidValue, (gid_t)gidValue, (gid_t)gidValue) != 0) fail("setresgid");
   if (setresuid((uid_t)uidValue, (uid_t)uidValue, (uid_t)uidValue) != 0) fail("setresuid");
   if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) fail("PR_SET_NO_NEW_PRIVS");
