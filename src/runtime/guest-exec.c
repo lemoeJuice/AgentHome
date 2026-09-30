@@ -78,6 +78,7 @@ int main(int argc, char **argv) {
   if (setresgid((gid_t)gidValue, (gid_t)gidValue, (gid_t)gidValue) != 0) fail("setresgid");
   if (setresuid((uid_t)uidValue, (uid_t)uidValue, (uid_t)uidValue) != 0) fail("setresuid");
   if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) fail("PR_SET_NO_NEW_PRIVS");
+  umask(0002);
   execvp(argv[9], &argv[9]);
   fail("execvp");
 }
