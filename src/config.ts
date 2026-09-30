@@ -6,6 +6,7 @@ import type { LogLevel } from "./shared/logger.js";
 export interface AppConfig {
   instanceId: string;
   owners?: Array<{ platform: string; accountId: string; userId: string }>;
+  systemAdmins?: Array<{ platform: string; accountId: string; userId: string }>;
   /** @deprecated Use owners. Kept for existing configuration and integrations. */
   owner?: { platform: string; accountId: string; userId: string };
   gateway: { mcpPort: number; mcpHost?: string; mcpActionTimeoutMs: number };
@@ -150,10 +151,15 @@ export function configuredOwners(config: Pick<AppConfig, "owners" | "owner">): N
   return config.owners ?? (config.owner ? [config.owner] : []);
 }
 
+export function configuredSystemAdmins(config: Pick<AppConfig, "systemAdmins" | "owners" | "owner">): NonNullable<AppConfig["owners"]> {
+  return config.systemAdmins ?? configuredOwners(config);
+}
+
 export function validateConfig(config: AppConfig): void {
   const required = [config.instanceId, config.snowluma.endpoint, config.snowluma.apiEndpoint];
   if (required.some((value) => !value)) throw new Error("CONFIG_MISSING: instance and SnowLuma endpoints are required");
   if (config.owners?.some((owner) => !owner.platform || !owner.accountId || !owner.userId)) throw new Error("CONFIG_INVALID: owners");
+  if (config.systemAdmins?.some((admin) => !admin.platform || !admin.accountId || !admin.userId)) throw new Error("CONFIG_INVALID: systemAdmins");
   for (const key of ["serviceBindAddress", "uiBindAddress"] as const) if (!/^[A-Za-z0-9.:-]+$/.test(config.snowluma.deployment[key])) throw new Error(`CONFIG_INVALID: snowluma.deployment.${key}`);
   for (const key of ["httpPort", "wsPort", "webuiPort", "novncPort"] as const) if (!Number.isInteger(config.snowluma.deployment[key]) || config.snowluma.deployment[key] < 1 || config.snowluma.deployment[key] > 65535) throw new Error(`CONFIG_INVALID: snowluma.deployment.${key}`);
   if (typeof config.snowluma.deployment.acceptEula !== "boolean" || typeof config.snowluma.deployment.acceptPrivacy !== "boolean") throw new Error("CONFIG_INVALID: snowluma.deployment consent");
