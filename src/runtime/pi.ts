@@ -354,12 +354,12 @@ export class PiCliHarness implements PiHarness {
       const launcherGid = options.sandbox?.launcherGid ?? this.launcherGid;
       // Node 22's bundled Pi undici/llhttp WebAssembly parser needs a 128 GiB
       // virtual-address ceiling at full CLI startup; this is RLIMIT_AS, not an RSS cap.
-      const guestExec = launcherUid !== undefined && launcherGid !== undefined && (launcherUid !== globalThis.process.getuid?.() || launcherGid !== globalThis.process.getgid?.());
-      const command = guestExec ? globalThis.process.env.AGENT_HOME_GUEST_EXEC_COMMAND ?? "/usr/local/bin/agent-home-guest-exec" : invocation.command;
-      const args = guestExec
-        ? [String(launcherUid), String(launcherGid), String(options.sandbox?.launcherCpuSeconds ?? 3600), String(options.sandbox?.launcherMemoryBytes ?? 128 * 1024 * 1024 * 1024), String(options.sandbox?.launcherPids ?? 512), String(options.sandbox?.launcherMaxFileBytes ?? 2 * 1024 * 1024 * 1024), "--", invocation.command, ...invocation.args]
+      const principalExec = launcherUid !== undefined && launcherGid !== undefined && (launcherUid !== globalThis.process.getuid?.() || launcherGid !== globalThis.process.getgid?.());
+      const command = principalExec ? globalThis.process.env.AGENT_HOME_PRINCIPAL_EXEC_COMMAND ?? globalThis.process.env.AGENT_HOME_GUEST_EXEC_COMMAND ?? "/usr/local/bin/agent-home-principal-exec" : invocation.command;
+      const args = principalExec
+        ? [String(launcherUid), String(launcherGid), String(launcherGid), String(options.sandbox?.launcherCpuSeconds ?? 3600), String(options.sandbox?.launcherMemoryBytes ?? 128 * 1024 * 1024 * 1024), String(options.sandbox?.launcherPids ?? 512), String(options.sandbox?.launcherMaxFileBytes ?? 2 * 1024 * 1024 * 1024), "--", invocation.command, ...invocation.args]
         : invocation.args;
-      const env = guestExec ? { PATH: globalThis.process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" } : invocation.env;
+      const env = principalExec ? { PATH: globalThis.process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" } : invocation.env;
       const child = spawn(command, args, { cwd: invocation.cwd, env, detached: true, stdio: ["pipe", "pipe", "pipe"] });
     const process: RpcProcess = { child, sessionPath: session.sessionPath, pending: new Map(), buffer: "", mainTools: Boolean(options.mainTools), ...(options.extensionPath ? { extensionPath: options.extensionPath } : {}), ...(options.sandbox ? { sandbox: options.sandbox } : {}) };
     this.active.set(session.sessionId, process);
