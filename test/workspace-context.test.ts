@@ -86,7 +86,7 @@ test("Guest default Worker profile is writable and Pi tool dispatch keeps Princi
   const config = testConfig();
   const requester: TaskRequester = { platform: "qq", accountId: "default", userId: "guest-user", principalId: "principal_guest-test" };
   const taskCaps = capabilities();
-  const service = new TaskService(db, { } as never, new ArtifactService(db, root), config, { workerRoot: root, principals, guestExecCommand: helper }, logger);
+  const service = new TaskService(db, { } as never, new ArtifactService(db, root), config, { workerRoot: root, principals, principalExecCommand: helper }, logger);
   const task = service.createTask({ title: "write own workspace", goal: "create a file", requester, trust: "GUEST", originConversationId: "conversation", notificationConversationId: "conversation", parentCapabilities: taskCaps });
   const workerId = "worker_guest-write";
   const workerCaps = { ...taskCaps, projects: [{ projectId: "default", access: "WRITE" as const }] };
@@ -165,7 +165,7 @@ test("Guest Worker cannot write another Principal workspace and read-only profil
   const config = testConfig();
   const requester: TaskRequester = { platform: "qq", accountId: "default", userId: "guest", principalId: "principal_guest-isolated" };
   const caps = capabilities();
-  const service = new TaskService(db, {} as never, new ArtifactService(db, root), config, { workerRoot: root, principals, guestExecCommand: await createExecHelper(root) }, logger);
+  const service = new TaskService(db, {} as never, new ArtifactService(db, root), config, { workerRoot: root, principals, principalExecCommand: await createExecHelper(root) }, logger);
   const task = service.createTask({ title: "isolation", goal: "isolation", requester, trust: "GUEST", originConversationId: "conversation", notificationConversationId: "conversation", parentCapabilities: caps });
   const otherWorkspace = await principals.ensureConversationWorkspacePath("conversation-other", "default");
   const timestamp = new Date().toISOString();
@@ -194,7 +194,7 @@ test("reconstructed Principal Worker context fails closed and differentiates wor
   const principals = fakePrincipals(root);
   const requester: TaskRequester = { platform: "qq", accountId: "default", userId: "guest", principalId: "principal_guest-recovery" };
   const caps = capabilities();
-  const service = new TaskService(db, {} as never, new ArtifactService(db, root), testConfig(), { workerRoot: root, principals, guestExecCommand: await createExecHelper(root) }, logger);
+  const service = new TaskService(db, {} as never, new ArtifactService(db, root), testConfig(), { workerRoot: root, principals, principalExecCommand: await createExecHelper(root) }, logger);
   const task = service.createTask({ title: "recovered", goal: "recovered", requester, trust: "GUEST", originConversationId: "conversation", notificationConversationId: "conversation", parentCapabilities: caps });
   const timestamp = new Date().toISOString();
   const insert = (id: string, snapshot: CapabilitySet | null) => db.run("INSERT INTO worker_executions(id,task_id,objective,status,harness,workspace_id,workspace_access,capabilities_json,updated_at,principal_id,runtime_uid,runtime_gid,workspace_scope_id,process_mode,workspace_gid) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", id, task.id, id, "RUNNING", "pi", "default", "WRITE", snapshot ? JSON.stringify(snapshot) : null, timestamp, requester.principalId!, 20001, 20001, "conversation:conversation:default", "PRINCIPAL_BROKERED", 30001);
@@ -204,7 +204,7 @@ test("reconstructed Principal Worker context fails closed and differentiates wor
   insert("worker-write-capability-missing", { ...caps, projects: [{ projectId: "default", access: "READ" }] });
   try {
     const first = await service.executionContext("worker-recovered");
-    const rebuiltService = new TaskService(db, {} as never, new ArtifactService(db, root), testConfig(), { workerRoot: root, principals, guestExecCommand: await createExecHelper(root) }, logger);
+    const rebuiltService = new TaskService(db, {} as never, new ArtifactService(db, root), testConfig(), { workerRoot: root, principals, principalExecCommand: await createExecHelper(root) }, logger);
     const rebuilt = await rebuiltService.executionContext("worker-recovered");
     assert.deepEqual(rebuilt, first);
     assert.equal(rebuilt.contextSource, "durable-worker-record");

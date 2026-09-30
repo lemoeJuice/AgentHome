@@ -46,7 +46,7 @@ export interface TaskServiceOptions {
   mcpEndpoint?: string;
   workerToolExtensionPath?: string;
   principals?: PrincipalService;
-  guestExecCommand?: string;
+  principalExecCommand?: string;
   modelSessionsRoot?: string;
   modelRuntimeUid?: number;
   modelRuntimeGid?: number;
@@ -246,7 +246,7 @@ export class TaskService implements ExecutionBackend {
     if (guest) await this.assertGuestQuota(principalDirs, root);
     const commandTimeout = guest ? this.config.guest.commandTimeoutMs : this.config.runtime.piTimeoutMs;
     const timeoutMs = Math.max(1, Math.min(Number.isSafeInteger(input.timeoutMs) ? Number(input.timeoutMs) : commandTimeout, commandTimeout, remainingTaskMs));
-    const helper = this.options.guestExecCommand ?? "/usr/local/bin/agent-home-guest-exec";
+    const helper = this.options.principalExecCommand ?? "/usr/local/bin/agent-home-principal-exec";
     const environment = { ...this.options.principals!.principalProcessEnvironment(current.principalId, this.config.network?.modelProxyUrl), HOME: current.home, WORKSPACE: current.workspace };
     const child = spawn(helper, [String(current.uid), String(current.gid), String(current.workspaceGid), String(this.config.guest.cpuSeconds), String(this.config.guest.memoryBytes), String(this.config.guest.pids), String(this.config.guest.maxFileBytes), "--", "/bin/bash", "-c", input.command], { cwd, env: environment, detached: true, stdio: ["ignore", "pipe", "pipe"] });
     const active = this.activePrincipalCommands.get(worker.id) ?? new Set<ChildProcess>();

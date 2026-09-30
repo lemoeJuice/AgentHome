@@ -24,7 +24,7 @@ let modelSecret;
 let ownerTestRoot;
 
 const runIdentity = (uid, gid, command, cwd, env = process.env, timeout = 90_000) => {
-  const result = spawnSync("/usr/local/bin/agent-home-guest-exec", [String(uid), String(gid), "60", "17179869184", "64", "536870912", "--", "/bin/bash", "-c", command], {
+  const result = spawnSync("/usr/local/bin/agent-home-principal-exec", [String(uid), String(gid), String(gid), "60", "17179869184", "64", "536870912", "--", "/bin/bash", "-c", command], {
     cwd,
     env,
     encoding: "utf8",

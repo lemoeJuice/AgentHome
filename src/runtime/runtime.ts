@@ -109,7 +109,7 @@ export class RuntimeApp {
      }
      this.snowlumaMcp = new SnowLumaMcpClient(config, this.log);
      this.qq = new SnowLumaQQCapability(config, this.artifacts, this.log, this.snowlumaMcp);
-    this.tasks = new TaskService(this.db, this.pi, this.artifacts, config, { workerRoot: config.paths.stateRoot, modelSessionsRoot: this.modelPlane.paths.workerSessions, modelRuntimeUid: this.modelRuntimeUid, modelRuntimeGid: this.modelRuntimeGid, principals: this.principals, guestExecCommand: "/usr/local/bin/agent-home-guest-exec", workerToolExtensionPath: this.workerToolsPath, ...(this.mcpControl ? { mcpControl: this.mcpControl, mcpEndpoint: process.env.AGENT_HOME_MCP_URL } : {}), createWorkerToolContext: (worker, task) => this.createWorkerToolContext(worker, task), onEvent: (event, task) => this.onTaskEvent(event, task) }, this.log);
+    this.tasks = new TaskService(this.db, this.pi, this.artifacts, config, { workerRoot: config.paths.stateRoot, modelSessionsRoot: this.modelPlane.paths.workerSessions, modelRuntimeUid: this.modelRuntimeUid, modelRuntimeGid: this.modelRuntimeGid, principals: this.principals, principalExecCommand: "/usr/local/bin/agent-home-principal-exec", workerToolExtensionPath: this.workerToolsPath, ...(this.mcpControl ? { mcpControl: this.mcpControl, mcpEndpoint: process.env.AGENT_HOME_MCP_URL } : {}), createWorkerToolContext: (worker, task) => this.createWorkerToolContext(worker, task), onEvent: (event, task) => this.onTaskEvent(event, task) }, this.log);
     this.toolServer = new RuntimeToolServer(this.toolSocketPath, (token) => this.resolveRuntimeToolContext(token), (action, input, context) => this.handleMainTool(action, input, context), { ...(process.getuid?.() === 0 ? { socketGroupId: this.modelRuntimeGid } : {}) });
   }
 
