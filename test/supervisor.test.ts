@@ -15,7 +15,8 @@ test("supervisor starts Runtime after bootstrap and stops it cleanly", async () 
     await writeFile(join(root, "config", "bootstrap.json"), "{}\n");
     await writeFile(configPath, JSON.stringify({
       instanceId: "supervisor-test",
-      owner: { platform: "qq", accountId: "default", userId: "owner" },
+      owners: [{ platform: "qq", accountId: "default", userId: "owner" }],
+      systemAdmins: [{ platform: "qq", accountId: "default", userId: "owner" }],
       paths: { gatewayState: join(root, "gateway.sqlite"), pluginData: join(root, "plugins"), backupDir: join(root, "backups"), stateRoot: root, runtimeSocket: socketPath },
       snowluma: { accountId: "default", endpoint: "ws://127.0.0.1:1", apiEndpoint: "http://127.0.0.1:1", reverseWebSocketPath: "/", reconnectMs: 10, requestTimeoutMs: 10 },
       chat: { global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, conversationOverrides: {} },

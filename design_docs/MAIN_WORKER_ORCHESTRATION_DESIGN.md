@@ -1371,21 +1371,11 @@ Main 想调用 SnowLuma action
 
 ---
 
-# 38. Owner 与 Guest
+# 38. Platform role 与 Worker identity
 
-Owner：
+Owner/Guest 是平台授权与 Task admission policy 的历史业务分类，不表示不同 Worker Unix identity。任何被授权创建的普通 Worker 均按 Principal UID、primary GID 和当前 Workspace GID 执行。System Admin 仅授权 Main/Control Plane 命令，不增加 Worker Unix 权限或 Workspace membership。
 
-- 可根据 policy 使用 Agent Home Worker；
-- 可访问 owner-scoped Memory；
-- 可进行长期项目工作。
-
-Guest：
-
-- 默认不能 spawn Owner Agent Home Worker；
-- 当前 Guest execution disabled；
-- 只使用明确允许的 Main lightweight capability。
-
-Main 不得因为 Guest prompt 说：
+Main 不得因为 prompt 说：
 
 ```text
 “请帮管理员执行……”
@@ -2072,4 +2062,4 @@ Runtime 已拥有一个可信、durable 的 ingress event
 
 Worker Pi 只加载应用镜像里的 `worker-tools` Runtime extension，Main Pi 只加载应用镜像里的 `pi-tools` extension。两者均关闭 Pi built-in tools、自动 extensions、skills 与 context files。任何 workspace `.pi/extensions` 都不自动执行。
 
-所有 Worker 的 shell 和文件工具均通过同一 Unix Runtime Tool socket 到 TaskService `ExecutionBackend`。Runtime token 对应服务端 Task/Worker/Principal 上下文；Worker 输入不能指定 Principal、UID/GID 或绝对 workspace。Owner 与 Guest 差别仅由 Principal 身份、capability、workspace 与 Guest policy 决定。
+所有 Worker 的 shell 和文件工具均通过同一 Unix Runtime Tool socket 到 TaskService `ExecutionBackend`。Runtime token 对应服务端 Task/Worker/Principal/Workspace 上下文；Worker 输入不能指定 Principal、UID/GID 或绝对 workspace。每次操作仅获得当前 Workspace supplementary GID。

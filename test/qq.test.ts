@@ -84,7 +84,7 @@ test("lazy message reads reject a provider response from another conversation", 
     return { status: "ok", retcode: 0, data: { message_id: 9, message_type: "group", group_id: 99, user_id: 8, time: 1, message: [{ type: "text", data: { text: "foreign" } }] } };
   }, async (endpoint) => {
     const config = {
-      instanceId: "test", owner: { platform: "qq", accountId: "default", userId: "8" },
+      instanceId: "test",
       paths: { gatewayState: "./gateway.sqlite", pluginData: "./plugins", backupDir: "./backups", stateRoot: "/tmp", runtimeSocket: "/run/agent-home/control.sock" },
       snowluma: { accountId: "default", endpoint: "ws://127.0.0.1:1", apiEndpoint: endpoint, reverseWebSocketPath: "/", reconnectMs: 10, requestTimeoutMs: 1000 },
       chat: { global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" as const }, qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" as const }, conversationOverrides: {} },
@@ -104,7 +104,6 @@ test("lazy message reads reject a provider response from another conversation", 
 test("QQ history consumes SnowLuma data.messages and numeric IDs", async () => {
   const config = {
     instanceId: "test",
-    owner: { platform: "qq", accountId: "default", userId: "8" },
     paths: { gatewayState: "./gateway.sqlite", pluginData: "./plugins", backupDir: "./backups", stateRoot: "/state", runtimeSocket: "/run/agent-home/control.sock" },
     snowluma: { accountId: "default", endpoint: "ws://127.0.0.1:1", apiEndpoint: "http://127.0.0.1:1", reverseWebSocketPath: "/", reconnectMs: 10, requestTimeoutMs: 1000 },
     chat: { global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" as const }, qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" as const }, conversationOverrides: {} },
@@ -131,7 +130,7 @@ test("QQ history consumes SnowLuma data.messages and numeric IDs", async () => {
 
 test("QQ capability normalizes lazy message responses", () => {
   const config = {
-    instanceId: "test", owner: { platform: "qq", accountId: "default", userId: "8" },
+    instanceId: "test",
     paths: { gatewayState: "./gateway.sqlite", pluginData: "./plugins", backupDir: "./backups", stateRoot: "/state", runtimeSocket: "/run/agent-home/control.sock" },
     snowluma: { accountId: "default", endpoint: "ws://127.0.0.1:1", apiEndpoint: "http://127.0.0.1:1", reverseWebSocketPath: "/", reconnectMs: 10, requestTimeoutMs: 1000 },
     chat: { global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" as const }, qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" as const }, conversationOverrides: {} },
@@ -145,7 +144,7 @@ test("QQ capability normalizes lazy message responses", () => {
 
 test("QQ capability accepts negative OneBot message IDs", async () => {
   const config = {
-    instanceId: "test", owner: { platform: "qq", accountId: "default", userId: "8" },
+    instanceId: "test",
     paths: { gatewayState: "./gateway.sqlite", pluginData: "./plugins", backupDir: "./backups", stateRoot: "/state", runtimeSocket: "/run/agent-home/control.sock" },
     snowluma: { accountId: "default", endpoint: "ws://127.0.0.1:1", apiEndpoint: "http://127.0.0.1:1", reverseWebSocketPath: "/", reconnectMs: 10, requestTimeoutMs: 1000 },
     chat: { global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" as const }, qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" as const }, conversationOverrides: {} },
@@ -171,7 +170,6 @@ test("QQ capability accepts negative OneBot message IDs", async () => {
 test("unsupported QQ private history is explicit", async () => {
   const config = {
     instanceId: "test",
-    owner: { platform: "qq", accountId: "default", userId: "8" },
     paths: { gatewayState: "./gateway.sqlite", pluginData: "./plugins", backupDir: "./backups", stateRoot: "/state", runtimeSocket: "/run/agent-home/control.sock" },
     snowluma: { accountId: "default", endpoint: "ws://127.0.0.1:1", apiEndpoint: "http://127.0.0.1:1", reverseWebSocketPath: "/", reconnectMs: 10, requestTimeoutMs: 1000 },
     chat: { global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" as const }, qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" as const }, conversationOverrides: {} },
@@ -191,7 +189,6 @@ test("unsupported QQ private history is explicit", async () => {
 test("QQ outbound rejects raw URLs instead of treating them as artifacts", async () => {
   const config = {
     instanceId: "test",
-    owner: { platform: "qq", accountId: "default", userId: "8" },
     paths: { gatewayState: "./gateway.sqlite", pluginData: "./plugins", backupDir: "./backups", stateRoot: "/state", runtimeSocket: "/run/agent-home/control.sock" },
     snowluma: { accountId: "default", endpoint: "ws://127.0.0.1:1", apiEndpoint: "http://127.0.0.1:1", reverseWebSocketPath: "/", reconnectMs: 10, requestTimeoutMs: 1000 },
     chat: { global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" as const }, qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" as const }, conversationOverrides: {} },
@@ -215,7 +212,6 @@ test("Agent QQ capability sends an authorized ArtifactRef", async () => {
   const artifact = await artifacts.registerLocalArtifact({ path: join(project, "image.png"), taskId: "task-1", allowedRoots: [project], capability: artifactCapability, maxBytes: 1000 });
   const config = {
     instanceId: "test",
-    owner: { platform: "qq", accountId: "default", userId: "8" },
     paths: { gatewayState: "./gateway.sqlite", pluginData: "./plugins", backupDir: "./backups", stateRoot: root, runtimeSocket: "/run/agent-home/control.sock" },
     snowluma: { accountId: "default", endpoint: "ws://127.0.0.1:1", apiEndpoint: "http://127.0.0.1:1", reverseWebSocketPath: "/", reconnectMs: 10, requestTimeoutMs: 1000 },
     chat: { global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" as const }, qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" as const }, conversationOverrides: {} },
@@ -257,7 +253,7 @@ test("SnowLuma attachment streams require a real regular file below the stream r
   await writeFile(outsidePath, "outside");
   await symlink(outsidePath, linkPath);
   const config = {
-    instanceId: "test", owner: { platform: "qq", accountId: "default", userId: "8" },
+    instanceId: "test",
     paths: { gatewayState: join(root, "gateway.sqlite"), pluginData: root, backupDir: root, stateRoot: root, runtimeSocket: join(root, "runtime.sock") },
     snowluma: { accountId: "default", endpoint: "ws://127.0.0.1:1", apiEndpoint: "http://127.0.0.1:1", reverseWebSocketPath: "/", reconnectMs: 10, requestTimeoutMs: 1000 },
     chat: { global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" as const }, qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" as const }, conversationOverrides: {} },

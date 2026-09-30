@@ -7,8 +7,6 @@ export interface AppConfig {
   instanceId: string;
   owners?: Array<{ platform: string; accountId: string; userId: string }>;
   systemAdmins?: Array<{ platform: string; accountId: string; userId: string }>;
-  /** @deprecated Use owners. Kept for existing configuration and integrations. */
-  owner?: { platform: string; accountId: string; userId: string };
   gateway: { mcpPort: number; mcpHost?: string; mcpActionTimeoutMs: number };
   network: {
     modelProxyUrl?: string;
@@ -117,14 +115,13 @@ export async function loadConfig(path = process.env.AGENT_HOME_CONFIG ?? "./conf
       fileConfig = { ...bootstrap, paths: { ...defaults.paths, stateRoot } };
     } catch { /* doctor will report the missing configuration below */ }
   }
-  const legacyOwner = fileConfig.owner;
-  const configuredOwners = fileConfig.owners ?? (legacyOwner ? [legacyOwner] : []);
+  if (Object.hasOwn(fileConfig, "owner")) throw new Error("CONFIG_UNSUPPORTED: owner; migrate to owners and systemAdmins");
+  const configuredOwners = fileConfig.owners ?? [];
   if (!Array.isArray(configuredOwners) || configuredOwners.some((owner) => !owner || typeof owner.platform !== "string" || typeof owner.accountId !== "string" || typeof owner.userId !== "string")) throw new Error("CONFIG_INVALID: owners");
   const owners = configuredOwners.filter((owner) => owner.platform && owner.accountId && owner.userId && !owner.userId.startsWith("REPLACE_"));
   if (fileConfig.systemAdmins !== undefined && (!Array.isArray(fileConfig.systemAdmins) || fileConfig.systemAdmins.some((admin) => !admin || typeof admin.platform !== "string" || typeof admin.accountId !== "string" || typeof admin.userId !== "string"))) throw new Error("CONFIG_INVALID: systemAdmins");
   const systemAdmins = fileConfig.systemAdmins?.filter((admin) => admin.platform && admin.accountId && admin.userId && !admin.userId.startsWith("REPLACE_"));
-  const { owner: _legacyOwner, ...withoutLegacyOwner } = fileConfig;
-  fileConfig = { ...withoutLegacyOwner, ...(fileConfig.owners !== undefined || legacyOwner ? { owners } : {}), ...(systemAdmins ? { systemAdmins } : {}) };
+  fileConfig = { ...fileConfig, ...(fileConfig.owners !== undefined ? { owners } : {}), ...(systemAdmins ? { systemAdmins } : {}) };
   if (fileConfig.owners !== undefined) fileConfig.owners = owners;
   const config = merge(defaults, fileConfig);
   const explicitModelProxy = Boolean(fileConfig.network && Object.prototype.hasOwnProperty.call(fileConfig.network, "modelProxyUrl"));
@@ -134,10 +131,6 @@ export async function loadConfig(path = process.env.AGENT_HOME_CONFIG ?? "./conf
   if (process.env.PI_COMMAND) config.runtime.piCommand = process.env.PI_COMMAND;
   if (process.env.PI_AGENT_DIR) config.runtime.piAgentDir = process.env.PI_AGENT_DIR;
   if (resolve(config.runtime.piAgentDir) === resolve("/state/model/pi/agent")) config.runtime.piAgentDir = join(config.paths.stateRoot, "model", "pi", "agent");
-  if (resolve(config.runtime.piAgentDir) === resolve(config.paths.stateRoot, "home", ".pi", "agent")) config.runtime.piAgentDir = join(config.paths.stateRoot, "model", "pi", "agent");
-  // Node 22's bundled undici reserves substantial WebAssembly virtual address
-  // space. The former 2 GiB RLIMIT_AS prevented Pi from starting and broke fetch/npm.
-  if (config.guest.memoryBytes === 2 * 1024 * 1024 * 1024) config.guest.memoryBytes = 16 * 1024 * 1024 * 1024;
   if (process.env.AGENT_HOME_WORKER_SANDBOX) config.runtime.workerSandboxCommand = process.env.AGENT_HOME_WORKER_SANDBOX;
   if (process.env.AGENT_HOME_MODEL_PROXY_URL !== undefined) config.network.modelProxyUrl = process.env.AGENT_HOME_MODEL_PROXY_URL || undefined;
   if (process.env.GATEWAY_MCP_PORT !== undefined) config.gateway.mcpPort = positiveIntegerEnv("GATEWAY_MCP_PORT", config.gateway.mcpPort);
@@ -149,12 +142,12 @@ export async function loadConfig(path = process.env.AGENT_HOME_CONFIG ?? "./conf
   return config;
 }
 
-export function configuredOwners(config: Pick<AppConfig, "owners" | "owner">): NonNullable<AppConfig["owners"]> {
-  return config.owners ?? (config.owner ? [config.owner] : []);
+export function configuredOwners(config: Pick<AppConfig, "owners">): NonNullable<AppConfig["owners"]> {
+  return config.owners ?? [];
 }
 
-export function configuredSystemAdmins(config: Pick<AppConfig, "systemAdmins" | "owners" | "owner">): NonNullable<AppConfig["owners"]> {
-  return config.systemAdmins ?? configuredOwners(config);
+export function configuredSystemAdmins(config: Pick<AppConfig, "systemAdmins">): NonNullable<AppConfig["owners"]> {
+  return config.systemAdmins ?? [];
 }
 
 export function validateConfig(config: AppConfig): void {

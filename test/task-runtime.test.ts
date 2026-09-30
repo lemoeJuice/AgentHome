@@ -5,13 +5,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SqliteStore, migrate } from "../src/db.js";
 import { runtimeMigrations } from "../src/schema.js";
-import { isLiveProcStatInGroup, TaskService } from "../src/runtime/tasks.js";
+import { isLiveProcStatInGroup, TaskService as RuntimeTaskService, type TaskServiceOptions } from "../src/runtime/tasks.js";
 import { WORKER_CONTROL_PREFIX } from "../src/runtime/tasks.js";
 import { ArtifactService } from "../src/runtime/artifacts.js";
 import type { PiHarness, PiImageContent, PiProcessIdentity, PiProcessInspection, PiSandbox, PiSession } from "../src/runtime/pi.js";
 import type { AppConfig } from "../src/config.js";
 import type { Logger } from "../src/shared/logger.js";
 import type { PrincipalService } from "../src/runtime/principals.js";
+import { createTaskTestPrincipals, taskTestWorkspaceGid, taskTestWorkspacePath } from "./task-principals.js";
 
 class TestPi implements PiHarness {
   readonly steers: string[] = [];
@@ -35,8 +36,11 @@ class SuffixControlPi extends TestPi {
 }
 
 class StructuredPi extends TestPi {
+  private readonly workspace: string;
+  constructor(workspace: string) { super(); this.workspace = workspace; }
   async send(_session: PiSession, _prompt: string, options?: { cwd?: string }): Promise<string> {
-    await writeFile(join(options?.cwd ?? "/tmp", "result.txt"), "verified artifact");
+    void options;
+    await writeFile(join(this.workspace, "result.txt"), "verified artifact");
     return [
       `${WORKER_CONTROL_PREFIX}{"type":"progress","summary":"workspace checked","currentAction":"writing result"}`,
       `${WORKER_CONTROL_PREFIX}{"type":"artifact","path":"result.txt","mime":"text/plain"}`,
@@ -91,6 +95,72 @@ class DelayedCreatePi extends TestPi {
 }
 
 const logger = { child: () => logger, info() {}, warn() {}, error() {}, debug() {} } as unknown as Logger;
+type TestTaskServiceOptions = Omit<TaskServiceOptions, "principals"> & { principals?: PrincipalService };
+
+class TaskService extends RuntimeTaskService {
+  private readonly testPrincipals: PrincipalService;
+
+  constructor(db: SqliteStore, pi: PiHarness, artifacts: ArtifactService, config: AppConfig, options: TestTaskServiceOptions, log: Logger) {
+    const principals = options.principals ?? createTaskTestPrincipals(options.workerRoot);
+    super(db, pi, artifacts, config, {
+      ...options,
+      principals,
+      modelRuntimeUid: options.modelRuntimeUid ?? process.getuid?.(),
+      modelRuntimeGid: options.modelRuntimeGid ?? process.getgid?.(),
+      createWorkerToolContext: options.createWorkerToolContext ?? (() => Promise.resolve({ token: "test-worker-token", socketPath: join(options.workerRoot, "worker-tools.sock") })),
+    }, log);
+    this.testPrincipals = principals;
+  }
+
+  override getTask(taskId: string) {
+    const row = this.db.get<{ principal_id: string | null; requester_json: string; trust: "OWNER" | "GUEST" }>("SELECT principal_id,requester_json,trust FROM tasks WHERE id=?", taskId);
+    if (row && !row.principal_id) {
+      let requester: Record<string, unknown>;
+      try { requester = JSON.parse(row.requester_json) as Record<string, unknown>; } catch { requester = {}; }
+      const identity = typeof requester.platform === "string" && typeof requester.accountId === "string" && typeof requester.userId === "string"
+        ? this.testPrincipals.resolveIdentity(requester.platform, requester.accountId, requester.userId)
+        : this.testPrincipals.resolveIdentity("test", "test", taskId);
+      const principal = this.testPrincipals.get(identity.principalId);
+      requester.principalId = identity.principalId; requester.runtimeUid = principal.runtimeUid; requester.runtimeGid = principal.runtimeGid;
+      this.db.run("UPDATE tasks SET principal_id=?,requester_json=? WHERE id=?", identity.principalId, JSON.stringify(requester), taskId);
+    }
+    return super.getTask(taskId);
+  }
+
+  override getWorker(workerId: string) {
+    const row = this.db.get<{ task_id: string; principal_id: string | null; runtime_uid: number | null; runtime_gid: number | null; workspace_gid: number | null; workspace_id: string | null; workspace_access: "READ" | "WRITE" | null; process_mode: string | null; capabilities_json: string | null }>("SELECT task_id,principal_id,runtime_uid,runtime_gid,workspace_gid,workspace_id,workspace_access,process_mode,capabilities_json FROM worker_executions WHERE id=?", workerId);
+    if (row) {
+      const task = this.getTask(row.task_id);
+      const principalId = row.principal_id ?? task.requester.principalId!;
+      const principal = this.testPrincipals.get(principalId);
+      const workspaceId = row.workspace_id ?? "default";
+      const workspaceAccess = row.workspace_access ?? "WRITE";
+      const capabilities = row.capabilities_json !== null
+        ? row.capabilities_json
+        : JSON.stringify({ ...task.capabilities, projects: [{ projectId: workspaceId, access: workspaceAccess }] });
+      this.db.run("UPDATE worker_executions SET principal_id=?,runtime_uid=?,runtime_gid=?,workspace_gid=?,workspace_id=?,workspace_access=?,process_mode='PRINCIPAL_BROKERED',capabilities_json=? WHERE id=?", principalId, principal.runtimeUid, principal.runtimeGid, row.workspace_gid ?? taskTestWorkspaceGid(task.originConversationId), workspaceId, workspaceAccess, capabilities, workerId);
+    }
+    return super.getWorker(workerId);
+  }
+
+  override async recover(): Promise<void> {
+    for (const row of this.db.all<{ id: string }>("SELECT id FROM tasks")) this.getTask(row.id);
+    for (const row of this.db.all<{ id: string }>("SELECT id FROM worker_executions")) this.getWorker(row.id);
+    return super.recover();
+  }
+
+  override createTask(input: Parameters<RuntimeTaskService["createTask"]>[0]) {
+    const parentCapabilities = input.parentCapabilities.projects.length
+      ? input.parentCapabilities
+      : { ...input.parentCapabilities, projects: [{ projectId: "*", access: "WRITE" as const }] };
+    return super.createTask({ ...input, parentCapabilities });
+  }
+
+  override createWorker(input: Parameters<RuntimeTaskService["createWorker"]>[0]) {
+    const principalId = input.actorPrincipalId ?? this.getTask(input.taskId).requester.principalId;
+    return super.createWorker({ ...input, ...(principalId ? { actorPrincipalId: principalId } : {}) });
+  }
+}
 
 test("process-group cleanup treats zombie-only groups as terminated", () => {
   assert.equal(isLiveProcStatInGroup("333 (http) Z 1 328 328 0", 328), false);
@@ -178,9 +248,10 @@ test("task listing filters another requester in a shared conversation", () => {
   const root = "/tmp/agent-home-task-visibility";
   const tasks = new TaskService(db, new TestPi(), new ArtifactService(db, root), { runtime: { maxWorkers: 1, maxArtifactBytes: 1000, piCommand: "pi", piTimeoutMs: 1000 } } as AppConfig, { workerRoot: root }, logger);
   const caps = { memory: { allowedScopes: ["global_agent"] }, projects: [], qq: { readConversations: ["group"], sendConversations: ["group"] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: ["agent-home"], publishTaskIds: [], allowedDestinations: ["group"] }, tasks: { canCreate: true, visibleTaskIds: [], canCancel: true, canFollowUp: true } };
-  tasks.createTask({ title: "one", goal: "one", requester: { platform: "qq", accountId: "a", userId: "u1" }, trust: "OWNER", originConversationId: "group", notificationConversationId: "group", parentCapabilities: caps });
+  const firstTask = tasks.createTask({ title: "one", goal: "one", requester: { platform: "qq", accountId: "a", userId: "u1" }, trust: "OWNER", originConversationId: "group", notificationConversationId: "group", parentCapabilities: caps });
   tasks.createTask({ title: "two", goal: "two", requester: { platform: "qq", accountId: "a", userId: "u2" }, trust: "GUEST", originConversationId: "group", notificationConversationId: "group", parentCapabilities: caps });
-  assert.deepEqual(tasks.listTasks("group", caps, "u1").map((task) => task.requester.userId), ["u1"]);
+  const requester = firstTask.requester.principalId;
+  assert.deepEqual(tasks.listTasks("group", caps, requester).map((task) => task.requester.userId), ["u1"]);
   db.close();
 });
 
@@ -191,7 +262,7 @@ test("child Tasks require visible parent ownership and remain queryable by expli
   const parent = tasks.createTask({ title: "parent", goal: "parent", requester: { platform: "qq", accountId: "a", userId: "u" }, trust: "OWNER", originConversationId: "parent", notificationConversationId: "parent", parentCapabilities: caps });
   const child = tasks.createTask({ title: "child", goal: "child", requester: { platform: "qq", accountId: "a", userId: "u" }, trust: "OWNER", originConversationId: "child", notificationConversationId: "child", parentTaskId: parent.id, parentCapabilities: caps });
   assert.equal(child.parentTaskId, parent.id);
-  assert.deepEqual(new Set(tasks.listTasks("child", { ...caps, tasks: { ...caps.tasks, visibleTaskIds: [parent.id] } }, "u").map((task) => task.id)), new Set([child.id, parent.id]));
+  assert.deepEqual(new Set(tasks.listTasks("child", { ...caps, tasks: { ...caps.tasks, visibleTaskIds: [parent.id] } }, parent.requester.principalId).map((task) => task.id)), new Set([child.id, parent.id]));
   assert.throws(() => tasks.createTask({ title: "foreign", goal: "foreign", requester: { platform: "qq", accountId: "a", userId: "other" }, trust: "OWNER", originConversationId: "child", notificationConversationId: "child", parentTaskId: parent.id, parentCapabilities: { ...caps, qq: { readConversations: ["child"], sendConversations: ["child"] } } }), /TASK_PARENT_DENIED/);
   db.close();
 });
@@ -267,10 +338,10 @@ test("follow-up after the last Worker completed starts a new Worker instead of o
   const requester = { platform: "qq", accountId: "a", userId: "owner" };
   const task = tasks.createTask({ title: "artifact output", goal: "produce a result", requester, trust: "OWNER", originConversationId: "c", notificationConversationId: "c", parentCapabilities: caps });
   try {
-    const first = await tasks.createWorker({ taskId: task.id, objective: "inspect source", actor: caps, actorRequester: requester });
+    const first = await tasks.createWorker({ taskId: task.id, objective: "inspect source", actor: caps, actorPrincipalId: task.requester.principalId });
     for (let index = 0; index < 100 && tasks.getWorker(first.id).status !== "COMPLETED"; index += 1) await new Promise((resolve) => setTimeout(resolve, 5));
     assert.equal(tasks.getWorker(first.id).status, "COMPLETED");
-    await tasks.addFollowUp(task.id, "write the requested output artifact", { conversationId: "c", message: { platform: "qq", accountId: "a", platformConversationId: "group", threadId: null, messageId: "follow-up" }, requester, capabilities: caps });
+    await tasks.addFollowUp(task.id, "write the requested output artifact", { conversationId: "c", message: { platform: "qq", accountId: "a", platformConversationId: "group", threadId: null, messageId: "follow-up" }, requester: task.requester, capabilities: caps });
     const next = db.get<{ id: string; status: string; objective: string }>("SELECT id,status,objective FROM worker_executions WHERE task_id=? AND id<>? ORDER BY updated_at DESC LIMIT 1", task.id, first.id);
     assert.ok(next);
     assert.match(next.objective, /write the requested output artifact/);
@@ -303,7 +374,7 @@ test("Runtime recovery resumes an orphaned follow-up mailbox with a durably link
     assert.match(worker.objective, /write solution.cpp.txt and publish it/);
     assert.equal(db.get<{ source_mailbox_id: string }>("SELECT source_mailbox_id FROM worker_executions WHERE id=?", worker.id)?.source_mailbox_id, mailboxId);
     for (let index = 0; index < 100 && tasks.getWorker(worker.id).status !== "COMPLETED"; index += 1) await new Promise((resolve) => setTimeout(resolve, 5));
-    assert.equal(tasks.getWorker(worker.id).status, "COMPLETED");
+    assert.equal(tasks.getWorker(worker.id).status, "COMPLETED", JSON.stringify(db.all("SELECT type,payload_json FROM task_events WHERE task_id=?", task.id)));
   } finally { db.close(); await rm(root, { recursive: true, force: true }); }
 });
 
@@ -316,7 +387,7 @@ test("Worker control JSON followed by harness summary text still completes the W
   try {
     const worker = await tasks.createWorker({ taskId: task.id, objective: "finish using a control frame", actor: caps });
     for (let index = 0; index < 100 && tasks.getWorker(worker.id).status !== "COMPLETED"; index += 1) await new Promise((resolve) => setTimeout(resolve, 5));
-    assert.equal(tasks.getWorker(worker.id).status, "COMPLETED");
+    assert.equal(tasks.getWorker(worker.id).status, "COMPLETED", JSON.stringify(db.all("SELECT type,payload_json FROM task_events WHERE task_id=?", task.id)));
     assert.equal(db.get("SELECT 1 FROM runtime_exceptions WHERE worker_id=? AND category='PI_FAILURE'", worker.id), undefined);
   } finally { db.close(); await rm(root, { recursive: true, force: true }); }
 });
@@ -324,7 +395,7 @@ test("Worker control JSON followed by harness summary text still completes the W
 test("runtime recovery does not leave phantom RUNNING workers", async () => {
   const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
   const timestamp = new Date().toISOString();
-  db.run("INSERT INTO tasks(id,title,goal,status,requester_json,trust,origin_conversation_id,notification_conversation_id,capabilities_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", "t", "x", "x", "RUNNING", JSON.stringify({}), "OWNER", "c", "c", JSON.stringify({ tasks: { canCancel: true } }), timestamp, timestamp);
+  db.run("INSERT INTO tasks(id,title,goal,status,requester_json,trust,origin_conversation_id,notification_conversation_id,capabilities_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", "t", "x", "x", "RUNNING", JSON.stringify({}), "OWNER", "c", "c", JSON.stringify({ memory: { allowedScopes: [] }, projects: [{ projectId: "*", access: "WRITE" }], qq: { readConversations: ["c"], sendConversations: ["c"] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: [], publishTaskIds: [], allowedDestinations: ["c"] }, tasks: { canCreate: true, visibleTaskIds: [], canCancel: true, canFollowUp: true } }), timestamp, timestamp);
   db.run("INSERT INTO worker_executions(id,task_id,objective,status,harness,updated_at) VALUES (?,?,?,?,?,?)", "w", "t", "x", "RUNNING", "pi", timestamp);
   const config = { runtime: { maxWorkers: 2, maxArtifactBytes: 100000, piCommand: "pi", piTimeoutMs: 1000 } } as AppConfig;
   const tasks = new TaskService(db, new TestPi(), new ArtifactService(db, "/tmp"), config, { workerRoot: "/tmp", onEvent: async () => {} }, logger);
@@ -339,12 +410,12 @@ test("WorkerControl persists progress, publishes artifacts, and explicitly finis
   const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
   const config = { runtime: { maxWorkers: 2, maxArtifactBytes: 100000, piCommand: "pi", piTimeoutMs: 1000 } } as AppConfig;
   const events: string[] = [];
-  const tasks = new TaskService(db, new StructuredPi(), new ArtifactService(db, root), config, { workerRoot: root, onEvent: async (event) => { events.push(event.type); } }, logger);
+  const tasks = new TaskService(db, new StructuredPi(taskTestWorkspacePath(root, "c", "project")), new ArtifactService(db, root), config, { workerRoot: root, onEvent: async (event) => { events.push(event.type); } }, logger);
   const caps = { memory: { allowedScopes: ["global_agent"] }, projects: [{ projectId: "*", access: "WRITE" as const }], qq: { readConversations: ["c"], sendConversations: ["c"] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: ["agent-home"], publishTaskIds: ["*"], allowedDestinations: ["c"] }, tasks: { canCreate: true, visibleTaskIds: [], canCancel: true, canFollowUp: true } };
   const task = tasks.createTask({ title: "control", goal: "control", requester: { platform: "qq", accountId: "a", userId: "u" }, trust: "OWNER", originConversationId: "c", notificationConversationId: "c", parentCapabilities: caps });
   const worker = await tasks.createWorker({ taskId: task.id, objective: "control", workspaceId: "project", workspaceAccess: "WRITE", actor: caps });
   await new Promise((resolve) => setTimeout(resolve, 30));
-  assert.equal(tasks.getWorker(worker.id).status, "COMPLETED");
+  assert.equal(tasks.getWorker(worker.id).status, "COMPLETED", JSON.stringify(db.all("SELECT type,payload_json FROM task_events WHERE task_id=?", task.id)));
   assert.equal(tasks.getTask(task.id).status, "RUNNING");
   assert.equal(db.get<{ count: number }>("SELECT count(*) AS count FROM task_events WHERE task_id=? AND type='WORKER_PROGRESS'", task.id)?.count, 1);
   const artifact = db.get<{ owner_task_id: string; producer_worker_id: string; status: string }>("SELECT owner_task_id,producer_worker_id,status FROM artifacts WHERE owner_task_id=?", task.id);
@@ -371,7 +442,7 @@ test("authorized image Artifact is injected into Pi visual context and adjacent 
   try {
     const worker = await tasks.createWorker({ taskId: task.id, objective: "inspect the image", artifactRefs: [artifact.ref], actor: caps });
     for (let index = 0; index < 100 && tasks.getWorker(worker.id).status !== "COMPLETED"; index += 1) await new Promise((resolve) => setTimeout(resolve, 5));
-    assert.equal(tasks.getWorker(worker.id).status, "COMPLETED");
+    assert.equal(tasks.getWorker(worker.id).status, "COMPLETED", JSON.stringify(db.all("SELECT type,payload_json FROM task_events WHERE task_id=?", task.id)));
     assert.deepEqual(pi.images, [{ type: "image", data: jpeg.toString("base64"), mimeType: "image/jpeg" }]);
     assert.equal(db.get("SELECT 1 FROM runtime_exceptions WHERE task_id=? AND category='PI_FAILURE'", task.id), undefined);
     assert.equal(db.get("SELECT 1 FROM task_events WHERE task_id=? AND type='WORKER_COMPLETED'", task.id) !== undefined, true);
@@ -417,12 +488,11 @@ test("Owner and Guest Workers persist the same Principal-brokered execution mode
     get(principalId: string) { return { principalId, runtimeUid: principalId === "principal:owner" ? 10001 : 20001, runtimeGid: principalId === "principal:owner" ? 10001 : 20001, role: principalId === "principal:owner" ? "OWNER" as const : "GUEST" as const }; },
     async ensurePrincipalDirectories(principalId: string) { const base = join(root, "principals", principalId); return { root: base, home: join(base, "home"), projects: join(base, "projects"), cache: join(base, "cache"), artifacts: join(base, "artifacts"), agent: join(base, "agent") }; },
     async workspacePath(principalId: string, workspaceId: string) { return join(root, "principals", principalId, "projects", workspaceId); },
-    workspacePathSync(principalId: string, workspaceId: string) { return join(root, "principals", principalId, "projects", workspaceId); },
     async ensureConversationWorkspace(conversationId: string) { const base = join(root, "conversation-workspaces", conversationId); return { root: base, home: join(base, "home"), projects: join(base, "projects"), cache: join(base, "cache"), uid: 30001, gid: 30001 }; },
     async ensureConversationWorkspacePath(conversationId: string, workspaceId: string) { return join(root, "conversation-workspaces", conversationId, "projects", workspaceId); },
     conversationWorkspacePath(conversationId: string, workspaceId: string) { return join(root, "conversation-workspaces", conversationId, "projects", workspaceId); },
   } as unknown as PrincipalService;
-  const config = { owner: { platform: "qq", accountId: "a", userId: "owner" }, guest: { enabled: true, maxWorkersPerPrincipal: 1, taskTimeoutMs: 30_000, commandTimeoutMs: 5000, cpuSeconds: 60, memoryBytes: 100_000_000, pids: 20, maxFileBytes: 10_000_000, workspaceQuotaBytes: 10_000_000, cacheQuotaBytes: 10_000_000, artifactQuotaBytes: 10_000_000 }, runtime: { maxWorkers: 2, maxArtifactBytes: 100_000, piCommand: "pi", piTimeoutMs: 1000 } } as AppConfig;
+  const config = { owners: [{ platform: "qq", accountId: "a", userId: "owner" }], systemAdmins: [{ platform: "qq", accountId: "a", userId: "owner" }], guest: { enabled: true, maxWorkersPerPrincipal: 1, taskTimeoutMs: 30_000, commandTimeoutMs: 5000, cpuSeconds: 60, memoryBytes: 100_000_000, pids: 20, maxFileBytes: 10_000_000, workspaceQuotaBytes: 10_000_000, cacheQuotaBytes: 10_000_000, artifactQuotaBytes: 10_000_000 }, runtime: { maxWorkers: 2, maxArtifactBytes: 100_000, piCommand: "pi", piTimeoutMs: 1000 } } as AppConfig;
   const service = new TaskService(db, new TestPi(), new ArtifactService(db, root), config, { workerRoot: root, principals }, logger);
   try {
     const modes: string[] = [];
@@ -648,7 +718,7 @@ test("TaskService rejects forged Owner group capability and malformed durable ca
   const timestamp = new Date().toISOString();
   db.run("INSERT INTO conversations(conversation_id,platform,account_id,kind,platform_conversation_id,thread_id_json,trust,memory_scopes_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)", "group-conv", "qq", "a", "group", "g", "null", "GUEST", JSON.stringify(["global_agent", "group:group-conv"]), timestamp, timestamp);
   db.run("INSERT INTO tasks(id,title,goal,status,requester_json,trust,origin_conversation_id,notification_conversation_id,capabilities_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", "bad-task", "bad", "bad", "CREATED", JSON.stringify({}), "OWNER", "group-conv", "group-conv", "{}", timestamp, timestamp);
-  const config = { owner: { platform: "qq", accountId: "a", userId: "owner" }, runtime: { maxWorkers: 1, maxArtifactBytes: 100000, piCommand: "pi", piTimeoutMs: 1000 } } as AppConfig;
+  const config = { owners: [{ platform: "qq", accountId: "a", userId: "owner" }], systemAdmins: [{ platform: "qq", accountId: "a", userId: "owner" }], runtime: { maxWorkers: 1, maxArtifactBytes: 100000, piCommand: "pi", piTimeoutMs: 1000 } } as AppConfig;
   const tasks = new TaskService(db, new TestPi(), new ArtifactService(db, "/tmp"), config, { workerRoot: "/tmp", onEvent: async () => {} }, logger);
   const forged = { memory: { allowedScopes: ["global_agent", "group:group-conv"] }, projects: [{ projectId: "*", access: "WRITE" as const }], qq: { readConversations: ["group-conv"], sendConversations: ["group-conv"] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: ["agent-home"], publishTaskIds: [], allowedDestinations: ["group-conv"] }, tasks: { canCreate: true, visibleTaskIds: [], canCancel: true, canFollowUp: true } };
   assert.throws(() => tasks.createTask({ title: "forged", goal: "forged", requester: { platform: "qq", accountId: "a", userId: "guest" }, trust: "OWNER", originConversationId: "group-conv", notificationConversationId: "group-conv", parentCapabilities: forged }), /CAPABILITY_CONTEXT_INVALID/);
@@ -674,7 +744,7 @@ test("normal Worker startup rejects a tampered durable workspace", async () => {
   const timestamp = new Date().toISOString();
   const caps = { memory: { allowedScopes: ["global_agent"] }, projects: [{ projectId: "*", access: "WRITE" as const }], qq: { readConversations: ["allowed"], sendConversations: ["allowed"] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: ["agent-home"], publishTaskIds: ["*"], allowedDestinations: ["allowed"] }, tasks: { canCreate: true, visibleTaskIds: [], canCancel: true, canFollowUp: true } };
   const task = tasks.createTask({ title: "tampered", goal: "tampered", requester: { platform: "qq", accountId: "a", userId: "u" }, trust: "OWNER", originConversationId: "allowed", notificationConversationId: "allowed", parentCapabilities: caps });
-  db.run("INSERT INTO worker_executions(id,task_id,objective,status,harness,workspace_id,workspace_access,capabilities_json,updated_at) VALUES (?,?,?,?,?,?,?,?,?)", "worker-tampered", task.id, "tampered", "STARTING", "pi", "../escape", "WRITE", JSON.stringify(caps), timestamp);
+  db.run("INSERT INTO worker_executions(id,task_id,objective,status,harness,workspace_id,workspace_access,capabilities_json,updated_at,principal_id,runtime_uid,runtime_gid,workspace_gid,process_mode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", "worker-tampered", task.id, "tampered", "STARTING", "pi", "../escape", "WRITE", JSON.stringify(caps), timestamp, task.requester.principalId!, task.requester.runtimeUid!, task.requester.runtimeGid!, taskTestWorkspaceGid("allowed"), "PRINCIPAL_BROKERED");
   try {
     await assert.rejects(() => tasks.startWorker("worker-tampered"), /WORKSPACE_ID_INVALID/);
   } finally {

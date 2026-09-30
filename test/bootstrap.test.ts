@@ -12,7 +12,7 @@ test("bootstrap initializes private state and schema without provider credential
     const child = spawn(process.execPath, ["--experimental-strip-types", "--experimental-loader", "./scripts/ts-loader.mjs", "src/cli.ts", "bootstrap"], { cwd: process.cwd(), env: { ...process.env, AGENT_HOME_STATE: root }, stdio: ["pipe", "pipe", "pipe"] });
     let output = "";
     child.stdout.on("data", (chunk) => { output += String(chunk); });
-    child.stdin.end(JSON.stringify({ format: "agent-home-bootstrap", version: 1, instanceId: "test", owners: [{ platform: "qq", userId: "owner-1" }, { platform: "qq", userId: "owner-2" }], snowluma: { endpoint: "ws://snowluma:3001" } }));
+    child.stdin.end(JSON.stringify({ format: "agent-home-bootstrap", version: 1, instanceId: "test", owners: [{ platform: "qq", userId: "owner-1" }, { platform: "qq", userId: "owner-2" }], systemAdmins: [{ platform: "qq", userId: "owner-1" }], snowluma: { endpoint: "ws://snowluma:3001" } }));
     const exitCode = await new Promise<number>((resolve) => child.once("exit", (code) => resolve(code ?? 1)));
     assert.equal(exitCode, 0);
     const config = JSON.parse(await readFile(join(root, "config/bootstrap.json"), "utf8")) as { snowluma: { apiEndpoint: string }; owners: Array<{ userId: string }> };
@@ -30,11 +30,11 @@ test("bootstrap accepts a deployment without an Owner", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-bootstrap-no-owner-"));
   try {
     const child = spawn(process.execPath, ["--experimental-strip-types", "--experimental-loader", "./scripts/ts-loader.mjs", "src/cli.ts", "bootstrap"], { cwd: process.cwd(), env: { ...process.env, AGENT_HOME_STATE: root }, stdio: ["pipe", "pipe", "pipe"] });
-    child.stdin.end(JSON.stringify({ format: "agent-home-bootstrap", version: 1, instanceId: "no-owner", snowluma: { endpoint: "ws://snowluma:3001" } }));
+    child.stdin.end(JSON.stringify({ format: "agent-home-bootstrap", version: 1, instanceId: "no-owner", owners: [], systemAdmins: [], snowluma: { endpoint: "ws://snowluma:3001" } }));
     const exitCode = await new Promise<number>((resolve) => child.once("exit", (code) => resolve(code ?? 1)));
     assert.equal(exitCode, 0);
     const config = JSON.parse(await readFile(join(root, "config/bootstrap.json"))) as { owners?: unknown };
-    assert.equal(config.owners, undefined);
+    assert.deepEqual(config.owners, []);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -47,7 +47,7 @@ test("bootstrap stores SnowLuma credentials in private state", async () => {
     let output = "";
     const child = spawn(process.execPath, ["--experimental-strip-types", "--experimental-loader", "./scripts/ts-loader.mjs", "src/cli.ts", "bootstrap"], { cwd: process.cwd(), env: { ...process.env, AGENT_HOME_STATE: root }, stdio: ["pipe", "pipe", "pipe"] });
     child.stdout.on("data", (chunk) => { output += String(chunk); });
-    child.stdin.end(JSON.stringify({ format: "agent-home-bootstrap", version: 1, instanceId: "secret", snowluma: { endpoint: "ws://snowluma:3001", credential } }));
+    child.stdin.end(JSON.stringify({ format: "agent-home-bootstrap", version: 1, instanceId: "secret", owners: [], systemAdmins: [], snowluma: { endpoint: "ws://snowluma:3001", credential } }));
     const exitCode = await new Promise<number>((resolve) => child.once("exit", (code) => resolve(code ?? 1)));
     assert.equal(exitCode, 0);
     assert.equal(output.includes(credential), false);
@@ -63,7 +63,7 @@ test("bootstrap stores internal deployment secrets in private state", async () =
   const root = await mkdtemp(join(tmpdir(), "agent-home-bootstrap-internal-secret-"));
   try {
     const child = spawn(process.execPath, ["--experimental-strip-types", "--experimental-loader", "./scripts/ts-loader.mjs", "src/cli.ts", "bootstrap"], { cwd: process.cwd(), env: { ...process.env, AGENT_HOME_STATE: root }, stdio: ["pipe", "pipe", "pipe"] });
-    child.stdin.end(JSON.stringify({ format: "agent-home-bootstrap", version: 1, instanceId: "internal-secret", snowluma: { endpoint: "ws://snowluma:3001" }, internal: { controlToken: "control-secret", mcpToken: "mcp-secret", mcpControlToken: "mcp-control-secret", artifactTransferSecret: "artifact-secret" } }));
+    child.stdin.end(JSON.stringify({ format: "agent-home-bootstrap", version: 1, instanceId: "internal-secret", owners: [], systemAdmins: [], snowluma: { endpoint: "ws://snowluma:3001" }, internal: { controlToken: "control-secret", mcpToken: "mcp-secret", mcpControlToken: "mcp-control-secret", artifactTransferSecret: "artifact-secret" } }));
     const exitCode = await new Promise<number>((resolve) => child.once("exit", (code) => resolve(code ?? 1)));
     assert.equal(exitCode, 0);
     assert.equal(await readFile(join(root, "secrets/control-token"), "utf8"), "control-secret\n");

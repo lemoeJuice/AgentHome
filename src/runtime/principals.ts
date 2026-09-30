@@ -39,79 +39,21 @@ export class PrincipalService {
     });
   }
 
-  backfillRuntimeIds(): void {
-    this.db.transaction(() => {
-      const rows = this.db.all<PrincipalRow>("SELECT principal_id,trust,runtime_uid,runtime_gid FROM principals ORDER BY CASE WHEN principal_id=? THEN 0 ELSE 1 END,created_at,principal_id", OWNER_PRINCIPAL_ID);
-      for (const row of rows) this.ensureRuntimeIdentity(row.principal_id, row.trust);
-    });
-  }
-
-  backfillTaskPrincipals(configuredOwners?: { platform: string; accountId: string; userId: string } | Array<{ platform: string; accountId: string; userId: string }>, guestTaskTimeoutMs = 30 * 60 * 1000): void {
-    const rows = this.db.all<{ id: string; requester_json: string; trust: Trust }>("SELECT id,requester_json,trust FROM tasks WHERE principal_id IS NULL OR principal_id='' ");
-    for (const row of rows) {
-      let requester: { platform?: string; accountId?: string; userId?: string; principalId?: string; runtimeUid?: number; runtimeGid?: number };
-      try { requester = JSON.parse(row.requester_json) as typeof requester; } catch { throw new Error(`TASK_REQUESTER_INVALID:${row.id}`); }
-      let principalId = requester.principalId;
-      if (!principalId && requester.platform && requester.accountId && requester.userId) {
-        principalId = this.resolveIdentity(requester.platform, requester.accountId, requester.userId, configuredOwners).principalId;
-      }
-      if (!principalId) continue;
-      const principal = this.get(principalId);
-      requester.principalId = principalId;
-      requester.runtimeUid = principal.runtimeUid;
-      requester.runtimeGid = principal.runtimeGid;
-      this.db.transaction(() => {
-        this.db.run("UPDATE tasks SET principal_id=?,requester_json=? WHERE id=? AND (principal_id IS NULL OR principal_id='')", principalId as string, JSON.stringify(requester), row.id);
-        this.db.run("UPDATE worker_executions SET principal_id=?,runtime_uid=?,runtime_gid=? WHERE task_id=? AND (principal_id IS NULL OR principal_id='')", principalId as string, principal.runtimeUid, principal.runtimeGid, row.id);
-      });
-    }
-    const tasks = this.db.all<{ id: string; principal_id: string | null; requester_json: string; trust: Trust; created_at: string; deadline_at: string | null; origin_conversation_id: string }>("SELECT id,principal_id,requester_json,trust,created_at,deadline_at,origin_conversation_id FROM tasks");
-    for (const task of tasks) {
-      let principalId = task.principal_id;
-      if (!principalId) {
-        try { principalId = (JSON.parse(task.requester_json) as { principalId?: string }).principalId ?? null; } catch { principalId = null; }
-      }
-      if (!principalId) continue;
-      const principal = this.get(principalId);
-      const deadline = task.trust === "GUEST" ? task.deadline_at ?? new Date(Date.parse(task.created_at) + guestTaskTimeoutMs).toISOString() : task.deadline_at;
-      this.db.transaction(() => {
-        this.db.run("UPDATE tasks SET principal_id=?,deadline_at=COALESCE(deadline_at,?) WHERE id=?", principalId, deadline ?? null, task.id);
-        const workers = this.db.all<{ id: string; workspace_id: string | null }>("SELECT id,workspace_id FROM worker_executions WHERE task_id=?", task.id);
-        for (const worker of workers) {
-          const workspaceId = worker.workspace_id ?? "default";
-          const workspaceScope = `conversation:${task.origin_conversation_id}:${workspaceId}`;
-          this.db.run("UPDATE worker_executions SET principal_id=?,process_mode='PRINCIPAL_BROKERED',workspace_id=COALESCE(workspace_id,'default'),workspace_access=COALESCE(workspace_access,'WRITE'),workspace_scope_id=? WHERE id=?", principalId, workspaceScope, worker.id);
-        }
-      });
-    }
-  }
-
   resolveIdentity(platform: string, accountId: string, externalId: string, configuredOwners?: { platform: string; accountId: string; userId: string } | Array<{ platform: string; accountId: string; userId: string }>): { principalId: string; trust: Trust } {
     const owners = configuredOwners ? (Array.isArray(configuredOwners) ? configuredOwners : [configuredOwners]) : [];
     const isConfiguredOwner = owners.some((owner) => platform === owner.platform && accountId === owner.accountId && externalId === owner.userId);
     return this.db.transaction(() => {
-      if (isConfiguredOwner) {
-        const bound = this.db.all<{ platform: string; account_id: string; user_id: string }>("SELECT platform,account_id,user_id FROM platform_identities WHERE principal_id=? ORDER BY platform,account_id,user_id", OWNER_PRINCIPAL_ID);
-        const canonicalOwner = bound[0] ? { platform: bound[0].platform, accountId: bound[0].account_id, userId: bound[0].user_id } : owners[0];
-        const canonical = canonicalOwner?.platform === platform && canonicalOwner.accountId === accountId && canonicalOwner.userId === externalId;
-        const existing = this.db.get<{ principal_id: string }>("SELECT principal_id FROM platform_identities WHERE platform=? AND account_id=? AND user_id=?", platform, accountId, externalId);
-        let principalId: string;
-        if (canonical) principalId = OWNER_PRINCIPAL_ID;
-        else if (existing && existing.principal_id !== OWNER_PRINCIPAL_ID) principalId = existing.principal_id;
-        else principalId = existing?.principal_id === OWNER_PRINCIPAL_ID ? newId("principal") : existing?.principal_id ?? newId("principal");
-        this.ensureRuntimeIdentity(principalId, "OWNER");
-        this.db.run("INSERT INTO platform_identities(platform,account_id,user_id,principal_id) VALUES (?,?,?,?) ON CONFLICT(platform,account_id,user_id) DO UPDATE SET principal_id=excluded.principal_id", platform, accountId, externalId, principalId);
-        return { principalId, trust: "OWNER" as const };
-      }
       const existing = this.db.get<{ principal_id: string; trust: Trust }>("SELECT p.principal_id,p.trust FROM platform_identities i JOIN principals p ON p.principal_id=i.principal_id WHERE i.platform=? AND i.account_id=? AND i.user_id=?", platform, accountId, externalId);
       if (existing) {
-        this.ensureRuntimeIdentity(existing.principal_id, existing.trust);
-        return { principalId: existing.principal_id, trust: existing.trust };
+        const trust = isConfiguredOwner ? "OWNER" : existing.trust;
+        this.ensureRuntimeIdentity(existing.principal_id, trust);
+        return { principalId: existing.principal_id, trust };
       }
-      const principalId = newId("principal");
-      this.ensureRuntimeIdentity(principalId, "GUEST");
+      const ownerIdentityAssigned = Boolean(this.db.get("SELECT 1 AS found FROM platform_identities WHERE principal_id=?", OWNER_PRINCIPAL_ID));
+      const principalId = isConfiguredOwner && !ownerIdentityAssigned ? OWNER_PRINCIPAL_ID : newId("principal");
+      this.ensureRuntimeIdentity(principalId, isConfiguredOwner ? "OWNER" : "GUEST");
       this.db.run("INSERT INTO platform_identities(platform,account_id,user_id,principal_id) VALUES (?,?,?,?)", platform, accountId, externalId, principalId);
-      return { principalId, trust: "GUEST" as const };
+      return { principalId, trust: isConfiguredOwner ? "OWNER" : "GUEST" };
     });
   }
 
@@ -257,27 +199,6 @@ export class PrincipalService {
     for (const name of ["sessions", "scratch"]) await this.ensureOwnedDirectory(join(this.stateRoot, name), serviceUid, serviceGid, 0o700);
   }
 
-  async workspacePath(principalId: string, workspaceId: string): Promise<string> {
-    const id = canonicalWorkspaceId(workspaceId);
-    const directories = await this.ensurePrincipalDirectories(principalId);
-    const candidate = resolve(directories.projects, id);
-    const boundary = await realpath(directories.projects);
-    await mkdir(candidate, { recursive: true, mode: 0o700 });
-    const realCandidate = await realpath(candidate);
-    if (!isWithin(boundary, realCandidate)) throw new Error("WORKSPACE_PATH_ESCAPE");
-    const principal = this.get(principalId);
-    await this.ensureOwnedDirectory(realCandidate, principal.runtimeUid, principal.runtimeGid, 0o700);
-    return realCandidate;
-  }
-
-  workspacePathSync(principalId: string, workspaceId: string): string {
-    return resolve(this.principalRoot(principalId), "projects", canonicalWorkspaceId(workspaceId));
-  }
-
-  guestProcessEnvironment(principalId: string, proxyUrl?: string): NodeJS.ProcessEnv {
-    return this.principalProcessEnvironment(principalId, proxyUrl);
-  }
-
   principalProcessEnvironment(principalId: string, proxyUrl?: string): NodeJS.ProcessEnv {
     const home = join(this.principalRoot(principalId), "home");
     const cache = join(this.principalRoot(principalId), "cache");
@@ -310,7 +231,10 @@ export class PrincipalService {
 
   private ensureRuntimeIdentity(principalId: string, role: Trust): PrincipalRow {
     const existing = this.db.get<PrincipalRow>("SELECT principal_id,trust,runtime_uid,runtime_gid FROM principals WHERE principal_id=?", principalId);
-    if (existing && existing.runtime_uid !== null && existing.runtime_gid !== null) return existing;
+    if (existing && existing.runtime_uid !== null && existing.runtime_gid !== null) {
+      if (existing.trust !== role) this.db.run("UPDATE principals SET trust=? WHERE principal_id=?", role, principalId);
+      return { ...existing, trust: role };
+    }
     if (!existing) this.db.run("INSERT INTO principals(principal_id,trust,created_at) VALUES (?,?,?)", principalId, role, nowIso());
     const used = new Set(this.db.all<{ runtime_uid: number }>("SELECT runtime_uid FROM principals WHERE runtime_uid IS NOT NULL").map((row) => Number(row.runtime_uid)));
     let uid = existing?.runtime_uid ?? (principalId === OWNER_PRINCIPAL_ID ? OWNER_RUNTIME_UID : PRINCIPAL_UID_MIN);

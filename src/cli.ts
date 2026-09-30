@@ -14,6 +14,8 @@ import { spawn } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 import { resolveWebSocketEndpoint } from "./qq/onebot.js";
 import { createProxyRelay } from "./proxy-relay.js";
+import { migrateCurrentState } from "./runtime/manual-migration.js";
+import { migrateBootstrapStateConfig } from "./runtime/manual-migration.js";
 
 async function main(): Promise<void> {
   const command = process.argv[2] ?? "help";
@@ -26,7 +28,14 @@ async function main(): Promise<void> {
     await waitForSignal(() => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())));
     return;
   }
-  if (command === "help") { process.stdout.write("agent-home gateway|runtime|control stream|control ping|control backup-prepare|control backup-finish|control set-pi-model <provider> <model>|control set-pi-thinking-level <level>|bootstrap|doctor|status\n"); return; }
+  if (command === "migrate-state") {
+    const stateRoot = process.env.AGENT_HOME_STATE ?? "/state";
+    await migrateBootstrapStateConfig(stateRoot);
+    const config = await loadConfig();
+    process.stdout.write(`${JSON.stringify(await migrateCurrentState(config))}\n`);
+    return;
+  }
+  if (command === "help") { process.stdout.write("agent-home gateway|runtime|control stream|control ping|control backup-prepare|control backup-finish|control set-pi-model <provider> <model>|control set-pi-thinking-level <level>|bootstrap|migrate-state|doctor|status\n"); return; }
   let config: Awaited<ReturnType<typeof loadConfig>>;
   try { config = await loadConfig(); } catch (error) {
     if (command === "doctor" || command === "status") { await doctorUnavailable(String(error)); return; }

@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig, snowlumaAccessToken, snowlumaWebSocketAccessToken } from "../src/config.ts";
@@ -12,6 +13,33 @@ test("loadConfig reads multiple Bot Owner identities from the main config", asyn
     await writeFile(configPath, JSON.stringify({ instanceId: "config-test", owners: [{ platform: "qq", accountId: "bot-1", userId: "owner-1" }, { platform: "qq", accountId: "bot-1", userId: "owner-2" }], snowluma: { endpoint: "ws://snowluma", apiEndpoint: "http://snowluma" } }));
     const config = await loadConfig(configPath);
     assert.deepEqual(config.owners, [{ platform: "qq", accountId: "bot-1", userId: "owner-1" }, { platform: "qq", accountId: "bot-1", userId: "owner-2" }]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("loadConfig rejects the removed singular Owner configuration key", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-home-config-owner-compat-"));
+  const configPath = join(root, "agent-home.json");
+  try {
+    await writeFile(configPath, JSON.stringify({ instanceId: "owner-compat", owner: { platform: "qq", accountId: "a", userId: "owner" }, snowluma: { endpoint: "ws://snowluma", apiEndpoint: "http://snowluma" } }));
+    await assert.rejects(loadConfig(configPath), /CONFIG_UNSUPPORTED: owner/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("manual deployment config migration separates Owner and System Admin lists", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-home-config-one-time-migration-"));
+  const configPath = join(root, "agent-home.json");
+  try {
+    await writeFile(configPath, JSON.stringify({ instanceId: "migrate-config", owner: { platform: "qq", accountId: "a", userId: "owner" }, guest: { memoryBytes: 2_147_483_648 } }));
+    execFileSync(process.execPath, ["scripts/migrate-config.mjs", configPath]);
+    const migrated = JSON.parse(await readFile(configPath, "utf8")) as { owner?: unknown; owners: Array<{ userId: string }>; systemAdmins: Array<{ userId: string }>; guest: { memoryBytes: number } };
+    assert.equal("owner" in migrated, false);
+    assert.deepEqual(migrated.owners, [{ platform: "qq", accountId: "a", userId: "owner" }]);
+    assert.deepEqual(migrated.systemAdmins, migrated.owners);
+    assert.equal(migrated.guest.memoryBytes, 16 * 1024 * 1024 * 1024);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -54,23 +82,23 @@ test("loadConfig preserves array values while merging defaults", async () => {
   }
 });
 
-test("Pi auth default follows stateRoot and migrates the legacy Owner auth path", async () => {
+test("Pi auth default follows stateRoot and preserves an explicitly selected agent directory", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-config-model-plane-"));
   const configPath = join(root, "agent-home.json");
   try {
     await writeFile(configPath, JSON.stringify({ instanceId: "model-plane-config", paths: { stateRoot: root }, snowluma: { endpoint: "ws://snowluma", apiEndpoint: "http://snowluma" } }));
     assert.equal((await loadConfig(configPath)).runtime.piAgentDir, join(root, "model", "pi", "agent"));
     await writeFile(configPath, JSON.stringify({ instanceId: "model-plane-config", paths: { stateRoot: root }, runtime: { piAgentDir: join(root, "home", ".pi", "agent") }, snowluma: { endpoint: "ws://snowluma", apiEndpoint: "http://snowluma" } }));
-    assert.equal((await loadConfig(configPath)).runtime.piAgentDir, join(root, "model", "pi", "agent"));
+    assert.equal((await loadConfig(configPath)).runtime.piAgentDir, join(root, "home", ".pi", "agent"));
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("legacy 2 GiB guest address-space default is raised for Node 22 WebAssembly", async () => {
+test("explicit worker memory limit is preserved without automatic compatibility rewriting", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-config-node-rlimit-"));
   const configPath = join(root, "agent-home.json");
   try {
     await writeFile(configPath, JSON.stringify({ instanceId: "node-rlimit", paths: { stateRoot: root }, guest: { enabled: true, memoryBytes: 2147483648 }, snowluma: { endpoint: "ws://snowluma", apiEndpoint: "http://snowluma" } }));
-    assert.equal((await loadConfig(configPath)).guest.memoryBytes, 17179869184);
+    await assert.rejects(loadConfig(configPath), /CONFIG_INVALID: guest.memoryBytes/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

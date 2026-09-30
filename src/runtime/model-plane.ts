@@ -1,4 +1,4 @@
-import { chown, chmod, copyFile, lstat, mkdir, readFile, readdir, realpath, rename, writeFile } from "node:fs/promises";
+import { chown, chmod, copyFile, lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import type { SqliteStore } from "../db.js";
@@ -43,13 +43,16 @@ export class ModelPlaneService {
     await this.ensureDirectory(this.paths.root, privileged ? 0 : uid, privileged ? 0 : gid, 0o711);
     await mkdir(dirname(this.paths.agentDir), { recursive: true, mode: 0o700 });
     await this.ensureDirectory(dirname(this.paths.agentDir), uid, gid, 0o700);
-    await this.migrateLegacyAgentDirectory();
     for (const path of [this.paths.home, this.paths.agentDir, this.paths.sessionsRoot, this.paths.mainSessions, this.paths.workerSessions]) {
       await this.ensureDirectory(path, uid, gid, 0o700);
     }
     await this.chownTree(this.paths.agentDir, uid, gid);
-    await this.migrateSessions();
     await this.chownSessionTree(this.paths.sessionsRoot, uid, gid);
+  }
+
+  async migrateLegacyState(): Promise<void> {
+    await this.migrateLegacyAgentDirectory();
+    await this.migrateSessions();
   }
 
   async ensureSessionDirectory(path: string): Promise<void> {
@@ -81,6 +84,7 @@ export class ModelPlaneService {
       if (!destinationInfo.isDirectory() || destinationInfo.isSymbolicLink()) throw new Error("MODEL_AGENT_MIGRATION_COLLISION");
       await this.validateAgentTree(destination);
       await this.mergeAgentTree(legacy, destination);
+      await rm(legacy, { recursive: true });
       return;
     }
     await mkdir(dirname(destination), { recursive: true, mode: 0o700 });

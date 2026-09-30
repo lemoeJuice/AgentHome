@@ -168,11 +168,11 @@ Host Controller restart ≠ Worker 自动停止
 │                  ▼                                  │
 │  Execution Plane: Worker + Principal UID/GID        │
 │      ┌───────────┴────────────┐                     │
-│      Owner workspace      Guest workspace           │
+│ Principal private state  Conversation Workspace    │
 └─────────────────────────────────────────────────────┘
 ```
 
-Owner and Guest share the same Trusted Pi Runtime and Principal-scoped ExecutionBackend. Pi receives only fixed trusted Runtime extensions; it has no workspace mount and no unrestricted built-in tools. `GUEST_PERSISTENT_SANDBOX_DESIGN.md` defines the UID/GID filesystem and network boundary.
+All ordinary Tasks share the same Pi Runtime and Principal-scoped ExecutionBackend. Pi receives only fixed Runtime extensions; it has no Workspace mount or unrestricted built-in tools. Principal/Workspace/System Admin semantics are defined by `PRINCIPAL_WORKSPACE_SYSTEM_ADMIN_DESIGN.md`; UID/GID and Memory scopes are defined by `UID_GID_MEMORY_DESIGN.md`. `GUEST_PERSISTENT_SANDBOX_DESIGN.md` is historical.
 
 ---
 
@@ -1149,13 +1149,13 @@ Execution Plane
 
 Pi 不拥有 Principal workspace mount，也不启用 unrestricted built-in tools。只有部署镜像中的固定 Runtime extension 能进入 Pi；Principal workspace 的 `.pi/extensions` 不会加载。
 
-Owner 与 Guest 共用 Pi、Runtime Tool Protocol 和 `ExecutionBackend`。Runtime 从 Task/Worker/Principal 的持久可信记录构造 `ExecutionContext`（task、worker、Principal、UID/GID、role、capability、workspace、session）；模型输入只提供 operation 参数，不能指定身份、UID 或 workspace root。shell、read/write/edit、mkdir/remove/list/stat 均通过 backend 以目标 Principal UID/GID 执行。
+所有普通 Task 共用 Pi、Runtime Tool Protocol 和 `ExecutionBackend`。Runtime 从 Task/Worker/Principal 的持久可信记录构造 `ExecutionContext`（task、worker、Principal UID/primary GID、当前 Workspace GID、capability、workspace、session）；Context 不包含 Owner/Guest 执行 role。模型输入只提供 operation 参数，不能指定身份、UID 或 workspace root。shell、read/write/edit、mkdir/remove/list/stat 均通过 backend 以目标 Principal UID/primary GID 和仅当前 Workspace supplementary GID 执行。
 
 Pi provider auth 位于 `/state/model/pi/agent`，由 Model Plane UID 10002 持有。Principal execution 不获得 provider token、auth path bind、环境变量副本或临时凭据文件。系统当前没有通用 `secret.read` 或 raw secret export tool；未来需要服务凭据时必须将 `secret.use` 与 `secret.export` 分开，默认不提供 `secret.export`。Model Plane 直接访问模型 provider，不经过 LLM reverse proxy。
 
-Worker 工作区按 origin Conversation 隔离并共享：同一群聊/私聊的 Tasks 使用该会话的稳定工作区身份和目录，不同 Conversation 使用不同 UID 与目录。调用者 Principal 不因此合并；每个 Worker 的读写权限仍由发起者当前 Capability 快照约束。工作区路径使用 Conversation ID 的 SHA-256 目录名，不把平台 ID 或 Principal ID 直接作为文件路径。个人 Home/Cache/Artifacts 则保留在以 runtime UID 命名的 Principal 目录中；旧的 `/state/home`、`/state/projects` symlink 兼容层不再创建。
+Worker 工作区由 origin Conversation 唯一确定并共享：同一 Conversation 的 Tasks 共用稳定 Workspace GID 和目录，不同 Conversation 使用不同 GID 与目录。调用者 Principal 不因此合并；每个 Worker 的读写能力由持久 Capability 快照约束。工作区路径使用 Conversation ID 的 SHA-256 目录名，不把平台 ID 或 Principal ID 直接作为文件路径。个人 Home/Cache/Artifacts 保留在以 runtime UID 命名的 Principal 目录中。
 
-Guest execution 另外受 `guest.enabled`、Principal capability、UID/GID filesystem permission 与 Guest UID nftables policy 约束。Model Plane provider networking 不受 Guest egress rules 限制。
+`guest.enabled` 是旧 Task admission 配置，不选择 Worker 身份或执行后端。所有 Principal UID 使用统一的 UID-scoped egress policy；Model Plane provider networking 仍独立于 Worker egress policy。
 
 禁止：
 
@@ -1262,27 +1262,9 @@ Memory 的内部结构不在本文重复描述。
 
 ---
 
-# 21. Guest
+# 21. Principal execution
 
-当前：
-
-```text
-Guest execution = disabled
-```
-
-Guest 可以只拥有明确允许的轻量能力。
-
-Guest 不允许：
-
-- Owner Agent Home shell；
-- Owner projects；
-- owner_private memory；
-- Owner credential；
-- 通过 Main 间接 spawn privileged Worker。
-
-未来 Guest execution 必须使用独立 Disposable Sandbox。
-
-不要把 Guest hostile workload 放进 Owner Agent Home。
+Owner、Guest、System Admin 的普通 Agent Task 都进入同一条 Principal → Workspace → ExecutionContext → Worker 路径。System Admin 权限只用于 Main/Control Plane 操作，不提升 Unix UID/GID 或 Workspace membership。不同 Principal 以 UID 隔离，同一 Conversation Workspace 以 GID 共享；每次任务只获得当前 Workspace supplementary GID。个人 Memory 跟随 Principal，协作 Memory 跟随 Conversation Workspace。
 
 ---
 

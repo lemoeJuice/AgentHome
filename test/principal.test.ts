@@ -6,6 +6,8 @@ import { join } from "node:path";
 import { SqliteStore, migrate } from "../src/db.js";
 import { runtimeMigrations } from "../src/schema.js";
 import { OWNER_PRINCIPAL_ID, PrincipalService, PRINCIPAL_UID_MAX, PRINCIPAL_UID_MIN } from "../src/runtime/principals.js";
+import { migrateCurrentState } from "../src/runtime/manual-migration.js";
+import type { AppConfig } from "../src/config.js";
 
 test("Principal runtime identities are stable, unique and independent of platform IDs", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-principal-id-"));
@@ -15,10 +17,7 @@ test("Principal runtime identities are stable, unique and independent of platfor
   try {
     const service = new PrincipalService(db, root);
     service.ensureOwnerPrincipal();
-    service.backfillRuntimeIds();
     const configuredOwners = [{ platform: "qq", accountId: "default", userId: "owner-1" }, { platform: "qq", accountId: "default", userId: "owner-2" }];
-    db.run("INSERT INTO platform_identities(platform,account_id,user_id,principal_id) VALUES (?,?,?,?)", "qq", "default", "owner-1", OWNER_PRINCIPAL_ID);
-    db.run("INSERT INTO platform_identities(platform,account_id,user_id,principal_id) VALUES (?,?,?,?)", "qq", "default", "owner-2", OWNER_PRINCIPAL_ID);
     const ownerOne = service.resolveIdentity("qq", "default", "owner-1", configuredOwners);
     const ownerTwo = service.resolveIdentity("qq", "default", "owner-2", configuredOwners);
     assert.equal(ownerOne.principalId, OWNER_PRINCIPAL_ID);
@@ -50,19 +49,23 @@ test("Principal runtime identities are stable, unique and independent of platfor
   } finally { db.close(); await rm(root, { recursive: true, force: true }); }
 });
 
-test("legacy Tasks are assigned the Principal from their persisted platform identity", async () => {
+test("manual state migration assigns Principal and Workspace identities to the current database", async (context) => {
+  if (process.getuid?.() !== 0 || process.getgid?.() !== 0) { context.skip("manual ownership migration requires container root"); return; }
   const root = await mkdtemp(join(tmpdir(), "agent-home-principal-task-migration-"));
-  const db = new SqliteStore(join(root, "agent.db"));
-  migrate(db, runtimeMigrations);
+  const db = new SqliteStore(join(root, "data", "agent.db"));
+  migrate(db, runtimeMigrations.slice(0, -1));
   const service = new PrincipalService(db, root);
   service.ensureOwnerPrincipal();
   const guest = service.resolveIdentity("qq", "account-a", "guest-1");
   const timestamp = new Date().toISOString();
+  await import("node:fs/promises").then(({ mkdir, writeFile }) => Promise.all([mkdir(join(root, "config"), { recursive: true }), writeFile(join(root, "config", "bootstrap.json"), JSON.stringify({ instanceId: "migration-test", owners: [], systemAdmins: [], snowluma: { endpoint: "ws://snowluma" } }))]));
   db.run("INSERT INTO conversations(conversation_id,platform,account_id,kind,platform_conversation_id,thread_id_json,principal_id,trust,memory_scopes_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", "conversation-a", "qq", "account-a", "group", "group-1", "null", "conversation-principal", "GUEST", "[]", timestamp, timestamp);
   db.run("INSERT INTO tasks(id,title,goal,status,requester_json,trust,origin_conversation_id,notification_conversation_id,capabilities_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", "legacy-task", "legacy", "legacy", "CREATED", JSON.stringify({ platform: "qq", accountId: "account-a", userId: "guest-1" }), "GUEST", "conversation-a", "conversation-a", JSON.stringify({}), timestamp, timestamp);
   db.run("INSERT INTO worker_executions(id,task_id,objective,status,harness,workspace_id,workspace_access,updated_at) VALUES (?,?,?,?,?,?,?,?)", "legacy-worker", "legacy-task", "legacy", "COMPLETED", "pi", "default", "WRITE", timestamp);
   try {
-    service.backfillTaskPrincipals();
+    const config = { paths: { stateRoot: root }, owners: [], systemAdmins: [], runtime: { piAgentDir: join(root, "model", "pi", "agent") }, memory: { rawEpisodeDays: 30, keepExplicitForever: true, keepProvenanceForActiveFacts: true, maxPromptBytes: 24_000 } } as AppConfig;
+    const result = await migrateCurrentState(config);
+    assert.equal(result.tasks, 1);
     const task = db.get<{ principal_id: string; requester_json: string }>("SELECT principal_id,requester_json FROM tasks WHERE id=?", "legacy-task");
     assert.equal(task?.principal_id, guest.principalId);
     assert.equal((JSON.parse(task?.requester_json ?? "{}") as { runtimeUid?: number }).runtimeUid, service.get(guest.principalId).runtimeUid);

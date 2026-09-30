@@ -214,7 +214,7 @@ QQ
 
 ### Guest Sandbox
 
-Owner 与 Guest 均在 Agent Home 容器内，复用 Trusted Pi Model Plane 和同一 Principal ExecutionBackend。容器边界保护 Host；Principal UID/GID、workspace permission 与 capability 在容器内区分 Owner/Guest。当前不使用 nested container、VM 或 LLM reverse proxy。
+所有普通 Worker 均在 Agent Home 容器内复用 Trusted Pi Model Plane 和同一 Principal ExecutionBackend。容器边界保护 Host；容器内由 Principal UID、当前 Workspace GID、Unix permissions 和 capability 实施隔离。System Admin 管理能力只存在于 Main/Control Plane，不改变 Worker 的 Unix 身份。当前不使用 nested container、VM 或 LLM reverse proxy。
 
 ---
 

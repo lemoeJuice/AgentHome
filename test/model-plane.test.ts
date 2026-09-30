@@ -31,6 +31,7 @@ test("Model Plane migration moves Pi credentials and session state out of Princi
   try {
     const plane = new ModelPlaneService(db, root);
     await plane.ensure();
+    await plane.migrateLegacyState();
     assert.equal(await readFile(join(plane.paths.agentDir, "auth.json"), "utf8"), "model-only-auth");
     await assert.rejects(readFile(join(ownerHome, ".pi", "agent", "auth.json"), "utf8"));
     const mainPath = db.get<{ main_session_path: string }>("SELECT main_session_path FROM conversations WHERE conversation_id=?", "conversation-1")?.main_session_path;
@@ -65,13 +66,15 @@ test("Model Plane migration safely reconciles legacy placeholders with an existi
 
     const plane = new ModelPlaneService(db, root);
     await plane.ensure();
+    await plane.migrateLegacyState();
 
     assert.deepEqual(JSON.parse(await readFile(join(destination, "auth.json"), "utf8")), { token: "legacy-credential" });
     assert.deepEqual(JSON.parse(await readFile(join(destination, "models-store.json"), "utf8")), { catalog: "current" });
     assert.deepEqual(JSON.parse(await readFile(join(destination, "legacy-settings.json"), "utf8")), { retained: true });
-    assert.deepEqual(JSON.parse(await readFile(join(legacy, "auth.json"), "utf8")), { token: "legacy-credential" });
+    await assert.rejects(readFile(join(legacy, "auth.json"), "utf8"));
 
     await plane.ensure();
+    await plane.migrateLegacyState();
     assert.deepEqual(JSON.parse(await readFile(join(destination, "auth.json"), "utf8")), { token: "legacy-credential" });
   } finally { db.close(); await rm(root, { recursive: true, force: true }); }
 });
@@ -87,7 +90,8 @@ test("Model Plane migration preserves conflicting non-placeholder credentials an
     await writeFile(join(legacy, "auth.json"), JSON.stringify({ token: "legacy-credential" }));
     await writeFile(join(destination, "auth.json"), JSON.stringify({ token: "model-plane-credential" }));
     const plane = new ModelPlaneService(db, root);
-    await assert.rejects(plane.ensure(), /MODEL_AGENT_MIGRATION_COLLISION/);
+    await plane.ensure();
+    await assert.rejects(plane.migrateLegacyState(), /MODEL_AGENT_MIGRATION_COLLISION/);
     assert.deepEqual(JSON.parse(await readFile(join(legacy, "auth.json"), "utf8")), { token: "legacy-credential" });
     assert.deepEqual(JSON.parse(await readFile(join(destination, "auth.json"), "utf8")), { token: "model-plane-credential" });
   } finally { db.close(); await rm(root, { recursive: true, force: true }); }

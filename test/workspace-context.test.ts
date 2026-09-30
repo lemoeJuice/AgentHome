@@ -31,7 +31,8 @@ function capabilities(projectAccess: "READ" | "WRITE" = "WRITE"): CapabilitySet 
 
 function testConfig(): AppConfig {
   return {
-    owner: { platform: "qq", accountId: "default", userId: "owner" },
+    owners: [{ platform: "qq", accountId: "default", userId: "owner" }],
+    systemAdmins: [{ platform: "qq", accountId: "default", userId: "owner" }],
     guest: { enabled: true, maxWorkersPerPrincipal: 4, taskTimeoutMs: 30_000, commandTimeoutMs: 5000, cpuSeconds: 60, memoryBytes: 100_000_000, pids: 20, maxFileBytes: 1_000_000, workspaceQuotaBytes: 10_000_000, cacheQuotaBytes: 10_000_000, artifactQuotaBytes: 10_000_000 },
     runtime: { maxWorkers: 2, maxWorkersTotal: 4, maxWorkersPerProject: 4, maxWorkersPerRequester: 4, maxTasks: 10, maxTasksPerRequester: 5, maxTasksPerPrincipal: 5, maxArtifactBytes: 100_000, piCommand: "pi", piTimeoutMs: 5000, workerSandboxCommand: "bwrap", piAgentDir: "/tmp/pi-agent" },
   } as AppConfig;
@@ -68,7 +69,6 @@ function fakePrincipals(root: string): PrincipalService {
     },
     conversationWorkspacePath(conversationId: string, workspaceId: string) { return join(root, "conversation-workspaces", conversationId, "projects", workspaceId); },
     async conversationWorkspaceProcessEnvironment(conversationId: string) { return { ...process.env, HOME: join(root, "conversation-workspaces", conversationId, "home") }; },
-    workspacePathSync(principalId: string, workspaceId: string) { return join(principalRoot(principalId), "projects", workspaceId); },
     principalProcessEnvironment(principalId: string) { return { ...process.env, HOME: join(principalRoot(principalId), "home") }; },
   } as unknown as PrincipalService;
 }
@@ -192,7 +192,7 @@ test("Guest Worker cannot write another Principal workspace and read-only profil
   }
 });
 
-test("reconstructed Principal Worker context fails closed and differentiates workspace failures", async () => {
+test("durable Principal Worker context fails closed and differentiates workspace failures", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-workspace-recovery-"));
   const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
   const principals = fakePrincipals(root);
@@ -214,12 +214,7 @@ test("reconstructed Principal Worker context fails closed and differentiates wor
     assert.equal(rebuilt.contextSource, "durable-worker-record");
     assert.equal(rebuilt.workspace, await principals.ensureConversationWorkspacePath("conversation", "default"));
     await assert.rejects(() => service.readFile(rebuilt, "not-present.txt"), /WORKSPACE_PATH_NOT_FOUND/);
-    await service.recover();
-    const reconstructedWorker = service.getWorker("worker-no-capability-snapshot");
-    assert.deepEqual(reconstructedWorker.capabilities?.projects, [{ projectId: "default", access: "WRITE" }]);
-    const reconstructedAfterRecovery = await service.executionContext("worker-no-capability-snapshot");
-    assert.equal(reconstructedAfterRecovery.workspace, first.workspace);
-    assert.equal(reconstructedAfterRecovery.uid, first.uid);
+    await assert.rejects(() => service.executionContext("worker-no-capability-snapshot"), /WORKER_CAPABILITY_SNAPSHOT_MISSING/);
     await assert.rejects(() => service.executionContext("worker-missing-project-capability"), /WORKSPACE_CAPABILITY_MISSING/);
     await assert.rejects(() => service.executionContext("worker-write-capability-missing"), /WORKSPACE_WRITE_CAPABILITY_MISSING/);
     assert.equal(classifyWorkspaceErrorCode("EACCES"), "WORKSPACE_UNIX_PERMISSION_DENIED");
