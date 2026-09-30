@@ -128,7 +128,7 @@ export class PrincipalService {
     const cache = join(root, "cache");
     const artifacts = join(root, "artifacts");
     const agent = join(root, "agent");
-    for (const directory of [home, cache, artifacts, agent, join(home, ".local"), join(home, ".local", "bin"), join(home, ".local", "share"), join(home, ".local", "state"), join(home, ".local", "uv-tools"), join(home, ".config"), join(home, ".npm-global"), join(home, ".npm-global", "bin"), join(cache, "xdg"), join(cache, "npm"), join(cache, "pip"), join(cache, "uv"), join(cache, "go-build"), join(cache, "go-mod"), join(home, "go"), join(home, "tmp")]) {
+    for (const directory of [home, cache, artifacts, agent, join(home, ".agent"), this.principalMemoryPath(principalId), join(home, ".local"), join(home, ".local", "bin"), join(home, ".local", "share"), join(home, ".local", "state"), join(home, ".local", "uv-tools"), join(home, ".config"), join(home, ".npm-global"), join(home, ".npm-global", "bin"), join(cache, "xdg"), join(cache, "npm"), join(cache, "pip"), join(cache, "uv"), join(cache, "go-build"), join(cache, "go-mod"), join(home, "go"), join(home, "tmp")]) {
       await this.ensureOwnedDirectory(directory, principal.runtimeUid, principal.runtimeGid, 0o700);
     }
     let projects = join(root, "projects");
@@ -139,6 +139,10 @@ export class PrincipalService {
 
   async ensureOwnerDirectories(): Promise<void> {
     await this.ensurePrincipalDirectories(OWNER_PRINCIPAL_ID);
+  }
+
+  principalMemoryPath(principalId: string): string {
+    return join(this.principalRoot(principalId), "home", ".agent", "memory");
   }
 
   async ensureConversationWorkspace(conversationId: string): Promise<{ root: string; home: string; projects: string; cache: string; uid: number; gid: number }> {
