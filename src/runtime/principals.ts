@@ -145,12 +145,12 @@ export class PrincipalService {
     if (!conversationId || conversationId.length > 512) throw new Error("CONVERSATION_WORKSPACE_ID_INVALID");
     this.assertSystemRoot();
     const { uid, gid } = this.db.transaction(() => {
-      const conversation = this.db.get<{ trust: Trust }>("SELECT trust FROM conversations WHERE conversation_id=?", conversationId);
+      const conversation = this.db.get<{ conversation_id: string }>("SELECT conversation_id FROM conversations WHERE conversation_id=?", conversationId);
       if (!conversation) throw new Error("CONVERSATION_WORKSPACE_NOT_FOUND");
       const row = this.db.get<{ runtime_uid: number; runtime_gid: number }>("SELECT runtime_uid,runtime_gid FROM conversation_workspaces WHERE conversation_id=?", conversationId);
       const used = new Set(this.db.all<{ runtime_uid: number }>("SELECT runtime_uid FROM conversation_workspaces").map((item) => Number(item.runtime_uid)));
-      const minUid = conversation.trust === "OWNER" ? OWNER_WORKSPACE_UID_MIN : WORKSPACE_RUNTIME_UID_MIN;
-      const maxUid = conversation.trust === "OWNER" ? OWNER_WORKSPACE_UID_MAX : WORKSPACE_RUNTIME_UID_MAX;
+      const minUid = WORKSPACE_RUNTIME_UID_MIN;
+      const maxUid = WORKSPACE_RUNTIME_UID_MAX;
       if (row && row.runtime_uid >= minUid && row.runtime_uid <= maxUid) return { uid: row.runtime_uid, gid: row.runtime_gid };
       if (row) used.delete(row.runtime_uid);
       let uid = minUid;
@@ -167,13 +167,17 @@ export class PrincipalService {
     await chmod(join(this.stateRoot, "workspaces"), 0o711);
     await chown(join(this.stateRoot, "workspaces", "conversations"), 0, 0);
     await chmod(join(this.stateRoot, "workspaces", "conversations"), 0o711);
-    await this.ensureOwnedDirectory(root, uid, gid, 0o700);
+    await mkdir(root, { recursive: true, mode: 0o711 });
+    await chown(root, 0, gid);
+    await chmod(root, 0o711);
     const home = join(root, "home");
     const projects = join(root, "projects");
     const cache = join(root, "cache");
-    for (const directory of [home, projects, cache, join(home, ".local"), join(home, ".local", "bin"), join(home, ".npm-global"), join(home, ".npm-global", "bin"), join(home, "tmp"), join(cache, "xdg"), join(cache, "npm"), join(cache, "pip"), join(cache, "uv"), join(cache, "go-build"), join(cache, "go-mod")]) {
-      await this.ensureOwnedDirectory(directory, uid, gid, 0o700);
-    }
+    await this.ensureOwnedDirectory(home, uid, gid, 0o700);
+    await this.ensureOwnedDirectory(cache, uid, gid, 0o700);
+    await mkdir(projects, { recursive: true, mode: 0o711 });
+    await chown(projects, 0, gid);
+    await chmod(projects, 0o711);
     return { root, home, projects, cache, uid, gid };
   }
 
@@ -212,10 +216,12 @@ export class PrincipalService {
   async ensureConversationWorkspacePath(conversationId: string, workspaceId: string): Promise<string> {
     const dirs = await this.ensureConversationWorkspace(conversationId);
     const candidate = resolve(dirs.projects, canonicalWorkspaceId(workspaceId));
-    await mkdir(candidate, { recursive: true, mode: 0o700 });
+    await mkdir(candidate, { recursive: true, mode: 0o2770 });
     const realCandidate = await realpath(candidate);
     if (!isWithin(await realpath(dirs.projects), realCandidate)) throw new Error("WORKSPACE_PATH_ESCAPE");
-    await this.ensureOwnedDirectory(realCandidate, dirs.uid, dirs.gid, 0o700);
+    const existing = await lstat(realCandidate);
+    if (existing.uid !== 0 || existing.gid !== dirs.gid) await this.chownTree(realCandidate, 0, dirs.gid);
+    await this.setSharedWorkspaceModes(realCandidate);
     return realCandidate;
   }
 
@@ -360,6 +366,17 @@ export class PrincipalService {
       else await chown(child, uid, gid);
     }
     await chown(path, uid, gid);
+  }
+
+  private async setSharedWorkspaceModes(path: string): Promise<void> {
+    const info = await lstat(path);
+    if (!info.isDirectory() || info.isSymbolicLink()) return;
+    await chmod(path, 0o2770);
+    for (const entry of await readdir(path, { withFileTypes: true })) {
+      const child = join(path, entry.name);
+      if (entry.isDirectory() && !entry.isSymbolicLink()) await this.setSharedWorkspaceModes(child);
+      else if (!entry.isSymbolicLink()) await chmod(child, ((await lstat(child)).mode & 0o777) | 0o660);
+    }
   }
 
   private assertSystemRoot(): void {

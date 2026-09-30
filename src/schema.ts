@@ -307,6 +307,14 @@ export const runtimeMigrations = [
       );
     `,
   },
+  {
+    version: 23,
+    sql: `
+      ALTER TABLE worker_executions ADD COLUMN workspace_gid INTEGER;
+      UPDATE worker_executions SET workspace_gid=(SELECT runtime_gid FROM conversation_workspaces cw JOIN tasks t ON t.origin_conversation_id=cw.conversation_id WHERE t.id=worker_executions.task_id) WHERE workspace_gid IS NULL;
+      UPDATE worker_executions SET runtime_uid=(SELECT runtime_uid FROM principals WHERE principal_id=worker_executions.principal_id), runtime_gid=(SELECT runtime_gid FROM principals WHERE principal_id=worker_executions.principal_id) WHERE principal_id IS NOT NULL;
+    `,
+  },
 ];
 
 export function ensureRuntimeSchema(store: SqliteStore): void {

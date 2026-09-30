@@ -431,9 +431,12 @@ test("Owner and Guest Workers persist the same Principal-brokered execution mode
       const trust = principalId === "principal:owner" ? "OWNER" : "GUEST";
       const task = service.createTask({ title: trust, goal: trust, requester: { platform: "qq", accountId: "a", userId: principalId, principalId }, trust, originConversationId: "c", notificationConversationId: "c", parentCapabilities: caps });
       const worker = await service.createWorker({ taskId: task.id, objective: "verify execution plane", actor: caps, actorPrincipalId: principalId });
-      const durable = db.get<{ process_mode: string; runtime_uid: number; workspace_id: string; workspace_access: string }>("SELECT process_mode,runtime_uid,workspace_id,workspace_access FROM worker_executions WHERE id=?", worker.id);
+      const durable = db.get<{ process_mode: string; runtime_uid: number; runtime_gid: number; workspace_gid: number; workspace_id: string; workspace_access: string }>("SELECT process_mode,runtime_uid,runtime_gid,workspace_gid,workspace_id,workspace_access FROM worker_executions WHERE id=?", worker.id);
       modes.push(durable?.process_mode ?? "missing");
-      assert.equal(durable?.runtime_uid, 30001);
+      assert.equal(durable?.runtime_uid, principalId === "principal:owner" ? 10001 : 20001);
+      assert.equal(durable?.runtime_gid, principalId === "principal:owner" ? 10001 : 20001);
+      assert.equal(durable?.workspace_gid, 30001);
+      assert.notEqual(durable?.runtime_uid, durable?.workspace_gid);
       assert.equal(durable?.workspace_id, "default");
       assert.equal(durable?.workspace_access, "WRITE");
       assert.deepEqual(worker.capabilities?.projects, [{ projectId: "default", access: "WRITE" }]);
@@ -441,8 +444,9 @@ test("Owner and Guest Workers persist the same Principal-brokered execution mode
       assert.equal(execution.taskId, task.id);
       assert.equal(execution.workerId, worker.id);
       assert.equal(execution.principalId, principalId);
-      assert.equal(execution.uid, 30001);
-      assert.equal(execution.gid, 30001);
+      assert.equal(execution.uid, principalId === "principal:owner" ? 10001 : 20001);
+      assert.equal(execution.gid, principalId === "principal:owner" ? 10001 : 20001);
+      assert.equal(execution.workspaceGid, 30001);
       assert.equal(execution.workspaceId, "default");
       assert.equal(execution.workspaceScopeId, "conversation:c:default");
       workspacePaths.push(principals.conversationWorkspacePath("c", "default"));

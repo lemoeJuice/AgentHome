@@ -19,7 +19,7 @@ test("bootstrap initializes private state and schema without provider credential
     assert.equal(config.snowluma.apiEndpoint, "http://127.0.0.1:3000");
     assert.deepEqual(config.owners.map((owner) => owner.userId), ["owner-1", "owner-2"]);
     const db = new SqliteStore(join(root, "data/agent.db"));
-    assert.equal(db.get<{ version: number }>("SELECT max(version) AS version FROM schema_migrations")?.version, 22);
+    assert.equal(db.get<{ version: number }>("SELECT max(version) AS version FROM schema_migrations")?.version, 23);
     db.close();
   } finally {
     await rm(root, { recursive: true, force: true });

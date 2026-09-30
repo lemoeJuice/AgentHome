@@ -10,6 +10,7 @@ export interface ExecutionContext {
   workspaceScopeId?: string;
   uid: number;
   gid: number;
+  workspaceGid: number;
   capabilities: CapabilitySet;
   workspace: string;
   workspaceAccess: "READ" | "WRITE";
