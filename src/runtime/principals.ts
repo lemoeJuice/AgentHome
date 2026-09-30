@@ -20,7 +20,6 @@ export interface PrincipalRecord {
   principalId: string;
   runtimeUid: number;
   runtimeGid: number;
-  role: Trust;
 }
 
 type PrincipalRow = { principal_id: string; trust: Trust; runtime_uid: number | null; runtime_gid: number | null };
@@ -38,7 +37,7 @@ export class PrincipalService {
     return this.db.transaction(() => {
       const row = this.ensureRuntimeIdentity(OWNER_PRINCIPAL_ID, "OWNER");
       if (row.runtime_uid === null || row.runtime_gid === null) throw new Error("PRINCIPAL_UID_ASSIGNMENT_FAILED");
-      return { principalId: row.principal_id, runtimeUid: row.runtime_uid, runtimeGid: row.runtime_gid, role: row.trust };
+      return { principalId: row.principal_id, runtimeUid: row.runtime_uid, runtimeGid: row.runtime_gid };
     });
   }
 
@@ -112,7 +111,7 @@ export class PrincipalService {
   get(principalId: string): PrincipalRecord {
     const row = this.db.get<PrincipalRow>("SELECT principal_id,trust,runtime_uid,runtime_gid FROM principals WHERE principal_id=?", principalId);
     if (!row || row.runtime_uid === null || row.runtime_gid === null) throw new Error("PRINCIPAL_NOT_PROVISIONED");
-    return { principalId: row.principal_id, runtimeUid: row.runtime_uid, runtimeGid: row.runtime_gid, role: row.trust };
+    return { principalId: row.principal_id, runtimeUid: row.runtime_uid, runtimeGid: row.runtime_gid };
   }
 
   async ensurePrincipalDirectories(principalId: string): Promise<{ root: string; home: string; projects: string; cache: string; artifacts: string; agent: string }> {
