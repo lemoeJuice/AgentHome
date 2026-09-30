@@ -1,70 +1,43 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig, snowlumaAccessToken, snowlumaWebSocketAccessToken } from "../src/config.ts";
 
-test("loadConfig reads multiple Bot Owner identities from the main config", async () => {
+test("loadConfig reads System Admin control identities and Principal execution policy", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-config-"));
   const configPath = join(root, "agent-home.json");
   try {
-    await writeFile(configPath, JSON.stringify({ instanceId: "config-test", owners: [{ platform: "qq", accountId: "bot-1", userId: "owner-1" }, { platform: "qq", accountId: "bot-1", userId: "owner-2" }], snowluma: { endpoint: "ws://snowluma", apiEndpoint: "http://snowluma" } }));
+    await writeFile(configPath, JSON.stringify({ instanceId: "config-test", systemAdmins: [{ platform: "qq", accountId: "bot-1", userId: "admin-1" }], principalExecution: { maxWorkersPerPrincipal: 3 }, snowluma: { endpoint: "ws://snowluma", apiEndpoint: "http://snowluma" } }));
     const config = await loadConfig(configPath);
-    assert.deepEqual(config.owners, [{ platform: "qq", accountId: "bot-1", userId: "owner-1" }, { platform: "qq", accountId: "bot-1", userId: "owner-2" }]);
+    assert.deepEqual(config.systemAdmins, [{ platform: "qq", accountId: "bot-1", userId: "admin-1" }]);
+    assert.equal(config.principalExecution.maxWorkersPerPrincipal, 3);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test("loadConfig rejects the removed singular Owner configuration key", async () => {
-  const root = await mkdtemp(join(tmpdir(), "agent-home-config-owner-compat-"));
+test("loadConfig ignores obsolete Owner/Guest settings and exposes no role-based configuration", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-home-config-obsolete-roles-"));
   const configPath = join(root, "agent-home.json");
   try {
-    await writeFile(configPath, JSON.stringify({ instanceId: "owner-compat", owner: { platform: "qq", accountId: "a", userId: "owner" }, snowluma: { endpoint: "ws://snowluma", apiEndpoint: "http://snowluma" } }));
-    await assert.rejects(loadConfig(configPath), /CONFIG_UNSUPPORTED: owner/);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test("manual deployment config migration separates Owner and System Admin lists", async () => {
-  const root = await mkdtemp(join(tmpdir(), "agent-home-config-one-time-migration-"));
-  const configPath = join(root, "agent-home.json");
-  try {
-    await writeFile(configPath, JSON.stringify({ instanceId: "migrate-config", owner: { platform: "qq", accountId: "a", userId: "owner" }, guest: { memoryBytes: 2_147_483_648 } }));
-    execFileSync(process.execPath, ["scripts/migrate-config.mjs", configPath]);
-    const migrated = JSON.parse(await readFile(configPath, "utf8")) as { owner?: unknown; owners: Array<{ userId: string }>; systemAdmins: Array<{ userId: string }>; guest: { memoryBytes: number } };
-    assert.equal("owner" in migrated, false);
-    assert.deepEqual(migrated.owners, [{ platform: "qq", accountId: "a", userId: "owner" }]);
-    assert.deepEqual(migrated.systemAdmins, migrated.owners);
-    assert.equal(migrated.guest.memoryBytes, 16 * 1024 * 1024 * 1024);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test("loadConfig keeps the System Admin allowlist independent from Owner identities", async () => {
-  const root = await mkdtemp(join(tmpdir(), "agent-home-config-system-admin-"));
-  const configPath = join(root, "agent-home.json");
-  try {
-    await writeFile(configPath, JSON.stringify({ instanceId: "system-admin-config", owners: [{ platform: "qq", accountId: "a", userId: "owner" }], systemAdmins: [], snowluma: { endpoint: "ws://snowluma", apiEndpoint: "http://snowluma" } }));
+    await writeFile(configPath, JSON.stringify({ instanceId: "config-roleless", owners: [{ platform: "qq", accountId: "a", userId: "old-owner" }], guest: { enabled: true }, plugins: { guestAllowedActions: ["old.action"] }, snowluma: { endpoint: "ws://snowluma", apiEndpoint: "http://snowluma" } }));
     const config = await loadConfig(configPath);
-    assert.deepEqual(config.owners, [{ platform: "qq", accountId: "a", userId: "owner" }]);
-    assert.deepEqual(config.systemAdmins, []);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
+    assert.equal("owners" in config, false);
+    assert.equal("guest" in config, false);
+    assert.equal("guestAllowedActions" in config.plugins, false);
+    assert.equal(config.principalExecution.taskTimeoutMs, 30 * 60 * 1000);
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("loadConfig accepts an unconfigured deployment without an Owner", async () => {
+test("loadConfig accepts an unconfigured deployment", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-config-no-owner-"));
   const configPath = join(root, "agent-home.json");
   try {
     await writeFile(configPath, JSON.stringify({ instanceId: "config-no-owner", snowluma: { endpoint: "ws://snowluma", apiEndpoint: "http://snowluma" } }));
     const config = await loadConfig(configPath);
-    assert.equal(config.owners, undefined);
+    assert.deepEqual(config.systemAdmins, undefined);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -93,12 +66,12 @@ test("Pi auth default follows stateRoot and preserves an explicitly selected age
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("explicit worker memory limit is preserved without automatic compatibility rewriting", async () => {
+test("Principal worker memory limit is validated", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-config-node-rlimit-"));
   const configPath = join(root, "agent-home.json");
   try {
-    await writeFile(configPath, JSON.stringify({ instanceId: "node-rlimit", paths: { stateRoot: root }, guest: { enabled: true, memoryBytes: 2147483648 }, snowluma: { endpoint: "ws://snowluma", apiEndpoint: "http://snowluma" } }));
-    await assert.rejects(loadConfig(configPath), /CONFIG_INVALID: guest.memoryBytes/);
+    await writeFile(configPath, JSON.stringify({ instanceId: "node-rlimit", paths: { stateRoot: root }, principalExecution: { memoryBytes: 2147483648 }, snowluma: { endpoint: "ws://snowluma", apiEndpoint: "http://snowluma" } }));
+    await assert.rejects(loadConfig(configPath), /CONFIG_INVALID: principalExecution.memoryBytes/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

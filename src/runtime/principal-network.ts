@@ -1,9 +1,9 @@
 import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 
-export function installPrincipalEgressFilter(uidMin: number, uidMax: number, resolverConfig = "/etc/resolv.conf", proxyUrl?: string): void {
+export function installPrincipalEgressFilter(uidMin: number, uidMax: number, resolverConfig = "/etc/resolv.conf", proxyUrl?: string, additionalUids: number[] = []): void {
   if (process.getuid?.() !== 0) throw new Error("PRINCIPAL_EGRESS_FILTER_REQUIRES_SYSTEM_ROOT");
-  const rules = buildPrincipalEgressRules(uidMin, uidMax, readFileSync(resolverConfig, "utf8"), proxyUrl);
+  const rules = buildPrincipalEgressRules(uidMin, uidMax, readFileSync(resolverConfig, "utf8"), proxyUrl, additionalUids);
   const nft = process.env.AGENT_HOME_NFT_COMMAND ?? "nft";
   const remove = spawnSync(nft, ["delete", "table", "inet", "agent_home_principal"], { encoding: "utf8" });
   if (remove.error && (remove.error as NodeJS.ErrnoException).code !== "ENOENT") throw remove.error;
@@ -12,10 +12,15 @@ export function installPrincipalEgressFilter(uidMin: number, uidMax: number, res
   if (result.status !== 0) throw new Error(`PRINCIPAL_EGRESS_FILTER_INSTALL_FAILED:${(result.stderr || result.stdout).trim()}`);
 }
 
-export function buildPrincipalEgressRules(uidMin: number, uidMax: number, resolverConfiguration: string, proxyUrl?: string): string {
+export function buildPrincipalEgressRules(uidMin: number, uidMax: number, resolverConfiguration: string, proxyUrl?: string, additionalUids: number[] = []): string {
   const resolvers = parseResolvers(resolverConfiguration);
   if (resolvers.ipv4.length === 0 && resolvers.ipv6.length === 0) throw new Error("PRINCIPAL_EGRESS_DNS_RESOLVER_REQUIRED");
-  const range = `${uidMin}-${uidMax}`;
+  if (!Number.isSafeInteger(uidMin) || !Number.isSafeInteger(uidMax) || uidMin < 1 || uidMax < uidMin) throw new Error("PRINCIPAL_EGRESS_UID_RANGE_INVALID");
+  const extra = [...new Set(additionalUids)].filter((uid) => {
+    if (!Number.isSafeInteger(uid) || uid < 1) throw new Error("PRINCIPAL_EGRESS_UID_RANGE_INVALID");
+    return uid < uidMin || uid > uidMax;
+  });
+  const range = extra.length ? `{ ${[...extra, `${uidMin}-${uidMax}`].join(", ")} }` : `${uidMin}-${uidMax}`;
   return [
     "table inet agent_home_principal {",
     "  chain output {",

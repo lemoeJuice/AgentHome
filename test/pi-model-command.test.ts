@@ -72,7 +72,7 @@ test("Pi model command switches a model Pi reports and hot-switches sessions wit
   assert.equal(calls.some((args) => args.includes("set-pi-thinking-level")), true);
 });
 
-test("Pi model handler accepts group context after Gateway Owner authorization", async () => {
+test("Pi model handler accepts group context after Gateway System Admin authorization", async () => {
   let called = false;
   const command = createPiModelCommand(config, logger, async (args) => { called = true; return args.includes("--list-models") ? modelList : ""; });
   const result = await command(context(["list"], "group"));

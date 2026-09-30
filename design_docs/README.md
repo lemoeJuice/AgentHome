@@ -8,20 +8,22 @@ Autonomous implementation instructions:
 
 Recommended reading order:
 1. `AGENT.md`
-2. `AGENT_HOME_DESIGN.md`
-3. `MEMORY_SYSTEM_DESIGN.md`
-4. `AGENT_HOME_CONTAINER_CONTROL_DESIGN.md`
-5. `MAIN_WORKER_ORCHESTRATION_DESIGN.md`
-6. `EXTERNAL_PLUGIN_COMMAND_DESIGN.md`
-7. `TASK_RUNTIME_DESIGN.md`
-8. `AUTHORIZATION_CAPABILITY_DESIGN.md`
-9. `ARTIFACT_FILE_DESIGN.md`
-10. `PRINCIPAL_WORKSPACE_SYSTEM_ADMIN_DESIGN.md`
-11. `UID_GID_MEMORY_DESIGN.md`
+2. `PRINCIPAL_WORKSPACE_SYSTEM_ADMIN_DESIGN.md`
+3. `UID_GID_MEMORY_DESIGN.md`
+4. `AGENT_HOME_DESIGN.md`
+5. `TASK_RUNTIME_DESIGN.md`
+6. `AUTHORIZATION_CAPABILITY_DESIGN.md`
+7. `MEMORY_SYSTEM_DESIGN.md`
+8. `AGENT_HOME_CONTAINER_CONTROL_DESIGN.md`
+9. `MAIN_WORKER_ORCHESTRATION_DESIGN.md`
+10. `EXTERNAL_PLUGIN_COMMAND_DESIGN.md`
+11. `ARTIFACT_FILE_DESIGN.md`
 
 `PRINCIPAL_WORKSPACE_SYSTEM_ADMIN_DESIGN.md` and `UID_GID_MEMORY_DESIGN.md`
-are the current identity/workspace/memory baselines. Older Guest sandbox and
-role-based designs are historical where they differ from these documents.
+are the current identity/workspace/memory baselines. The database and runtime
+model contains no Owner/Guest execution roles. Older role-based details in the
+other design documents are historical wherever they conflict with these current
+baselines.
 
 Key current implementation choices:
 - language: TypeScript + Node.js

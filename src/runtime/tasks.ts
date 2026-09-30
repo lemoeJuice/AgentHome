@@ -2,7 +2,7 @@ import { chmod, chown, mkdir, open, readFile, readdir, realpath, stat } from "no
 import { randomBytes } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { dirname, join, relative, resolve } from "node:path";
-import { configuredOwners, type AppConfig } from "../config.js";
+import type { AppConfig } from "../config.js";
 import type { SqliteStore } from "../db.js";
 import { attenuateTask, attenuateWorker, capabilityWithin, deriveCapabilities, validateCapabilitySet, type AuthorizationDecision, authorizeSend } from "../auth.js";
 import { newId, nowIso, messageKey } from "../shared/ids.js";
@@ -69,10 +69,10 @@ export class TaskService implements ExecutionBackend {
     this.log = logger.child("tasks");
   }
 
-  createTask(input: { title: string; goal: string; requester: TaskRequester; trust: "OWNER" | "GUEST"; originConversationId: string; notificationConversationId: string; parentTaskId?: string; parentCapabilities: CapabilitySet; requestedCapabilities?: Partial<CapabilitySet> }): TaskRecord {
+  createTask(input: { title: string; goal: string; requester: TaskRequester; originConversationId: string; notificationConversationId: string; parentTaskId?: string; parentCapabilities: CapabilitySet; requestedCapabilities?: Partial<CapabilitySet> }): TaskRecord {
     const identity = input.requester.principalId
       ? undefined
-      : this.options.principals.resolveIdentity(input.requester.platform, input.requester.accountId, input.requester.userId, configuredOwners(this.config));
+      : this.options.principals.resolveIdentity(input.requester.platform, input.requester.accountId, input.requester.userId);
     const principalId = input.requester.principalId ?? identity?.principalId;
     if (!principalId) throw new Error("TASK_PRINCIPAL_REQUIRED");
     const principal = this.options.principals.get(principalId);
@@ -94,10 +94,10 @@ export class TaskService implements ExecutionBackend {
     try { capabilities = attenuateTask(parentCapabilities, input.requestedCapabilities ?? {}, id); }
     catch (error) { this.audit("task.create", "DENY", error instanceof Error ? error.message : String(error), id, input.requester.userId); throw error; }
     const timestamp = nowIso();
-    const deadlineAt = input.trust === "GUEST" ? new Date(Date.now() + (this.config.guest?.taskTimeoutMs ?? 30 * 60 * 1000)).toISOString() : undefined;
-    const task: TaskRecord = { id, title: input.title, goal: input.goal, status: "CREATED", requester, trust: input.trust, originConversationId: input.originConversationId, notificationConversationId: input.notificationConversationId, ...(input.parentTaskId ? { parentTaskId: input.parentTaskId } : {}), capabilities, createdAt: timestamp, updatedAt: timestamp, ...(deadlineAt ? { deadlineAt } : {}) };
+    const deadlineAt = new Date(Date.now() + this.config.principalExecution.taskTimeoutMs).toISOString();
+    const task: TaskRecord = { id, title: input.title, goal: input.goal, status: "CREATED", requester, originConversationId: input.originConversationId, notificationConversationId: input.notificationConversationId, ...(input.parentTaskId ? { parentTaskId: input.parentTaskId } : {}), capabilities, createdAt: timestamp, updatedAt: timestamp, deadlineAt };
     this.db.transaction(() => {
-      this.db.run("INSERT INTO tasks(id,title,goal,status,requester_json,trust,origin_conversation_id,notification_conversation_id,parent_task_id,capabilities_json,created_at,updated_at,principal_id,deadline_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", id, task.title, task.goal, task.status, JSON.stringify(task.requester), task.trust, task.originConversationId, task.notificationConversationId, task.parentTaskId ?? null, JSON.stringify(task.capabilities), timestamp, timestamp, requester.principalId ?? null, deadlineAt ?? null);
+      this.db.run("INSERT INTO tasks(id,title,goal,status,requester_json,origin_conversation_id,notification_conversation_id,parent_task_id,capabilities_json,created_at,updated_at,principal_id,deadline_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", id, task.title, task.goal, task.status, JSON.stringify(task.requester), task.originConversationId, task.notificationConversationId, task.parentTaskId ?? null, JSON.stringify(task.capabilities), timestamp, timestamp, requester.principalId ?? null, deadlineAt);
       this.event(id, "TASK_CREATED", undefined, { title: task.title });
     });
     this.log.debug("Task Principal capabilities persisted", { taskId: id, principalId: requester.principalId, uid: requester.runtimeUid, gid: requester.runtimeGid, capabilities: { projects: capabilities.projects }, executionProfile: "TASK_CAPABILITY_SNAPSHOT", scope: input.originConversationId, contextSource: "resolved-principal" });
@@ -126,6 +126,7 @@ export class TaskService implements ExecutionBackend {
     const workerCount = Number(this.db.get<{ count: number }>("SELECT count(*) AS count FROM worker_executions WHERE task_id=? AND status IN ('PENDING','STARTING','RUNNING','WAITING_USER','STOPPING')", input.taskId)?.count ?? 0);
     if (workerCount >= this.config.runtime.maxWorkers) throw new Error("WORKER_QUOTA_EXCEEDED");
     if (this.activeWorkerCount() >= this.limit("maxWorkersTotal")) throw new Error("WORKER_TOTAL_QUOTA_EXCEEDED");
+    if (this.activePrincipalWorkerCount(effectivePrincipalId) >= this.config.principalExecution.maxWorkersPerPrincipal) throw new Error("PRINCIPAL_WORKER_QUOTA_EXCEEDED");
     if (workspaceScopeId && this.activeProjectWorkerCount(workspaceScopeId) >= this.limit("maxWorkersPerProject")) throw new Error("WORKER_PROJECT_QUOTA_EXCEEDED");
     if (this.activeRequesterWorkerCount(task.requester) >= this.limit("maxWorkersPerRequester")) throw new Error("WORKER_REQUESTER_QUOTA_EXCEEDED");
     const workerId = newId("worker");
@@ -235,11 +236,11 @@ export class TaskService implements ExecutionBackend {
     const root = await realpath(current.workspace);
     const cwd = await this.resolveWorkspaceWorkingDirectory(root, input.cwd);
     await this.assertPrincipalQuota(principalDirs, root);
-    const commandTimeout = this.config.guest.commandTimeoutMs;
+    const commandTimeout = this.config.principalExecution.commandTimeoutMs;
     const timeoutMs = Math.max(1, Math.min(Number.isSafeInteger(input.timeoutMs) ? Number(input.timeoutMs) : commandTimeout, commandTimeout, remainingTaskMs));
     const helper = this.options.principalExecCommand ?? "/usr/local/bin/agent-home-principal-exec";
     const environment = { ...this.options.principals.principalProcessEnvironment(current.principalId, this.config.network?.modelProxyUrl), HOME: current.home, WORKSPACE: current.workspace, AGENT_PERSONAL_MEMORY: this.options.principals.principalMemoryPath(current.principalId), AGENT_WORKSPACE_MEMORY: this.options.principals.workspaceMemoryPath(task.originConversationId, current.workspaceId) };
-    const child = spawn(helper, [String(current.uid), String(current.gid), String(current.workspaceGid), String(this.config.guest.cpuSeconds), String(this.config.guest.memoryBytes), String(this.config.guest.pids), String(this.config.guest.maxFileBytes), "--", "/bin/bash", "-c", input.command], { cwd, env: environment, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(helper, [String(current.uid), String(current.gid), String(current.workspaceGid), String(this.config.principalExecution.cpuSeconds), String(this.config.principalExecution.memoryBytes), String(this.config.principalExecution.pids), String(this.config.principalExecution.maxFileBytes), "--", "/bin/bash", "-c", input.command], { cwd, env: environment, detached: true, stdio: ["ignore", "pipe", "pipe"] });
     const active = this.activePrincipalCommands.get(worker.id) ?? new Set<ChildProcess>();
     active.add(child);
     this.activePrincipalCommands.set(worker.id, active);
@@ -253,7 +254,7 @@ export class TaskService implements ExecutionBackend {
       if (!["STARTING", "RUNNING", "WAITING_USER"].includes(this.getWorker(worker.id).status) || this.cancellationRequested(task.id)) throw new Error("WORKER_NOT_RUNNING");
       processId = child.pid;
       const processIdentity = processId ? await this.readProcessIdentity(processId) : undefined;
-      if (!processId || !processIdentity) throw new Error("GUEST_PROCESS_IDENTITY_UNAVAILABLE");
+      if (!processId || !processIdentity) throw new Error("PRINCIPAL_PROCESS_IDENTITY_UNAVAILABLE");
       processGroupId = processIdentity.processGroupId;
       processStartTime = processIdentity.startTime;
       processRecordId = newId("principal-process");
@@ -344,10 +345,10 @@ export class TaskService implements ExecutionBackend {
   private async principalQuotaExceeded(principalDirs: { root: string; home: string; projects: string; cache: string; agent: string; artifacts: string }, workspace: string): Promise<boolean> {
     let workspaceBytes = 0;
     for (const directory of [principalDirs.home, principalDirs.projects, principalDirs.agent, principalDirs.artifacts]) {
-      workspaceBytes += await directoryBytes(directory, this.config.guest.workspaceQuotaBytes - workspaceBytes);
-      if (workspaceBytes > this.config.guest.workspaceQuotaBytes) return true;
+      workspaceBytes += await directoryBytes(directory, this.config.principalExecution.workspaceQuotaBytes - workspaceBytes);
+      if (workspaceBytes > this.config.principalExecution.workspaceQuotaBytes) return true;
     }
-    return (await directoryBytes(principalDirs.cache, this.config.guest.cacheQuotaBytes)) > this.config.guest.cacheQuotaBytes;
+    return (await directoryBytes(principalDirs.cache, this.config.principalExecution.cacheQuotaBytes)) > this.config.principalExecution.cacheQuotaBytes;
   }
 
   private workspaceScopeId(task: TaskRecord, workspaceId: string): string {
@@ -494,7 +495,7 @@ export class TaskService implements ExecutionBackend {
     return questionId;
   }
 
-  async answerQuestion(questionId: string, answer: string, source: { message: PlatformMessageRef; conversationId: string; requester?: TaskRequester; trust?: "OWNER" | "GUEST"; capabilities?: CapabilitySet }): Promise<void> {
+  async answerQuestion(questionId: string, answer: string, source: { message: PlatformMessageRef; conversationId: string; requester?: TaskRequester; capabilities?: CapabilitySet }): Promise<void> {
     const question = this.db.get<{ id: string; task_id: string; worker_id: string; status: string }>("SELECT id,task_id,worker_id,status FROM pending_questions WHERE id=?", questionId);
     if (!question || question.status !== "OPEN") throw new Error("QUESTION_NOT_OPEN");
     const task = this.getTask(question.task_id);
@@ -709,7 +710,7 @@ export class TaskService implements ExecutionBackend {
           taskId: worker.taskId,
           workerId,
           ...(worker.principalId ? { sourcePrincipalId: worker.principalId } : {}),
-          principalQuotaBytes: this.config.guest?.artifactQuotaBytes ?? this.config.runtime.maxArtifactBytes,
+          principalQuotaBytes: this.config.principalExecution.artifactQuotaBytes,
           mime: input.mime,
           sourceType: "WORKER_OUTPUT",
           allowedRoots: [workspace],
@@ -928,7 +929,7 @@ export class TaskService implements ExecutionBackend {
     });
     const timestamp = nowIso();
     this.db.run("UPDATE task_mailbox SET worker_id=?,status='CONSUMED',delivered_at=?,consumed_at=? WHERE id=? AND status IN ('PENDING','DELIVERED','PROCESSING')", worker.id, timestamp, timestamp, mailboxId);
-    this.log.info("Task follow-up dispatched to a new Worker", { taskId: task.id, workerId: worker.id, principalId: worker.principalId, role: task.trust, uid: worker.runtimeUid, gid: worker.runtimeGid, workspaceId: worker.workspaceId, workspaceAccess: worker.workspaceAccess, capabilities: { projects: worker.capabilities?.projects ?? [] }, executionProfile: describeExecutionProfile(worker), scope: worker.workspaceScopeId ?? worker.workspaceId, contextSource: sourceCapabilities ? "authenticated-follow-up-and-durable-task-capabilities" : "recovered-authorized-task-mailbox" });
+    this.log.info("Task follow-up dispatched to a new Worker", { taskId: task.id, workerId: worker.id, principalId: worker.principalId, uid: worker.runtimeUid, gid: worker.runtimeGid, workspaceId: worker.workspaceId, workspaceAccess: worker.workspaceAccess, capabilities: { projects: worker.capabilities?.projects ?? [] }, executionProfile: describeExecutionProfile(worker), scope: worker.workspaceScopeId ?? worker.workspaceId, contextSource: sourceCapabilities ? "authenticated-follow-up-and-durable-task-capabilities" : "recovered-authorized-task-mailbox" });
     return worker;
   }
 
@@ -938,7 +939,7 @@ export class TaskService implements ExecutionBackend {
       const task = this.getTask(row.task_id);
       if (this.isTerminalTask(task.status) || !task.capabilities.tasks.canFollowUp || this.cancellationRequested(task.id)) {
         this.db.run("UPDATE task_mailbox SET status='FAILED' WHERE id=? AND status IN ('PENDING','DELIVERED','PROCESSING')", row.id);
-        this.log.warn("Pending Task follow-up discarded because its Task is no longer active", { taskId: task.id, mailboxId: row.id, workerId: row.worker_id, principalId: task.requester.principalId, role: task.trust, scope: task.originConversationId, contextSource: "durable-task-mailbox" });
+        this.log.warn("Pending Task follow-up discarded because its Task is no longer active", { taskId: task.id, mailboxId: row.id, workerId: row.worker_id, principalId: task.requester.principalId, scope: task.originConversationId, contextSource: "durable-task-mailbox" });
         continue;
       }
       if (row.worker_id) {
@@ -1154,7 +1155,7 @@ export class TaskService implements ExecutionBackend {
     try { capabilities = validateCapabilitySet(JSON.parse(row.capabilities_json as string)); } catch { throw new Error("CAPABILITY_SNAPSHOT_INVALID"); }
     const requester = JSON.parse(row.requester_json as string) as TaskRequester;
     if (requester.principalId !== row.principal_id) throw new Error(`TASK_REQUESTER_PRINCIPAL_MISMATCH:${taskId}`);
-    return { id: row.id as string, title: row.title as string, goal: row.goal as string, status: row.status as TaskStatus, requester, trust: row.trust as TaskRecord["trust"], originConversationId: row.origin_conversation_id as string, notificationConversationId: row.notification_conversation_id as string, ...(row.parent_task_id ? { parentTaskId: row.parent_task_id as string } : {}), capabilities, createdAt: row.created_at as string, updatedAt: row.updated_at as string, ...(row.completed_at ? { completedAt: row.completed_at as string } : {}), ...(typeof row.deadline_at === "string" ? { deadlineAt: row.deadline_at } : {}) };
+    return { id: row.id as string, title: row.title as string, goal: row.goal as string, status: row.status as TaskStatus, requester, originConversationId: row.origin_conversation_id as string, notificationConversationId: row.notification_conversation_id as string, ...(row.parent_task_id ? { parentTaskId: row.parent_task_id as string } : {}), capabilities, createdAt: row.created_at as string, updatedAt: row.updated_at as string, ...(row.completed_at ? { completedAt: row.completed_at as string } : {}), ...(typeof row.deadline_at === "string" ? { deadlineAt: row.deadline_at } : {}) };
   }
 
   getWorker(workerId: string): WorkerExecutionRecord {
@@ -1442,6 +1443,10 @@ export class TaskService implements ExecutionBackend {
     }, 0);
   }
 
+  private activePrincipalWorkerCount(principalId: string): number {
+    return Number(this.db.get<{ count: number }>("SELECT count(*) AS count FROM worker_executions WHERE principal_id=? AND status IN ('PENDING','STARTING','RUNNING','WAITING_USER','STOPPING')", principalId)?.count ?? 0);
+  }
+
   private limit(name: "maxTasks" | "maxWorkersTotal" | "maxWorkersPerProject" | "maxWorkersPerRequester" | "maxTasksPerRequester" | "maxTasksPerPrincipal"): number {
     const value = this.config.runtime[name];
     return Number.isInteger(value) && value > 0 ? value : Number.MAX_SAFE_INTEGER;
@@ -1451,12 +1456,10 @@ export class TaskService implements ExecutionBackend {
     this.db.run("INSERT INTO authorization_audit_events(id,operation,decision,reason,resource,requester_id,task_id,metadata_json,created_at) VALUES (?,?,?,?,?,?,?,?,?)", newId("authz"), operation, decision, reason ?? null, resource, requesterId ?? null, taskId ?? null, null, nowIso());
   }
 
-  private canonicalCapabilities(input: { requester: TaskRequester; trust: "OWNER" | "GUEST"; originConversationId: string }): CapabilitySet | undefined {
-    const owners = configuredOwners(this.config);
-    if (!owners.length) return undefined;
+  private canonicalCapabilities(input: { requester: TaskRequester; originConversationId: string }): CapabilitySet | undefined {
     const row = this.db.get<{ platform: string; account_id: string; kind: "private" | "group"; platform_conversation_id: string; thread_id_json: string }>("SELECT platform,account_id,kind,platform_conversation_id,thread_id_json FROM conversations WHERE conversation_id=?", input.originConversationId);
     if (!row) return undefined;
-    return deriveCapabilities({ ...input.requester, trust: input.trust, conversationId: input.originConversationId }, { platform: row.platform, accountId: row.account_id, kind: row.kind, platformConversationId: row.platform_conversation_id, threadId: JSON.parse(row.thread_id_json) }, owners, input.originConversationId, { ...this.config.plugins, guestTaskExecutionEnabled: this.config.guest?.enabled ?? true });
+    return deriveCapabilities({ ...input.requester, conversationId: input.originConversationId }, { platform: row.platform, accountId: row.account_id, kind: row.kind, platformConversationId: row.platform_conversation_id, threadId: JSON.parse(row.thread_id_json) }, input.originConversationId, this.config.plugins);
   }
 }
 
@@ -1561,7 +1564,7 @@ function workerFailureDetail(error: string): { errorCode: string; summary: strin
   const networkHint = piNetworkFailureHint(new Error(error));
   if (networkHint) return { errorCode: "PI_NETWORK_UNAVAILABLE", summary: `Worker stopped because its model-service connection failed (${networkHint}). No verified result was produced; retry when model connectivity is restored.` };
   if (error.toLowerCase().includes("terminated")) return { errorCode: "PI_TURN_TERMINATED", summary: "Worker's Pi turn terminated before it produced a verified result." };
-  const code = error.match(/\b(WORKER_[A-Z0-9_]+|WORKSPACE_[A-Z0-9_]+|PI_[A-Z0-9_]+|GUEST_[A-Z0-9_]+)\b/)?.[1] ?? "WORKER_EXECUTION_FAILED";
+  const code = error.match(/\b(WORKER_[A-Z0-9_]+|WORKSPACE_[A-Z0-9_]+|PI_[A-Z0-9_]+|PRINCIPAL_[A-Z0-9_]+)\b/)?.[1] ?? "WORKER_EXECUTION_FAILED";
   return { errorCode: code, summary: `Worker stopped with ${code}; no verified result was produced.` };
 }
 
@@ -1673,7 +1676,7 @@ async function directoryBytes(root: string, stopAfter: number): Promise<number> 
       const path = join(directory, entry.name);
       if (entry.isDirectory()) pending.push(path);
       else if (entry.isFile()) {
-        try { size += (await stat(path)).size; } catch { /* racing guest file */ }
+        try { size += (await stat(path)).size; } catch { /* file may disappear during quota accounting */ }
         if (size > stopAfter) break;
       }
     }

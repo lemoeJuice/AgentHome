@@ -15,7 +15,7 @@ import type { Logger } from "../src/shared/logger.js";
 import { QQChatPlatformAdapter } from "../src/qq/adapter.js";
 
 const logger = { child: () => logger, info() {}, warn() {}, error() {}, debug() {} } as unknown as Logger;
-const config = { instanceId: "x", owners: [{ platform: "qq", accountId: "a", userId: "owner" }], systemAdmins: [{ platform: "qq", accountId: "a", userId: "owner" }], paths: { gatewayState: "/tmp/router-test.sqlite", pluginData: "/tmp/plugins", backupDir: "/tmp/backups", stateRoot: "/tmp/state", runtimeSocket: "/tmp/socket" }, snowluma: { accountId: "a", endpoint: "ws://localhost", apiEndpoint: "http://localhost", accessTokenEnv: "TOKEN", reverseWebSocketPath: "/ws", reconnectMs: 10, requestTimeoutMs: 10 }, chat: { global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" as const }, qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" as const }, conversationOverrides: {} }, runtime: { maxInFlight: 2, maxWorkers: 1, maxArtifactBytes: 1000, piCommand: "pi", piTimeoutMs: 1000 }, plugins: { enabled: [] }, logging: { level: "error" as const } } as AppConfig;
+const config = { instanceId: "x", systemAdmins: [{ platform: "qq", accountId: "a", userId: "admin" }], paths: { gatewayState: "/tmp/router-test.sqlite", pluginData: "/tmp/plugins", backupDir: "/tmp/backups", stateRoot: "/tmp/state", runtimeSocket: "/tmp/socket" }, snowluma: { accountId: "a", endpoint: "ws://localhost", apiEndpoint: "http://localhost", accessTokenEnv: "TOKEN", reverseWebSocketPath: "/ws", reconnectMs: 10, requestTimeoutMs: 10 }, chat: { global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" as const }, qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" as const }, conversationOverrides: {} }, runtime: { maxInFlight: 2, maxWorkers: 1, maxArtifactBytes: 1000, piCommand: "pi", piTimeoutMs: 1000 }, principalExecution: {}, plugins: { enabled: [] }, logging: { level: "error" as const } } as AppConfig;
 
 class Adapter implements ChatPlatformAdapter {
   readonly platform = "qq";
@@ -61,7 +61,7 @@ test("direct plugin command bypasses Controller and Main", async () => {
   state.close(); await rm(root, { recursive: true, force: true });
 });
 
-test("admin model commands are restricted to the configured Owner, not to private chat", async () => {
+test("admin model commands are restricted to configured System Admin identities", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-router-admin-model-"));
   const state = new GatewayState(join(root, "gateway.sqlite"));
   const adapter = new Adapter();
@@ -73,40 +73,40 @@ test("admin model commands are restricted to the configured Owner, not to privat
   assert.equal(executions, 0);
   assert.match(adapter.sent[0]?.text ?? "", /没有执行此命令的权限/);
   const ownerEvent = event("/model");
-  ownerEvent.sender.userId = "owner";
+  ownerEvent.sender.userId = "admin";
   await router.handle(ownerEvent);
   assert.equal(executions, 1);
   assert.equal(adapter.sent[1]?.text, "model status");
-  const ownerGroupEvent = event("/model", "group", false);
-  ownerGroupEvent.sender.userId = "owner";
-  await router.handle(ownerGroupEvent);
+  const adminGroupEvent = event("/model", "group", false);
+  adminGroupEvent.sender.userId = "admin";
+  await router.handle(adminGroupEvent);
   assert.equal(executions, 2);
   assert.equal(adapter.sent[2]?.text, "model status");
   state.close(); await rm(root, { recursive: true, force: true });
 });
 
-test("System Admin and Owner command allowlists remain independent", async () => {
+test("admin-only and user commands use distinct control policy", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-router-system-admin-"));
   const state = new GatewayState(join(root, "gateway.sqlite"));
   const adapter = new Adapter();
   let executions = 0;
   const commands = new CommandRegistry();
   commands.register({ name: "admin-op", permission: "admin", kind: "CORE" }, async () => { executions++; return { text: "admin ok" }; });
-  commands.register({ name: "owner-op", permission: "owner", kind: "CORE" }, async () => { executions++; return { text: "owner ok" }; });
+  commands.register({ name: "user-op", permission: "user", kind: "CORE" }, async () => { executions++; return { text: "user ok" }; });
   const isolatedConfig = { ...config, systemAdmins: [{ platform: "qq", accountId: "a", userId: "administrator" }] };
   const router = new Router(isolatedConfig, adapter, state, commands, new AgentActionRegistry(), { deliver: async () => {} }, logger);
-  const ownerAdminAttempt = event("/admin-op"); ownerAdminAttempt.sender.userId = "owner";
-  await router.handle(ownerAdminAttempt);
+  const ordinaryAdminAttempt = event("/admin-op"); ordinaryAdminAttempt.sender.userId = "ordinary";
+  await router.handle(ordinaryAdminAttempt);
   assert.equal(executions, 0);
   const adminEvent = event("/admin-op"); adminEvent.sender.userId = "administrator";
   await router.handle(adminEvent);
   assert.equal(executions, 1);
-  const adminOwnerAttempt = event("/owner-op"); adminOwnerAttempt.sender.userId = "administrator";
-  await router.handle(adminOwnerAttempt);
-  assert.equal(executions, 1);
-  const ownerEvent = event("/owner-op"); ownerEvent.sender.userId = "owner";
-  await router.handle(ownerEvent);
+  const adminUserAttempt = event("/user-op"); adminUserAttempt.sender.userId = "administrator";
+  await router.handle(adminUserAttempt);
   assert.equal(executions, 2);
+  const ordinaryUserEvent = event("/user-op"); ordinaryUserEvent.sender.userId = "ordinary";
+  await router.handle(ordinaryUserEvent);
+  assert.equal(executions, 3);
   state.close(); await rm(root, { recursive: true, force: true });
 });
 

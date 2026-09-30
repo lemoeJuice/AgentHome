@@ -4,6 +4,8 @@
 > 上位设计：`AGENT_HOME_DESIGN.md`  
 > 相关设计：`MAIN_WORKER_ORCHESTRATION_DESIGN.md`、`TASK_RUNTIME_DESIGN.md`、`MEMORY_SYSTEM_DESIGN.md`、`EXTERNAL_PLUGIN_COMMAND_DESIGN.md`、`ARTIFACT_FILE_DESIGN.md`
 
+> 当前身份基线见 `PRINCIPAL_WORKSPACE_SYSTEM_ADMIN_DESIGN.md`：普通能力适用于所有 Principal；System Admin 仅用于 Main/Control Plane 管理操作。本文历史 Owner/Guest trust 分支已废弃。
+
 ---
 
 # 1. 目标

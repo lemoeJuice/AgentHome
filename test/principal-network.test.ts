@@ -10,3 +10,9 @@ test("Principal egress permits only the configured host proxy before blocking pr
   const noProxyRules = buildPrincipalEgressRules(20_000, 60_000, "nameserver 10.0.2.3\n");
   assert.equal(noProxyRules.includes(proxyRule), false);
 });
+
+test("Principal egress includes provisioned identities outside the new UID allocation range", () => {
+  const rules = buildPrincipalEgressRules(20_000, 60_000, "nameserver 10.0.2.3\n", "http://host.containers.internal:17890", [10_001]);
+  assert.ok(rules.includes("meta skuid { 10001, 20000-60000 } ip daddr 169.254.1.2 tcp dport 17890 accept"));
+  assert.ok(rules.includes("meta skuid { 10001, 20000-60000 } ip daddr { 0.0.0.0/8"));
+});

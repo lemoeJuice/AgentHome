@@ -1,12 +1,11 @@
 import { chmod, chown, unlink } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
-import type { CapabilitySet, ConversationAddress, JsonValue, PlatformMessageRef, TaskRequester, Trust } from "../shared/types.js";
+import type { CapabilitySet, ConversationAddress, JsonValue, PlatformMessageRef, TaskRequester } from "../shared/types.js";
 
 export interface RuntimeToolContext {
   conversationId: string;
   requesterId: string;
   requester: TaskRequester;
-  trust: Trust;
   address: ConversationAddress;
   capabilities: CapabilitySet;
   eventId?: string;

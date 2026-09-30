@@ -1,14 +1,14 @@
 import { createHash } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { OWNER_PRINCIPAL_ID, type PrincipalService } from "../src/runtime/principals.js";
+import type { PrincipalService } from "../src/runtime/principals.js";
 
 export function createTaskTestPrincipals(root: string): PrincipalService {
   const keys = new Map<string, string>();
   const roots = new Map<string, string>();
   const identity = (principalId: string) => {
     const hash = Number.parseInt(createHash("sha256").update(principalId).digest("hex").slice(0, 8), 16);
-    return { principalId, runtimeUid: principalId === OWNER_PRINCIPAL_ID ? 10_001 : 20_000 + hash % 40_001, runtimeGid: principalId === OWNER_PRINCIPAL_ID ? 10_001 : 20_000 + hash % 40_001 };
+    return { principalId, runtimeUid: 20_000 + hash % 40_001, runtimeGid: 20_000 + hash % 40_001 };
   };
   const principalRoot = (principalId: string) => {
     let path = roots.get(principalId);
@@ -18,15 +18,14 @@ export function createTaskTestPrincipals(root: string): PrincipalService {
   const workspaceRoot = (conversationId: string) => join(root, "test-workspaces", createHash("sha256").update(conversationId).digest("hex"));
   const ensureDir = async (path: string) => { await mkdir(path, { recursive: true, mode: 0o700 }); return path; };
   return {
-    resolveIdentity(platform, accountId, userId, owners = []) {
+    resolveIdentity(platform, accountId, userId) {
       const key = `${platform}\0${accountId}\0${userId}`;
       let principalId = keys.get(key);
       if (!principalId) {
-        const owner = (Array.isArray(owners) ? owners : [owners]).some((item) => item.platform === platform && item.accountId === accountId && item.userId === userId);
-        principalId = owner && ![...keys.values()].includes(OWNER_PRINCIPAL_ID) ? OWNER_PRINCIPAL_ID : `principal_${createHash("sha256").update(key).digest("hex").slice(0, 24)}`;
+        principalId = `principal_${createHash("sha256").update(key).digest("hex").slice(0, 24)}`;
         keys.set(key, principalId);
       }
-      return { principalId, trust: (principalId === OWNER_PRINCIPAL_ID ? "OWNER" : "GUEST") as "OWNER" | "GUEST" };
+      return { principalId };
     },
     get: identity,
     async ensurePrincipalDirectories(principalId) {

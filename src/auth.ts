@@ -1,36 +1,25 @@
-import type { CapabilitySet, ConversationAddress, MemoryScope, RequesterContext, Trust } from "./shared/types.js";
+import type { CapabilitySet, ConversationAddress, MemoryScope, RequesterContext } from "./shared/types.js";
 
 export interface PluginCapabilityPolicy {
   allowedActions?: string[];
   allowedPermissions?: string[];
-  guestAllowedActions?: string[];
-  guestAllowedPermissions?: string[];
-  guestTaskExecutionEnabled?: boolean;
 }
 
-export type OwnerIdentity = { platform: string; accountId: string; userId: string };
-
-export function deriveCapabilities(requester: RequesterContext, conversation: ConversationAddress, owners: OwnerIdentity | OwnerIdentity[] | undefined, conversationId: string, policy: PluginCapabilityPolicy = {}): CapabilitySet {
-  const configuredOwners = owners ? (Array.isArray(owners) ? owners : [owners]) : [];
-  const isOwnerIdentity = configuredOwners.some((owner) => requester.platform === owner.platform && requester.accountId === owner.accountId && requester.userId === owner.userId);
-  const isOwner = requester.trust === "OWNER" && isOwnerIdentity;
-  const trust: Trust = isOwner ? "OWNER" : "GUEST";
+export function deriveCapabilities(requester: RequesterContext, _conversation: ConversationAddress, conversationId: string, policy: PluginCapabilityPolicy = {}): CapabilitySet {
   const principalScope = requester.principalId ?? requester.userId;
   const baseScopes: MemoryScope[] = [`user:${principalScope}`, `workspace:${conversationId}`];
-  if (trust === "OWNER") baseScopes.push("global_agent");
-  if (trust === "OWNER" && conversation.kind === "private") baseScopes.push("owner_private");
-  const canCreate = trust === "OWNER" || policy.guestTaskExecutionEnabled === true;
-  const allowedActions = trust === "OWNER" ? policy.allowedActions : policy.guestAllowedActions;
-  const allowedPermissions = trust === "OWNER" ? policy.allowedPermissions : policy.guestAllowedPermissions;
+  const canCreate = true;
+  const allowedActions = policy.allowedActions;
+  const allowedPermissions = policy.allowedPermissions;
   return {
     memory: { allowedScopes: baseScopes },
-    // Requester permissions follow the authenticated identity. Conversation-scoped
-    // Memory and chat destinations remain bounded separately below.
+    // All principals follow the same capability policy. Conversation and Principal
+    // scopes bound the execution independently of system-administrator controls.
     projects: canCreate ? [{ projectId: "*", access: "WRITE" }] : [],
     qq: { readConversations: [conversationId], sendConversations: [conversationId] },
     plugins: { allowedActions: [...new Set(allowedActions ?? [])], ...(allowedPermissions ? { allowedPermissions: [...new Set(allowedPermissions)] } : {}) },
     artifacts: { readableArtifactAuthorities: ["agent-home"], publishTaskIds: canCreate ? ["*"] : [], allowedDestinations: [conversationId] },
-    tasks: { canCreate, visibleTaskIds: [], canCancel: trust === "OWNER" || canCreate, canFollowUp: true },
+    tasks: { canCreate, visibleTaskIds: [], canCancel: true, canFollowUp: true },
   };
 }
 
@@ -47,7 +36,7 @@ export function validateCapabilitySet(value: unknown): CapabilitySet {
     if (!Array.isArray(candidate) || candidate.some((item) => typeof item !== "string" || !item)) throw new Error(error);
     return [...new Set(candidate)];
   };
-  const allowedScopes = strings(memory?.allowedScopes, "CAPABILITY_MEMORY_INVALID").filter((scope): scope is MemoryScope => /^(global_agent|owner_private|user:[^\s]+|group:[^\s]+|workspace:[^\s]+|project:[^\s]+)$/.test(scope));
+  const allowedScopes = strings(memory?.allowedScopes, "CAPABILITY_MEMORY_INVALID").filter((scope): scope is MemoryScope => /^(user|workspace):[^\s]+$/.test(scope));
   if (allowedScopes.length !== strings(memory?.allowedScopes, "CAPABILITY_MEMORY_INVALID").length) throw new Error("CAPABILITY_MEMORY_INVALID");
   if (!Array.isArray(projects) || projects.some((item) => !item || typeof item !== "object" || typeof (item as Record<string, unknown>).projectId !== "string" || !(item as Record<string, unknown>).projectId || !["READ", "WRITE"].includes(String((item as Record<string, unknown>).access)))) throw new Error("CAPABILITY_PROJECT_INVALID");
   const normalizedProjects = (projects as Array<Record<string, unknown>>).map((item) => ({ projectId: item.projectId as string, access: item.access as "READ" | "WRITE" }));

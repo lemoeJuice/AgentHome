@@ -12,29 +12,30 @@ test("bootstrap initializes private state and schema without provider credential
     const child = spawn(process.execPath, ["--experimental-strip-types", "--experimental-loader", "./scripts/ts-loader.mjs", "src/cli.ts", "bootstrap"], { cwd: process.cwd(), env: { ...process.env, AGENT_HOME_STATE: root }, stdio: ["pipe", "pipe", "pipe"] });
     let output = "";
     child.stdout.on("data", (chunk) => { output += String(chunk); });
-    child.stdin.end(JSON.stringify({ format: "agent-home-bootstrap", version: 1, instanceId: "test", owners: [{ platform: "qq", userId: "owner-1" }, { platform: "qq", userId: "owner-2" }], systemAdmins: [{ platform: "qq", userId: "owner-1" }], snowluma: { endpoint: "ws://snowluma:3001" } }));
+    child.stdin.end(JSON.stringify({ format: "agent-home-bootstrap", version: 1, instanceId: "test", systemAdmins: [{ platform: "qq", userId: "admin-1" }], snowluma: { endpoint: "ws://snowluma:3001" } }));
     const exitCode = await new Promise<number>((resolve) => child.once("exit", (code) => resolve(code ?? 1)));
     assert.equal(exitCode, 0);
-    const config = JSON.parse(await readFile(join(root, "config/bootstrap.json"), "utf8")) as { snowluma: { apiEndpoint: string }; owners: Array<{ userId: string }> };
+    const config = JSON.parse(await readFile(join(root, "config/bootstrap.json"), "utf8")) as { snowluma: { apiEndpoint: string }; systemAdmins: Array<{ userId: string }> };
     assert.equal(config.snowluma.apiEndpoint, "http://127.0.0.1:3000");
-    assert.deepEqual(config.owners.map((owner) => owner.userId), ["owner-1", "owner-2"]);
+    assert.deepEqual(config.systemAdmins.map((admin) => admin.userId), ["admin-1"]);
     const db = new SqliteStore(join(root, "data/agent.db"));
-    assert.equal(db.get<{ version: number }>("SELECT max(version) AS version FROM schema_migrations")?.version, 23);
+    assert.equal(db.get<{ version: number }>("SELECT max(version) AS version FROM schema_migrations")?.version, 24);
     db.close();
   } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test("bootstrap accepts a deployment without an Owner", async () => {
+test("bootstrap accepts a deployment without configured System Admin identities", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-bootstrap-no-owner-"));
   try {
     const child = spawn(process.execPath, ["--experimental-strip-types", "--experimental-loader", "./scripts/ts-loader.mjs", "src/cli.ts", "bootstrap"], { cwd: process.cwd(), env: { ...process.env, AGENT_HOME_STATE: root }, stdio: ["pipe", "pipe", "pipe"] });
-    child.stdin.end(JSON.stringify({ format: "agent-home-bootstrap", version: 1, instanceId: "no-owner", owners: [], systemAdmins: [], snowluma: { endpoint: "ws://snowluma:3001" } }));
+    child.stdin.end(JSON.stringify({ format: "agent-home-bootstrap", version: 1, instanceId: "no-admin", snowluma: { endpoint: "ws://snowluma:3001" } }));
     const exitCode = await new Promise<number>((resolve) => child.once("exit", (code) => resolve(code ?? 1)));
     assert.equal(exitCode, 0);
-    const config = JSON.parse(await readFile(join(root, "config/bootstrap.json"))) as { owners?: unknown };
-    assert.deepEqual(config.owners, []);
+    const config = JSON.parse(await readFile(join(root, "config/bootstrap.json"))) as { systemAdmins?: unknown };
+    assert.equal("systemAdmins" in config, true);
+    assert.deepEqual(config.systemAdmins, []);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

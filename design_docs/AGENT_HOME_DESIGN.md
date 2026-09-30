@@ -8,6 +8,8 @@
 > 当前 QQ Adapter：SnowLuma / OneBot  
 > 当前容器基线：Rootless Podman
 
+> 当前身份基线：所有普通执行使用 Principal + Conversation Workspace；不存在 Owner/Guest 执行角色。System Admin 仅授权 Main/Control Plane 管理操作。身份与 Memory 的具体模型以 `PRINCIPAL_WORKSPACE_SYSTEM_ADMIN_DESIGN.md` 和 `UID_GID_MEMORY_DESIGN.md` 为准；本文及其他详细设计中冲突的 Owner/Guest 段落均为历史描述。
+
 ---
 
 # 1. 文档层级与实现阅读顺序
@@ -16,25 +18,28 @@
 
 以下详细设计文档属于实现时的必读规范：
 
-1. [`MEMORY_SYSTEM_DESIGN.md`](./MEMORY_SYSTEM_DESIGN.md)  
-   负责长期记忆系统的内部模型、公共接口、Canonical/Derived Data、Scope、Provenance、Temporal Validity、Export/Import。
+1. [`PRINCIPAL_WORKSPACE_SYSTEM_ADMIN_DESIGN.md`](./PRINCIPAL_WORKSPACE_SYSTEM_ADMIN_DESIGN.md) 与 [`UID_GID_MEMORY_DESIGN.md`](./UID_GID_MEMORY_DESIGN.md)
+   负责当前 Principal/Workspace/System Admin、UID/GID、个人/Workspace Memory 身份模型。
 
-2. [`AGENT_HOME_CONTAINER_CONTROL_DESIGN.md`](./AGENT_HOME_CONTAINER_CONTROL_DESIGN.md)  
+2. [`MEMORY_SYSTEM_DESIGN.md`](./MEMORY_SYSTEM_DESIGN.md)
+   负责长期记忆系统内部的 Canonical/Derived Data、Provenance、Temporal Validity、Export/Import；旧角色 Scope 仅作历史背景。
+
+3. [`AGENT_HOME_CONTAINER_CONTROL_DESIGN.md`](./AGENT_HOME_CONTAINER_CONTROL_DESIGN.md)
    负责 Rootless Podman、Agent Home 容器边界、Router→Controller→Control Stream、`/state`、备份恢复、迁移，以及 SnowLuma 真实适配要求。
 
-3. [`MAIN_WORKER_ORCHESTRATION_DESIGN.md`](./MAIN_WORKER_ORCHESTRATION_DESIGN.md)  
+4. [`MAIN_WORKER_ORCHESTRATION_DESIGN.md`](./MAIN_WORKER_ORCHESTRATION_DESIGN.md)
    负责 Main logical identity、Conversation Session、Main/Worker/Pi 编排、多 Worker、Worker progress/question/result 与 Main user-facing response。
 
-4. [`EXTERNAL_PLUGIN_COMMAND_DESIGN.md`](./EXTERNAL_PLUGIN_COMMAND_DESIGN.md)  
+5. [`EXTERNAL_PLUGIN_COMMAND_DESIGN.md`](./EXTERNAL_PLUGIN_COMMAND_DESIGN.md)
    负责 Bot Gateway、Router、Control/Direct Command、加载式 Plugin、CommandRegistry、AgentActionRegistry、Gateway MCP、Router persistence 与 Direct Command context bridge。
 
-5. [`TASK_RUNTIME_DESIGN.md`](./TASK_RUNTIME_DESIGN.md)  
+6. [`TASK_RUNTIME_DESIGN.md`](./TASK_RUNTIME_DESIGN.md)
    负责 durable Task/Worker execution semantics：状态机、Mailbox、PendingQuestion、MessageBinding、取消、process ownership、project lock、restart recovery、事务边界与 RuntimeException。
 
-6. [`AUTHORIZATION_CAPABILITY_DESIGN.md`](./AUTHORIZATION_CAPABILITY_DESIGN.md)  
-   负责 Identity / Trust / Capability、Conversation boundary、capability propagation/attenuation、confused-deputy prevention，以及 Memory/Project/QQ/Plugin/Task/Artifact 的确定性授权边界。
+7. [`AUTHORIZATION_CAPABILITY_DESIGN.md`](./AUTHORIZATION_CAPABILITY_DESIGN.md)
+   负责 Principal identity / Capability、Conversation boundary、capability propagation/attenuation、confused-deputy prevention，以及各资源的确定性授权边界；不定义 Owner/Guest 等执行角色。
 
-7. [`ARTIFACT_FILE_DESIGN.md`](./ARTIFACT_FILE_DESIGN.md)  
+8. [`ARTIFACT_FILE_DESIGN.md`](./ARTIFACT_FILE_DESIGN.md)
    负责 QQ inbound file/image、Agent/Worker/Gateway Plugin Artifact、文件注册/发布/发送权限、路径验证、跨 filesystem transfer 与 retention。
 
 实现 Agent 在修改以下领域之前必须先阅读对应详细设计：
@@ -59,7 +64,7 @@ Task / WorkerExecution / Mailbox / PendingQuestion /
 Cancellation / Process / Lock / Recovery / RuntimeException
 → TASK_RUNTIME_DESIGN.md
 
-Identity / Owner / Guest / Capability / Permission /
+Principal / System Admin / Capability / Permission /
 Memory scope / Project access / QQ access / Plugin Action permission
 → AUTHORIZATION_CAPABILITY_DESIGN.md
 
@@ -78,7 +83,8 @@ Upload / Download / Send file
 - `MAIN_WORKER_ORCHESTRATION_DESIGN.md` 拥有：消息进入 Main 之后的 Main/Worker/Pi 多 Agent 编排与 user-facing response 语义。
 - `EXTERNAL_PLUGIN_COMMAND_DESIGN.md` 拥有：Host-side Router/Controller/SnowLuma 分层、Direct Command、Gateway 加载式插件、Command/Action Registry 与 MCP bridge。
 - `TASK_RUNTIME_DESIGN.md` 拥有：Task/Worker durable state、Mailbox、PendingQuestion、MessageBinding、取消、恢复、锁与 RuntimeException。
-- `AUTHORIZATION_CAPABILITY_DESIGN.md` 拥有：Identity/Trust/Capability、权限传播、Conversation scope 与各资源边界的 deterministic authorization。
+- `PRINCIPAL_WORKSPACE_SYSTEM_ADMIN_DESIGN.md` 与 `UID_GID_MEMORY_DESIGN.md` 拥有：当前 Principal/Workspace/System Admin 身份模型与 UID/GID/Memory scopes。
+- `AUTHORIZATION_CAPABILITY_DESIGN.md` 拥有：Principal/Capability、权限传播、Conversation scope 与各资源边界的 deterministic authorization；不授予 Owner/Guest 级别权限。
 - `ARTIFACT_FILE_DESIGN.md` 拥有：文件/Artifact 生命周期、路径安全、跨域 transfer、publish/send 权限和 retention。
 - `IMPLEMENTATION_LOG.md` 只记录实现事实、临时方案和偏差，**不能推翻设计文档**。
 

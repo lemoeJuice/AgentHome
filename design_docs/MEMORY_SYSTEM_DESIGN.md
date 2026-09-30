@@ -1,5 +1,7 @@
 # Memory System Design
 
+> 当前身份与 Scope 基线见 `PRINCIPAL_WORKSPACE_SYSTEM_ADMIN_DESIGN.md` 和 `UID_GID_MEMORY_DESIGN.md`。本文较早版本中 `owner_private`、`global_agent`、Owner/Guest 信任层级等设计已过时；当前 Memory 仅按 `user:<principal-id>` 与 `workspace:<conversation-id>` 授权，不使用执行角色。
+
 > 独立记忆系统设计文档  
 > 适用于 Agent Home，但不依赖 Agent Home 的其他内部实现  
 > 目标：长期可迁移、可解释、可演化、低耦合的个人 Agent Memory
