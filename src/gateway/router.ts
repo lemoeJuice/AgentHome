@@ -1,4 +1,4 @@
-import { configuredOwners, type AppConfig } from "../config.js";
+import { configuredOwners, configuredSystemAdmins, type AppConfig } from "../config.js";
 import { newId, nowIso, messageKey, conversationKey } from "../shared/ids.js";
 import type { ChatEvent, ChatPlatformAdapter, ControllerEventEnvelope, ConversationAddress, JsonValue, OutgoingMessage, PlatformMessageRef, SendResult } from "../shared/types.js";
 import type { Logger } from "../shared/logger.js";
@@ -6,9 +6,10 @@ import { GatewayState } from "./state.js";
 import { CommandRegistry, type CommandContext, type CommandResult, AgentActionRegistry } from "./registry.js";
 import { GatewayArtifactService } from "./artifacts.js";
 
-function commandAllowed(permission: string, event: ChatEvent, owners: NonNullable<AppConfig["owners"]>): boolean {
+function commandAllowed(permission: string, event: ChatEvent, owners: NonNullable<AppConfig["owners"]>, systemAdmins: NonNullable<AppConfig["owners"]>): boolean {
   if (!permission) return false;
-  if (permission === "owner" || permission === "admin" || permission.startsWith("owner.")) {
+  if (permission === "admin") return systemAdmins.some((admin) => event.sender.platform === admin.platform && event.sender.accountId === admin.accountId && event.sender.userId === admin.userId);
+  if (permission === "owner" || permission.startsWith("owner.")) {
     return owners.some((owner) => event.sender.platform === owner.platform && event.sender.accountId === owner.accountId && event.sender.userId === owner.userId);
   }
   return permission === "user" || permission === "public" || permission.startsWith("command.");
@@ -82,7 +83,7 @@ export class Router {
       await this.adapter.sendMessage(event.conversation, { text: `未知命令 /${name}。发送 /help 查看可用命令。`, replyTo: event.message.ref });
       return;
     }
-    if (!commandAllowed(route.definition.permission, event, configuredOwners(this.config))) {
+    if (!commandAllowed(route.definition.permission, event, configuredOwners(this.config), configuredSystemAdmins(this.config))) {
       this.audit("command.execute", "DENY", "COMMAND_PERMISSION_DENIED", name, event.sender.userId, conversationId);
       await this.adapter.sendMessage(event.conversation, { text: "当前身份没有执行此命令的权限。", replyTo: event.message.ref });
       return;

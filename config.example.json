@@ -7,6 +7,13 @@
       "userId": "123456"
     }
   ],
+  "systemAdmins": [
+    {
+      "platform": "qq",
+      "accountId": "default",
+      "userId": "123456"
+    }
+  ],
   "gateway": {
     "mcpPort": 8787,
     "mcpActionTimeoutMs": 30000

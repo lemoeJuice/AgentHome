@@ -85,6 +85,31 @@ test("admin model commands are restricted to the configured Owner, not to privat
   state.close(); await rm(root, { recursive: true, force: true });
 });
 
+test("System Admin and legacy Owner command allowlists can be independent", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-home-router-system-admin-"));
+  const state = new GatewayState(join(root, "gateway.sqlite"));
+  const adapter = new Adapter();
+  let executions = 0;
+  const commands = new CommandRegistry();
+  commands.register({ name: "admin-op", permission: "admin", kind: "CORE" }, async () => { executions++; return { text: "admin ok" }; });
+  commands.register({ name: "owner-op", permission: "owner", kind: "CORE" }, async () => { executions++; return { text: "owner ok" }; });
+  const isolatedConfig = { ...config, systemAdmins: [{ platform: "qq", accountId: "a", userId: "administrator" }] };
+  const router = new Router(isolatedConfig, adapter, state, commands, new AgentActionRegistry(), { deliver: async () => {} }, logger);
+  const ownerAdminAttempt = event("/admin-op"); ownerAdminAttempt.sender.userId = "owner";
+  await router.handle(ownerAdminAttempt);
+  assert.equal(executions, 0);
+  const adminEvent = event("/admin-op"); adminEvent.sender.userId = "administrator";
+  await router.handle(adminEvent);
+  assert.equal(executions, 1);
+  const adminOwnerAttempt = event("/owner-op"); adminOwnerAttempt.sender.userId = "administrator";
+  await router.handle(adminOwnerAttempt);
+  assert.equal(executions, 1);
+  const ownerEvent = event("/owner-op"); ownerEvent.sender.userId = "owner";
+  await router.handle(ownerEvent);
+  assert.equal(executions, 2);
+  state.close(); await rm(root, { recursive: true, force: true });
+});
+
 test("help lists runtime and Gateway commands and reports the active @ rule", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-router-help-"));
   const state = new GatewayState(join(root, "gateway.sqlite"));
