@@ -15,7 +15,6 @@ RUN npm run build
 COPY src/runtime/principal-exec.c /tmp/principal-exec.c
 RUN gcc -O2 -Wall -Wextra -o /usr/local/bin/agent-home-principal-exec /tmp/principal-exec.c \
   && chmod 755 /usr/local/bin/agent-home-principal-exec \
-  && ln -s agent-home-principal-exec /usr/local/bin/agent-home-guest-exec \
   && useradd --create-home --uid 10001 agent \
   && mkdir -p /state /cache /scratch /run/agent-home \
   && chmod 711 /state \

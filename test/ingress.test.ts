@@ -13,10 +13,16 @@ import type { CapabilitySet, ConversationAddress, PlatformMessageRef } from "../
 
 const logger = { child: () => logger, info() {}, warn() {}, error() {}, debug() {} } as unknown as Logger;
 
+function runtimeTestConfig(config: AppConfig): AppConfig {
+  const legacyTestOwner = (config as AppConfig & { owner?: { platform: string; accountId: string; userId: string } }).owner;
+  const owners = config.owners ?? (legacyTestOwner ? [legacyTestOwner] : []);
+  return { ...config, owners, systemAdmins: config.systemAdmins ?? owners };
+}
+
 test("runtime ingress is enqueue-before-ACK and deduplicated", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-runtime-"));
   const config = { instanceId: "test", owner: { platform: "qq", accountId: "a", userId: "owner" }, paths: { gatewayState: join(root, "gateway.sqlite"), pluginData: join(root, "plugins"), backupDir: join(root, "backups"), stateRoot: root, runtimeSocket: join(root, "run.sock") }, snowluma: { accountId: "a", endpoint: "ws://127.0.0.1:1", apiEndpoint: "http://127.0.0.1:1", accessTokenEnv: "NO_TOKEN", reverseWebSocketPath: "/ws", reconnectMs: 10, requestTimeoutMs: 10 }, chat: { global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, conversationOverrides: {} }, runtime: { maxInFlight: 2, maxWorkers: 1, maxArtifactBytes: 100000, piCommand: "missing-pi", piTimeoutMs: 100 }, plugins: { enabled: [] }, logging: { level: "error" } } as AppConfig;
-  const runtime = new RuntimeApp(config, logger);
+  const runtime = new RuntimeApp(runtimeTestConfig(config), logger);
   const event = { protocolVersion: 1 as const, eventId: "evt-1", instanceId: "test", type: "chat.message" as const, occurredAt: new Date().toISOString(), source: { platform: "qq", accountId: "a", adapter: "test" }, trustedIdentity: { userId: "owner" }, conversation: { conversationId: "external", address: { platform: "qq", accountId: "a", kind: "private" as const, platformConversationId: "owner", threadId: null } }, message: { ref: { platform: "qq", accountId: "a", platformConversationId: "owner", threadId: null, messageId: "m" }, replyTo: null }, payload: { text: "hello" } };
   const first = await runtime.receive(event);
   const second = await runtime.receive(event);
@@ -33,7 +39,7 @@ test("runtime ingress is enqueue-before-ACK and deduplicated", async () => {
 test("principal binding is explicit and group scope stays separate from Owner requester trust", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-principal-binding-"));
   const config = { instanceId: "principal-binding", owner: { platform: "qq", accountId: "a", userId: "owner" }, paths: { gatewayState: join(root, "gateway.sqlite"), pluginData: join(root, "plugins"), backupDir: join(root, "backups"), stateRoot: root, runtimeSocket: join(root, "run.sock") }, snowluma: { accountId: "a", endpoint: "ws://127.0.0.1:1", apiEndpoint: "http://127.0.0.1:1", accessTokenEnv: "NO_TOKEN", reverseWebSocketPath: "/ws", reconnectMs: 10, requestTimeoutMs: 10 }, chat: { global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, conversationOverrides: {} }, runtime: { maxInFlight: 2, maxWorkers: 1, maxArtifactBytes: 100000, piCommand: "missing-pi", piTimeoutMs: 100 }, plugins: { enabled: [] }, logging: { level: "error" } } as AppConfig;
-  const runtime = new RuntimeApp(config, logger);
+  const runtime = new RuntimeApp(runtimeTestConfig(config), logger);
   const internals = runtime as unknown as {
     resolvePrincipalIdentity: (platform: string, accountId: string, userId: string) => { principalId: string; trust: "OWNER" | "GUEST" };
     bindPlatformIdentity: (actor: { platform: string; accountId: string; userId: string }, target: { platform: string; accountId: string; userId: string }) => void;
@@ -76,7 +82,7 @@ test("runtime control socket is private and rejects unauthenticated peers", asyn
   const config = { instanceId: "test-auth", owner: { platform: "qq", accountId: "a", userId: "owner" }, paths: { gatewayState: join(root, "gateway.sqlite"), pluginData: join(root, "plugins"), backupDir: join(root, "backups"), stateRoot: root, runtimeSocket: socketPath }, snowluma: { accountId: "a", endpoint: "ws://127.0.0.1:1", apiEndpoint: "http://127.0.0.1:1", accessTokenEnv: "NO_TOKEN", reverseWebSocketPath: "/ws", reconnectMs: 10, requestTimeoutMs: 10 }, chat: { global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, conversationOverrides: {} }, runtime: { maxInFlight: 2, maxWorkers: 1, maxArtifactBytes: 100000, piCommand: "missing-pi", piTimeoutMs: 100 }, plugins: { enabled: [] }, logging: { level: "error" } } as AppConfig;
   const previous = process.env.AGENT_HOME_CONTROL_TOKEN;
   process.env.AGENT_HOME_CONTROL_TOKEN = "test-control-token";
-  const runtime = new RuntimeApp(config, logger);
+  const runtime = new RuntimeApp(runtimeTestConfig(config), logger);
   try {
     await runtime.start();
     assert.equal((await stat(socketPath)).mode & 0o777, 0o600);
@@ -98,7 +104,7 @@ test("runtime control socket is private and rejects unauthenticated peers", asyn
 test("main turns are durable and serialized per conversation", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-main-queue-"));
   const config = { instanceId: "main-queue", owner: { platform: "qq", accountId: "a", userId: "owner" }, paths: { gatewayState: join(root, "gateway.sqlite"), pluginData: join(root, "plugins"), backupDir: join(root, "backups"), stateRoot: root, runtimeSocket: join(root, "run.sock") }, snowluma: { accountId: "a", endpoint: "ws://127.0.0.1:1", apiEndpoint: "http://127.0.0.1:1", accessTokenEnv: "NO_TOKEN", reverseWebSocketPath: "/ws", reconnectMs: 10, requestTimeoutMs: 10 }, chat: { global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, conversationOverrides: {} }, runtime: { maxInFlight: 2, maxWorkers: 1, maxArtifactBytes: 100000, piCommand: "missing-pi", piTimeoutMs: 100 }, plugins: { enabled: [] }, logging: { level: "error" } } as AppConfig;
-  const runtime = new RuntimeApp(config, logger);
+  const runtime = new RuntimeApp(runtimeTestConfig(config), logger);
   const prompts: string[] = [];
   const sentTexts: string[] = [];
   let retryablePromptAttempts = 0;
@@ -126,7 +132,7 @@ test("main turns are durable and serialized per conversation", async () => {
     assert.equal(ownerContext?.requester.principalId, "principal:owner");
     assert.ok(ownerContext);
     const task = runtime.tasks.createTask({ title: "visible task", goal: "visible task", requester: ownerContext.requester, trust: "OWNER", originConversationId: ownerContext.conversationId, notificationConversationId: ownerContext.conversationId, parentCapabilities: ownerContext.capabilities });
-    assert.ok(runtime.tasks.listTasks(ownerContext.conversationId, ownerContext.capabilities, ownerContext.requesterId, ownerContext.requester.principalId).some((item) => item.id === task.id));
+    assert.ok(runtime.tasks.listTasks(ownerContext.conversationId, ownerContext.capabilities, ownerContext.requester.principalId).some((item) => item.id === task.id));
     await internals.processMainTurnJob({ kind: "TASK_EVENT", taskId: task.id, eventType: "TASK_RESULT", payload: { outcome: "COMPLETED", summary: "verified worker result" } });
     assert.match(prompts.at(-1) ?? "", /调用 finish_task/);
     assert.match(prompts.at(-1) ?? "", new RegExp(task.id.slice(-8)));
@@ -158,14 +164,14 @@ test("runtime outbound intents recover after failed delivery", async () => {
     internals.pi = { createSession: async (path) => ({ sessionId: "main-session", sessionPath: path }), send: async () => "response", stop: async () => {} };
     internals.qq = { sendMessage: async () => { if (fail) throw new Error("DELIVERY_FAILED"); return { message: { platform: "qq", accountId: "a", platformConversationId: "owner", threadId: null, messageId: "outbound-reply" }, accepted: true }; } };
   };
-  const first = new RuntimeApp(config, logger); installFakes(first, true);
+  const first = new RuntimeApp(runtimeTestConfig(config), logger); installFakes(first, true);
   try {
     await first.start(); await first.receive(event);
     for (let index = 0; index < 100 && (first.db.get<{ count: number }>("SELECT count(*) AS count FROM runtime_outbound_intents WHERE status='PENDING'")?.count ?? 0) < 2; index += 1) await new Promise((resolve) => setTimeout(resolve, 5));
     assert.equal(first.db.get<{ count: number }>("SELECT count(*) AS count FROM runtime_outbound_intents WHERE status='PENDING'")?.count, 2, JSON.stringify({ intents: first.db.all("SELECT id,status,last_error FROM runtime_outbound_intents"), queue: first.db.all("SELECT id,status,error FROM main_turn_queue") }));
     first.db.run("UPDATE runtime_outbound_intents SET status='DELIVERING',lease_until=?", "2020-01-01T00:00:00.000Z");
   } finally { await first.stop(); }
-  const second = new RuntimeApp(config, logger); installFakes(second, false);
+  const second = new RuntimeApp(runtimeTestConfig(config), logger); installFakes(second, false);
   try {
     await second.start();
     assert.equal(second.db.get<{ count: number }>("SELECT count(*) AS count FROM runtime_outbound_intents WHERE status='ACKED'")?.count, 2, JSON.stringify(second.db.all("SELECT id,status,attempts,last_error,lease_until FROM runtime_outbound_intents")));
@@ -175,7 +181,7 @@ test("runtime outbound intents recover after failed delivery", async () => {
 test("Main uses native SnowLuma actions and on-demand stream downloads become Artifacts", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-main-qq-tools-"));
   const config = { instanceId: "main-qq-tools", owner: { platform: "qq", accountId: "a", userId: "owner" }, paths: { gatewayState: join(root, "gateway.sqlite"), pluginData: join(root, "plugins"), backupDir: join(root, "backups"), stateRoot: root, runtimeSocket: join(root, "run.sock") }, snowluma: { accountId: "a", endpoint: "ws://127.0.0.1:1", apiEndpoint: "http://127.0.0.1:1", accessTokenEnv: "NO_TOKEN", reverseWebSocketPath: "/ws", reconnectMs: 10, requestTimeoutMs: 10 }, chat: { global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, conversationOverrides: {} }, runtime: { maxInFlight: 2, maxWorkers: 1, maxArtifactBytes: 100000, piCommand: "missing-pi", piTimeoutMs: 100 }, plugins: { enabled: [] }, logging: { level: "error" } } as AppConfig;
-  const runtime = new RuntimeApp(config, logger);
+  const runtime = new RuntimeApp(runtimeTestConfig(config), logger);
   const address: ConversationAddress = { platform: "qq", accountId: "a", kind: "group", platformConversationId: "group-1", threadId: null };
   const otherAddress: ConversationAddress = { ...address, platformConversationId: "group-2" };
   const ref: PlatformMessageRef = { platform: "qq", accountId: "a", platformConversationId: "group-1", threadId: null, messageId: "42" };
@@ -243,7 +249,7 @@ test("runtime backup quiesce blocks intake until finish", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-backup-quiesce-"));
   const config = { instanceId: "backup-quiesce", owner: { platform: "qq", accountId: "a", userId: "owner" }, paths: { gatewayState: join(root, "gateway.sqlite"), pluginData: join(root, "plugins"), backupDir: join(root, "backups"), stateRoot: root, runtimeSocket: join(root, "run.sock") }, snowluma: { accountId: "a", endpoint: "ws://127.0.0.1:1", apiEndpoint: "http://127.0.0.1:1", accessTokenEnv: "NO_TOKEN", reverseWebSocketPath: "/ws", reconnectMs: 10, requestTimeoutMs: 10 }, chat: { global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, conversationOverrides: {} }, runtime: { maxInFlight: 2, maxWorkers: 1, maxArtifactBytes: 100000, piCommand: "missing-pi", piTimeoutMs: 100 }, plugins: { enabled: [] }, logging: { level: "error" } } as AppConfig;
   const event = { protocolVersion: 1 as const, eventId: "backup-event", instanceId: "backup-quiesce", type: "chat.message" as const, occurredAt: new Date().toISOString(), source: { platform: "qq", accountId: "a", adapter: "test" }, trustedIdentity: { userId: "owner" }, conversation: { conversationId: "external", address: { platform: "qq", accountId: "a", kind: "private" as const, platformConversationId: "owner", threadId: null } }, message: { ref: { platform: "qq", accountId: "a", platformConversationId: "owner", threadId: null, messageId: "backup-message" }, replyTo: null }, payload: { text: "backup" } };
-  const first = new RuntimeApp(config, logger);
+  const first = new RuntimeApp(runtimeTestConfig(config), logger);
   try {
     await first.start();
     assert.deepEqual(await first.backupPrepare(), { status: "quiesced" });
@@ -251,7 +257,7 @@ test("runtime backup quiesce blocks intake until finish", async () => {
     assert.deepEqual(await first.backupFinish(), { status: "running" });
     assert.equal((await first.receive(event)).status, "accepted");
   } finally { await first.stop(); }
-  const second = new RuntimeApp(config, logger);
+  const second = new RuntimeApp(runtimeTestConfig(config), logger);
   try {
     await second.start();
     assert.equal((await second.receive({ ...event, eventId: "backup-event-2" })).status, "accepted");
@@ -261,7 +267,7 @@ test("runtime backup quiesce blocks intake until finish", async () => {
 test("task replay refuses a notification destination outside its persisted capability", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-task-notification-"));
   const config = { instanceId: "task-notification", owner: { platform: "qq", accountId: "a", userId: "owner" }, paths: { gatewayState: join(root, "gateway.sqlite"), pluginData: join(root, "plugins"), backupDir: join(root, "backups"), stateRoot: root, runtimeSocket: join(root, "run.sock") }, snowluma: { accountId: "a", endpoint: "ws://127.0.0.1:1", apiEndpoint: "http://127.0.0.1:1", accessTokenEnv: "NO_TOKEN", reverseWebSocketPath: "/ws", reconnectMs: 10, requestTimeoutMs: 10 }, chat: { global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, conversationOverrides: {} }, runtime: { maxInFlight: 2, maxWorkers: 1, maxArtifactBytes: 100000, piCommand: "missing-pi", piTimeoutMs: 100 }, plugins: { enabled: [] }, logging: { level: "error" } } as AppConfig;
-  const runtime = new RuntimeApp(config, logger);
+  const runtime = new RuntimeApp(runtimeTestConfig(config), logger);
   const internals = runtime as unknown as { onTaskEvent: (event: unknown, task: unknown) => Promise<void> };
   const caps = { memory: { allowedScopes: ["global_agent"] }, projects: [], qq: { readConversations: ["allowed"], sendConversations: ["allowed"] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: ["agent-home"], publishTaskIds: [], allowedDestinations: ["allowed"] }, tasks: { canCreate: true, visibleTaskIds: [], canCancel: true, canFollowUp: true } };
   const task = runtime.tasks.createTask({ title: "notification", goal: "notification", requester: { platform: "qq", accountId: "a", userId: "owner" }, trust: "OWNER", originConversationId: "allowed", notificationConversationId: "allowed", parentCapabilities: caps });

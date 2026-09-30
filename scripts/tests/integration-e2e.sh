@@ -13,7 +13,7 @@ CONTAINER="$AGENT_HOME_CONTAINER"
 "$PODMAN" info >/dev/null
 [[ "$($PODMAN container inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)" == true ]] || { printf '%s\n' "Agent Home container is not running: $CONTAINER" >&2; exit 2; }
 
-bash "$ROOT_DIR/scripts/tests/guest-isolation.sh"
+bash "$ROOT_DIR/scripts/tests/principal-isolation.sh"
 
 PI_VERSION="$($PODMAN exec "$CONTAINER" pi --version)"
 printf 'Pi: %s\n' "$PI_VERSION"

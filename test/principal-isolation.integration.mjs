@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { chown, chmod, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
@@ -11,13 +10,12 @@ import { PrincipalService } from "/app/dist/runtime/principals.js";
 
 const nonce = randomBytes(8).toString("hex");
 const stateRoot = "/state";
-const databasePath = join(stateRoot, "data", `guest-isolation-${nonce}.sqlite`);
+const databasePath = join(stateRoot, "data", `principal-isolation-${nonce}.sqlite`);
 const database = new SqliteStore(databasePath);
 migrate(database, runtimeMigrations);
 const principals = new PrincipalService(database, stateRoot);
-principals.backfillRuntimeIds();
-const a = principals.resolveIdentity("guest-isolation", nonce, `a-${nonce}`);
-const b = principals.resolveIdentity("guest-isolation", nonce, `b-${nonce}`);
+const a = principals.resolveIdentity("principal-isolation", nonce, `a-${nonce}`);
+const b = principals.resolveIdentity("principal-isolation", nonce, `b-${nonce}`);
 let dirsA;
 let dirsB;
 let systemSecret;
@@ -25,12 +23,8 @@ let modelSecret;
 let ownerTestRoot;
 
 const principalExecHelper = "/usr/local/bin/agent-home-principal-exec";
-const helper = existsSync(principalExecHelper) ? principalExecHelper : "/usr/local/bin/agent-home-guest-exec";
 const runIdentity = (uid, gid, command, cwd, env = process.env, timeout = 90_000) => {
-  const identityArgs = helper === principalExecHelper
-    ? [String(uid), String(gid), String(gid), "60", "17179869184", "64", "536870912", "--", "/bin/bash", "-c", command]
-    : [String(uid), String(gid), "60", "17179869184", "64", "536870912", "--", "/bin/bash", "-c", command];
-  const result = spawnSync(helper, identityArgs, {
+  const result = spawnSync(principalExecHelper, [String(uid), String(gid), String(gid), "60", "17179869184", "64", "536870912", "--", "/bin/bash", "-c", command], {
     cwd,
     env,
     encoding: "utf8",
@@ -41,7 +35,7 @@ const runIdentity = (uid, gid, command, cwd, env = process.env, timeout = 90_000
 };
 const runAs = (principal, command, cwd, timeout = 90_000) => {
   const identity = principals.get(principal.principalId);
-  return runIdentity(identity.runtimeUid, identity.runtimeGid, command, cwd, principals.guestProcessEnvironment(principal.principalId), timeout);
+  return runIdentity(identity.runtimeUid, identity.runtimeGid, command, cwd, principals.principalProcessEnvironment(principal.principalId), timeout);
 };
 
 try {
@@ -60,11 +54,11 @@ try {
   await chown(ownerTestRoot, 10001, 10001);
   await chownTree(ownerTestRoot, 10001, 10001);
   const ownerEnv = { ...process.env, HOME: ownerHome, USER: "agent", LOGNAME: "agent", NPM_CONFIG_CACHE: join(ownerTestRoot, "cache", "npm"), NPM_CONFIG_PREFIX: join(ownerHome, ".npm-global"), TMPDIR: join(ownerHome, "tmp") };
-  assert.deepEqual(principals.resolveIdentity("guest-isolation", nonce, `a-${nonce}`), a);
+  assert.deepEqual(principals.resolveIdentity("principal-isolation", nonce, `a-${nonce}`), a);
   assert.notEqual(principals.get(a.principalId).runtimeUid, principals.get(b.principalId).runtimeUid);
   assert.equal((await readFile("/proc/self/uid_map", "utf8")).includes("65536"), true, "outer user namespace must map the Principal UID range");
 
-  systemSecret = join(stateRoot, "secrets", `guest-isolation-${nonce}`);
+  systemSecret = join(stateRoot, "secrets", `principal-isolation-${nonce}`);
   await writeFile(systemSecret, "controller-secret\n", { mode: 0o600 });
   await chmod(systemSecret, 0o600);
   await chown(systemSecret, 0, 0);
@@ -148,7 +142,7 @@ try {
   if (dirsB) await rm(dirsB.root, { recursive: true, force: true });
   if (systemSecret) await rm(systemSecret, { force: true }).catch(() => undefined);
   if (modelSecret) await rm(modelSecret, { force: true }).catch(() => undefined);
-  database.run("DELETE FROM platform_identities WHERE platform=? AND account_id=?", "guest-isolation", nonce);
+    database.run("DELETE FROM platform_identities WHERE platform=? AND account_id=?", "principal-isolation", nonce);
   database.run("DELETE FROM principals WHERE principal_id IN (?,?)", a.principalId, b.principalId);
   database.close();
   await rm(databasePath, { force: true });

@@ -355,7 +355,7 @@ export class PiCliHarness implements PiHarness {
       // Node 22's bundled Pi undici/llhttp WebAssembly parser needs a 128 GiB
       // virtual-address ceiling at full CLI startup; this is RLIMIT_AS, not an RSS cap.
       const principalExec = launcherUid !== undefined && launcherGid !== undefined && (launcherUid !== globalThis.process.getuid?.() || launcherGid !== globalThis.process.getgid?.());
-      const command = principalExec ? globalThis.process.env.AGENT_HOME_PRINCIPAL_EXEC_COMMAND ?? globalThis.process.env.AGENT_HOME_GUEST_EXEC_COMMAND ?? "/usr/local/bin/agent-home-principal-exec" : invocation.command;
+      const command = principalExec ? globalThis.process.env.AGENT_HOME_PRINCIPAL_EXEC_COMMAND ?? "/usr/local/bin/agent-home-principal-exec" : invocation.command;
       const args = principalExec
         ? [String(launcherUid), String(launcherGid), String(launcherGid), String(options.sandbox?.launcherCpuSeconds ?? 3600), String(options.sandbox?.launcherMemoryBytes ?? 128 * 1024 * 1024 * 1024), String(options.sandbox?.launcherPids ?? 512), String(options.sandbox?.launcherMaxFileBytes ?? 2 * 1024 * 1024 * 1024), "--", invocation.command, ...invocation.args]
         : invocation.args;

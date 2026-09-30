@@ -14,7 +14,7 @@ export interface ExecutionContext {
   capabilities: CapabilitySet;
   workspace: string;
   workspaceAccess: "READ" | "WRITE";
-  executionProfile: "PRINCIPAL_READ_ONLY" | "PRINCIPAL_READ_WRITE" | "LEGACY_READ_ONLY" | "LEGACY_READ_WRITE" | "LEGACY_UNSCOPED";
+  executionProfile: "PRINCIPAL_READ_ONLY" | "PRINCIPAL_READ_WRITE";
   contextSource: "durable-worker-record";
   home: string;
   sessionId?: string;

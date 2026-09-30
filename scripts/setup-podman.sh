@@ -74,7 +74,6 @@ build_without_overlay_context() (
   "$PODMAN" exec --workdir /app "$build_container" npm run build
   "$PODMAN" exec "$build_container" gcc -O2 -Wall -Wextra -o /usr/local/bin/agent-home-principal-exec /tmp/principal-exec.c
   "$PODMAN" exec "$build_container" chmod 755 /usr/local/bin/agent-home-principal-exec
-  "$PODMAN" exec "$build_container" ln -sf agent-home-principal-exec /usr/local/bin/agent-home-guest-exec
   "$PODMAN" exec "$build_container" sh -c 'useradd --create-home --uid 10001 agent && mkdir -p /state /cache /scratch /run/agent-home && chmod 711 /state && chmod 700 /cache /scratch /run/agent-home'
   "$PODMAN" exec "$build_container" sh -c "printf '%s\\n' '#!/bin/sh' 'exec node /app/dist/cli.js \"\$@\"' > /usr/local/bin/agent-home && chmod 755 /usr/local/bin/agent-home"
   "$PODMAN" commit --pause=false \
