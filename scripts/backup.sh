@@ -45,7 +45,7 @@ fi
 if [[ -f "$AGENT_HOME_RUNTIME_DIR/gateway.sqlite" ]]; then
   node --input-type=module -e 'import { DatabaseSync } from "node:sqlite"; const db=new DatabaseSync(process.argv[1]); db.exec("PRAGMA wal_checkpoint(TRUNCATE)"); db.close();' "$AGENT_HOME_RUNTIME_DIR/gateway.sqlite"
 fi
-RUNTIME_SCHEMA_VERSION="${AGENT_HOME_SCHEMA_VERSION:-19}"
+RUNTIME_SCHEMA_VERSION="${AGENT_HOME_SCHEMA_VERSION:-22}"
 GATEWAY_SCHEMA_VERSION="$(node --input-type=module -e 'import { DatabaseSync } from "node:sqlite"; try { const db=new DatabaseSync(process.argv[1], { readOnly: true }); process.stdout.write(String(db.prepare("SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations").get().version ?? 0)); db.close(); } catch { process.stdout.write("0"); }' "$AGENT_HOME_RUNTIME_DIR/gateway.sqlite")"
 "$PODMAN" volume export "$VOLUME" -o "$DEST/state.tar"
 "$PODMAN" image exists "$AGENT_HOME_IMAGE" || { printf '%s\n' "agent home image is not available: $AGENT_HOME_IMAGE" >&2; exit 2; }
@@ -73,7 +73,7 @@ IMAGE="$AGENT_HOME_IMAGE"
 import fs from "node:fs";
 import crypto from "node:crypto";
 
-const [manifestPath, ...files] = process.argv.slice(1);
+const [manifestPath, ...files] = process.argv.slice(2);
 const hash = (path) => fs.existsSync(path) ? crypto.createHash("sha256").update(fs.readFileSync(path)).digest("hex") : undefined;
 const manifest = {
   format: "agent-home-deployment",

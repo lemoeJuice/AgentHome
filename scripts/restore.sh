@@ -16,7 +16,7 @@ STAGING_VOLUME="${VOLUME}.restore-${STAMP}"
 OLD_VOLUME="${VOLUME}.pre-restore-${STAMP}"
 
 validate_manifest() {
-  CURRENT_RUNTIME_SCHEMA_VERSION="${AGENT_HOME_SCHEMA_VERSION:-19}" \
+  CURRENT_RUNTIME_SCHEMA_VERSION="${AGENT_HOME_SCHEMA_VERSION:-22}" \
   CURRENT_GATEWAY_SCHEMA_VERSION="${AGENT_HOME_GATEWAY_SCHEMA_VERSION:-6}" \
   node --input-type=module - \
     "$BACKUP/manifest.json" "$BACKUP/state.tar" "$BACKUP/image.tar" "$BACKUP/gateway.sqlite" \
@@ -26,7 +26,7 @@ validate_manifest() {
 import fs from "node:fs";
 import crypto from "node:crypto";
 
-const [manifestPath, ...files] = process.argv.slice(1);
+const [manifestPath, ...files] = process.argv.slice(2);
 const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
 const runtime = Number(process.env.CURRENT_RUNTIME_SCHEMA_VERSION);
 const gateway = Number(process.env.CURRENT_GATEWAY_SCHEMA_VERSION);
