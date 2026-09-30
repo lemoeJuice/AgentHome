@@ -441,7 +441,6 @@ test("Owner and Guest Workers persist the same Principal-brokered execution mode
       assert.equal(execution.taskId, task.id);
       assert.equal(execution.workerId, worker.id);
       assert.equal(execution.principalId, principalId);
-      assert.equal(execution.role, trust);
       assert.equal(execution.uid, 30001);
       assert.equal(execution.gid, 30001);
       assert.equal(execution.workspaceId, "default");

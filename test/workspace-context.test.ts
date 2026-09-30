@@ -98,7 +98,6 @@ test("Guest default Worker profile is writable and Pi tool dispatch keeps Princi
     const expectedWorkspace = await principals.ensureConversationWorkspacePath("conversation", "default");
     assert.equal(execution.taskId, task.id);
     assert.equal(execution.principalId, requester.principalId);
-    assert.equal(execution.role, "GUEST");
     assert.equal(execution.uid, 30001);
     assert.equal(execution.gid, 30001);
     assert.equal(execution.workspaceId, "default");

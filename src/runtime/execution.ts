@@ -1,4 +1,4 @@
-import type { CapabilitySet, Trust } from "../shared/types.js";
+import type { CapabilitySet } from "../shared/types.js";
 
 /** Runtime-authenticated authority snapshot for one Worker execution. */
 export interface ExecutionContext {
@@ -10,7 +10,6 @@ export interface ExecutionContext {
   workspaceScopeId?: string;
   uid: number;
   gid: number;
-  role: Trust;
   capabilities: CapabilitySet;
   workspace: string;
   workspaceAccess: "READ" | "WRITE";
