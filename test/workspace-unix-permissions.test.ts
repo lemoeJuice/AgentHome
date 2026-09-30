@@ -25,14 +25,18 @@ test("workspace group and umask allow different Principals to create and edit sh
       assert.equal(result.status, 0, result.stderr);
       assert.deepEqual(result.stdout.trim().split(/\s+/).map(Number).sort((a, b) => a - b), [principal.gid, workspaceGid].sort((a, b) => a - b));
     };
-    run(principalA, "printf A > from-a");
-    run(principalB, "printf B >> from-a; printf B > from-b");
-    run(principalA, "printf A >> from-b");
-    for (const name of ["from-a", "from-b"]) {
+    run(principalA, "printf A > from-a; mkdir -p tools; printf A > tools/read-image.ts");
+    run(principalB, "printf B >> from-a; printf B > from-b; printf B >> tools/read-image.ts");
+    run(principalA, "printf A >> from-b; printf A >> tools/read-image.ts");
+    for (const name of ["from-a", "from-b", "tools/read-image.ts"]) {
       const info = await stat(join(workspace, name));
       assert.equal(info.gid, workspaceGid);
       assert.ok((info.mode & 0o660) === 0o660);
     }
+    const tools = await stat(join(workspace, "tools"));
+    assert.equal(tools.gid, workspaceGid);
+    assert.equal(tools.mode & 0o2000, 0o2000);
+    assert.ok((tools.mode & 0o770) === 0o770);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
