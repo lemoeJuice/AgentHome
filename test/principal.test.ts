@@ -36,6 +36,7 @@ test("Principal runtime identities are stable, unique and independent of platfor
     assert.equal(a.runtimeGid, a.runtimeUid);
     assert.deepEqual(new PrincipalService(db, root).get(first.principalId), a);
     assert.equal(service.principalMemoryPath(first.principalId), join(root, "principals", `uid-${a.runtimeUid}`, "home", ".agent", "memory"));
+    assert.equal(service.workspaceMemoryPath("conversation-a", "default"), join(service.conversationWorkspacePath("conversation-a", "default"), ".agent", "memory"));
     const proxyEnvironment = service.principalProcessEnvironment(first.principalId, "http://host.containers.internal:17890");
     assert.equal(proxyEnvironment.HTTP_PROXY, "http://host.containers.internal:17890");
     assert.equal(proxyEnvironment.https_proxy, "http://host.containers.internal:17890");
