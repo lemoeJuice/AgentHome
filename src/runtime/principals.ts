@@ -110,7 +110,7 @@ export class PrincipalService {
       while (gid <= maxGid && used.has(gid)) gid++;
       if (gid > maxGid) throw new Error("CONVERSATION_WORKSPACE_GID_RANGE_EXHAUSTED");
       if (row) this.db.run("UPDATE conversation_workspaces SET runtime_uid=?,runtime_gid=? WHERE conversation_id=?", row.runtime_uid, gid, conversationId);
-      else this.db.run("INSERT INTO conversation_workspaces(conversation_id,runtime_uid,runtime_gid,created_at) VALUES (?,?,?,?)", gid, gid, nowIso());
+       else this.db.run("INSERT INTO conversation_workspaces(conversation_id,runtime_uid,runtime_gid,created_at) VALUES (?,?,?,?)", conversationId, gid, gid, nowIso());
       return { uid: row?.runtime_uid ?? gid, gid };
     });
     const key = createHash("sha256").update(conversationId).digest("hex");

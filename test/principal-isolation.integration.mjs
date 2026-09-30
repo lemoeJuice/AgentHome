@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { chown, chmod, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { SqliteStore, migrate } from "/app/dist/db.js";
 import { runtimeMigrations } from "/app/dist/schema.js";
 import { PrincipalService } from "/app/dist/runtime/principals.js";
@@ -18,13 +18,19 @@ const a = principals.resolveIdentity("principal-isolation", nonce, `a-${nonce}`)
 const b = principals.resolveIdentity("principal-isolation", nonce, `b-${nonce}`);
 let dirsA;
 let dirsB;
+let workspaceA;
+let workspaceB;
+let workspaceGidA;
+let workspaceGidB;
 let systemSecret;
 let modelSecret;
 let ownerTestRoot;
 
 const principalExecHelper = "/usr/local/bin/agent-home-principal-exec";
-const runIdentity = (uid, gid, command, cwd, env = process.env, timeout = 90_000) => {
-  const result = spawnSync(principalExecHelper, [String(uid), String(gid), String(gid), "60", "17179869184", "64", "536870912", "--", "/bin/bash", "-c", command], {
+const workspaceGroups = new Map();
+const workspaceGidForPath = (cwd) => [...workspaceGroups].find(([root]) => cwd === root || cwd.startsWith(`${root}/`))?.[1] ?? 0;
+const runIdentity = (uid, gid, command, cwd, env = process.env, timeout = 90_000, workspaceGid = 0) => {
+  const result = spawnSync(principalExecHelper, [String(uid), String(gid), String(workspaceGid), "60", "17179869184", "64", "536870912", "--", "/bin/bash", "-c", command], {
     cwd,
     env,
     encoding: "utf8",
@@ -35,14 +41,24 @@ const runIdentity = (uid, gid, command, cwd, env = process.env, timeout = 90_000
 };
 const runAs = (principal, command, cwd, timeout = 90_000) => {
   const identity = principals.get(principal.principalId);
-  return runIdentity(identity.runtimeUid, identity.runtimeGid, command, cwd, principals.principalProcessEnvironment(principal.principalId), timeout);
+  return runIdentity(identity.runtimeUid, identity.runtimeGid, command, cwd, principals.principalProcessEnvironment(principal.principalId), timeout, workspaceGidForPath(cwd));
 };
 
 try {
   dirsA = await principals.ensurePrincipalDirectories(a.principalId);
   dirsB = await principals.ensurePrincipalDirectories(b.principalId);
-  const workspaceA = await principals.workspacePath(a.principalId, "default");
-  const workspaceB = await principals.workspacePath(b.principalId, "default");
+  const timestamp = new Date().toISOString();
+  for (const conversationId of ["conversation-x", "conversation-y"]) database.run("INSERT INTO conversations(conversation_id,platform,account_id,kind,platform_conversation_id,thread_id_json,trust,memory_scopes_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)", conversationId, "principal-isolation", nonce, "group", conversationId, "null", "GUEST", JSON.stringify([`workspace:${conversationId}`]), timestamp, timestamp);
+  workspaceA = await principals.ensureConversationWorkspacePath("conversation-x", "default");
+  workspaceB = await principals.ensureConversationWorkspacePath("conversation-y", "default");
+  workspaceGidA = (await principals.ensureConversationWorkspace("conversation-x")).gid;
+  workspaceGidB = (await principals.ensureConversationWorkspace("conversation-y")).gid;
+  workspaceGroups.set(workspaceA, workspaceGidA);
+  workspaceGroups.set(workspaceB, workspaceGidB);
+  assert.equal(workspaceA, await principals.ensureConversationWorkspacePath("conversation-x", "default"));
+  assert.notEqual(workspaceA, workspaceB);
+  assert.equal(database.get("SELECT 1 FROM conversation_workspaces WHERE conversation_id=? AND runtime_gid=?", "conversation-x", workspaceGidA) !== undefined, true);
+  assert.notEqual(workspaceGidA, workspaceGidB);
   ownerTestRoot = join(stateRoot, "principals", `principal_integration_owner_${nonce}`);
   const ownerHome = join(ownerTestRoot, "home");
   const ownerWorkspace = join(ownerTestRoot, "projects", "default");
@@ -67,28 +83,38 @@ try {
   await chmod(modelSecret, 0o600);
   await chown(modelSecret, 10002, 10002);
   const otherFile = join(workspaceB, "private.txt");
-  await writeFile(otherFile, "guest-b-private\n", { mode: 0o600 });
-  await chown(otherFile, principals.get(b.principalId).runtimeUid, principals.get(b.principalId).runtimeGid);
+  await writeFile(otherFile, "principal-b-private\n", { mode: 0o600 });
+  await chown(otherFile, principals.get(b.principalId).runtimeUid, workspaceGidB);
+  const privateFile = join(dirsB.home, "private.txt");
+  await writeFile(privateFile, "principal-b-home\n", { mode: 0o600 });
+  await chown(privateFile, principals.get(b.principalId).runtimeUid, principals.get(b.principalId).runtimeGid);
 
-  const identityProbe = runAs(a, `node -e 'const fs=require("node:fs");fs.writeFileSync("hello.txt","principal-persistent\\n");const denied=(p)=>{try{fs.readFileSync(p);return false}catch{return true}};console.log(JSON.stringify({uid:process.getuid(),gid:process.getgid(),groups:process.getgroups(),own:fs.readFileSync("hello.txt","utf8").trim(),otherDenied:denied(${JSON.stringify(otherFile)}),databaseDenied:denied("/state/data/agent.db"),secretsDenied:denied(${JSON.stringify(systemSecret)}),runtimeSocketDenied:denied("/run/agent-home/control.sock")}))'`, workspaceA);
+  assert.equal(runAs(a, "printf A > shared.txt", workspaceA).status, 0);
+  assert.equal(runAs(b, "printf B >> shared.txt; printf B > from-b.txt", workspaceA).status, 0);
+  assert.equal(runAs(a, "printf A >> from-b.txt", workspaceA).status, 0);
+  for (const name of ["shared.txt", "from-b.txt"]) assert.equal((await stat(join(workspaceA, name))).gid, workspaceGidA);
+
+  const identityProbe = runAs(a, `node -e 'const fs=require("node:fs");fs.writeFileSync("hello.txt","principal-persistent\\n");const denied=(p)=>{try{fs.readFileSync(p);return false}catch{return true}};console.log(JSON.stringify({uid:process.getuid(),gid:process.getgid(),groups:process.getgroups(),own:fs.readFileSync("hello.txt","utf8").trim(),otherDenied:denied(${JSON.stringify(otherFile)}),personalDenied:denied(${JSON.stringify(privateFile)}),databaseDenied:denied("/state/data/agent.db"),secretsDenied:denied(${JSON.stringify(systemSecret)}),runtimeSocketDenied:denied("/run/agent-home/control.sock")}))'`, workspaceA);
   assert.equal(identityProbe.status, 0, identityProbe.stderr);
   const identity = JSON.parse(identityProbe.stdout.trim());
   assert.equal(identity.uid, principals.get(a.principalId).runtimeUid);
   assert.equal(identity.gid, principals.get(a.principalId).runtimeGid);
-  assert.equal(identity.groups.includes(0), false, "Guest must not inherit the Controller group");
+  assert.equal(identity.groups.includes(0), false, "Worker must not inherit the Main group");
+  assert.deepEqual(identity.groups, [workspaceGidA], "Worker must receive only its current Workspace supplementary GID");
   assert.equal(identity.own, "principal-persistent");
   assert.equal(identity.otherDenied, true);
+  assert.equal(identity.personalDenied, true);
   assert.equal(identity.databaseDenied, true);
   assert.equal(identity.secretsDenied, true);
   assert.equal(identity.runtimeSocketDenied, true);
 
-  const ownerProbe = runIdentity(10001, 10001, `node -e 'const fs=require("node:fs");const denied=(p)=>{try{fs.readFileSync(p);return false}catch{return true}};fs.writeFileSync("owner.txt","owner-workspace");console.log(JSON.stringify({uid:process.getuid(),gid:process.getgid(),own:fs.readFileSync("owner.txt","utf8"),guestDenied:denied(${JSON.stringify(otherFile)}),databaseDenied:denied("/state/data/agent.db"),modelSecretDenied:denied(${JSON.stringify(modelSecret)}),socketDenied:denied("/run/agent-home/control.sock")}))'`, ownerWorkspace, ownerEnv);
+  const ownerProbe = runIdentity(10001, 10001, `node -e 'const fs=require("node:fs");const denied=(p)=>{try{fs.readFileSync(p);return false}catch{return true}};fs.writeFileSync("owner.txt","owner-workspace");console.log(JSON.stringify({uid:process.getuid(),gid:process.getgid(),own:fs.readFileSync("owner.txt","utf8"),principalDenied:denied(${JSON.stringify(otherFile)}),databaseDenied:denied("/state/data/agent.db"),modelSecretDenied:denied(${JSON.stringify(modelSecret)}),socketDenied:denied("/run/agent-home/control.sock")}))'`, ownerWorkspace, ownerEnv);
   assert.equal(ownerProbe.status, 0, ownerProbe.stderr);
   const ownerIdentity = JSON.parse(ownerProbe.stdout.trim());
   assert.equal(ownerIdentity.uid, 10001);
   assert.equal(ownerIdentity.gid, 10001);
   assert.equal(ownerIdentity.own, "owner-workspace");
-  assert.equal(ownerIdentity.guestDenied, true);
+  assert.equal(ownerIdentity.principalDenied, true);
   assert.equal(ownerIdentity.databaseDenied, true);
   assert.equal(ownerIdentity.modelSecretDenied, true);
   assert.equal(ownerIdentity.socketDenied, true);
@@ -100,18 +126,19 @@ try {
   assert.equal(runAs(a, `cat ${JSON.stringify(modelSecret)}`, workspaceA).status, 1, "Guest prompt-injection style read must fail at the filesystem boundary");
 
   const npmProject = join(workspaceA, "npm-project");
-  await mkdir(npmProject, { mode: 0o700 });
-  await chown(npmProject, principals.get(a.principalId).runtimeUid, principals.get(a.principalId).runtimeGid);
+  await mkdir(npmProject, { mode: 0o2770 });
+  await chown(npmProject, 0, workspaceGidA);
+  await chmod(npmProject, 0o2770);
   const packageJson = join(npmProject, "package.json");
   const buildScript = join(npmProject, "build.cjs");
   await writeFile(packageJson, JSON.stringify({ name: "guest-project", version: "1.0.0", scripts: { build: "node build.cjs" } }));
   await writeFile(buildScript, 'require("node:fs").writeFileSync("built.txt", "ok")\n');
-  await chown(packageJson, principals.get(a.principalId).runtimeUid, principals.get(a.principalId).runtimeGid);
-  await chown(buildScript, principals.get(a.principalId).runtimeUid, principals.get(a.principalId).runtimeGid);
+  await chown(packageJson, principals.get(a.principalId).runtimeUid, workspaceGidA);
+  await chown(buildScript, principals.get(a.principalId).runtimeUid, workspaceGidA);
   const npm = runAs(a, "npm install --offline --no-audit --no-fund && npm run build && node --version && npm --version && python3 --version && git --version && (go version || true) && stat -c '%n %u:%g' built.txt", npmProject);
   assert.equal(npm.status, 0, npm.stderr);
   assert.ok(npm.stdout.includes("built.txt"), npm.stdout);
-  assert.ok(npm.stdout.includes(`${principals.get(a.principalId).runtimeUid}:${principals.get(a.principalId).runtimeGid}`), npm.stdout);
+  assert.ok(npm.stdout.includes(`${principals.get(a.principalId).runtimeUid}:${workspaceGidA}`), npm.stdout);
 
   const laterTask = runAs(a, `test "$(cat hello.txt)" = "principal-persistent" && test -f ${JSON.stringify(join(npmProject, "built.txt"))}`, workspaceA);
   assert.equal(laterTask.status, 0, laterTask.stderr);
@@ -135,9 +162,11 @@ try {
   assert.equal(privateNetwork.status, 0, privateNetwork.stderr);
   assert.match(privateNetwork.stdout, /private-egress-blocked/);
 
-  console.log(JSON.stringify({ ownerGuestUnifiedUidPath: "passed", modelCredentialIsolation: "passed", principalPersistence: "passed", systemStateDenied: "passed", ownerNpmInstallBuild: "passed", guestNpmInstallBuild: "passed", publicNetwork: "passed", privateNetworkBlocked: "passed", optionalGo: spawnSync("go", ["version"], { encoding: "utf8" }).status === 0 ? "installed" : "not installed in image" }));
+  console.log(JSON.stringify({ distinctPrincipalUids: "passed", sharedConversationWorkspaceGid: "passed", isolatedConversationWorkspaceGid: "passed", personalStateIsolation: "passed", modelCredentialIsolation: "passed", systemStateDenied: "passed", collaborativeFileModes: "passed", principalNpmInstallBuild: "passed", publicNetwork: "passed", privateNetworkBlocked: "passed", optionalGo: spawnSync("go", ["version"], { encoding: "utf8" }).status === 0 ? "installed" : "not installed in image" }));
 } finally {
   if (ownerTestRoot) await rm(ownerTestRoot, { recursive: true, force: true });
+  if (workspaceA) await rm(dirname(dirname(workspaceA)), { recursive: true, force: true });
+  if (workspaceB) await rm(dirname(dirname(workspaceB)), { recursive: true, force: true });
   if (dirsA) await rm(dirsA.root, { recursive: true, force: true });
   if (dirsB) await rm(dirsB.root, { recursive: true, force: true });
   if (systemSecret) await rm(systemSecret, { force: true }).catch(() => undefined);
