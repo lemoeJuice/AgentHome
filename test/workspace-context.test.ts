@@ -19,7 +19,7 @@ const logger = { child: () => logger, info() {}, warn() {}, error() {}, debug() 
 
 function capabilities(projectAccess: "READ" | "WRITE" = "WRITE"): CapabilitySet {
   return {
-    memory: { allowedScopes: ["global_agent"] },
+    memory: { allowedScopes: ["workspace:conversation"] },
     projects: [{ projectId: "*", access: "WRITE" }],
     qq: { readConversations: ["conversation"], sendConversations: ["conversation"] },
     plugins: { allowedActions: [] },
@@ -31,15 +31,14 @@ function capabilities(projectAccess: "READ" | "WRITE" = "WRITE"): CapabilitySet 
 
 function testConfig(): AppConfig {
   return {
-    owners: [{ platform: "qq", accountId: "default", userId: "owner" }],
     systemAdmins: [{ platform: "qq", accountId: "default", userId: "owner" }],
-    guest: { enabled: true, maxWorkersPerPrincipal: 4, taskTimeoutMs: 30_000, commandTimeoutMs: 5000, cpuSeconds: 60, memoryBytes: 100_000_000, pids: 20, maxFileBytes: 1_000_000, workspaceQuotaBytes: 10_000_000, cacheQuotaBytes: 10_000_000, artifactQuotaBytes: 10_000_000 },
+    principalExecution: { maxWorkersPerPrincipal: 4, taskTimeoutMs: 30_000, commandTimeoutMs: 5000, cpuSeconds: 60, memoryBytes: 16 * 1024 * 1024 * 1024, pids: 20, maxFileBytes: 1_000_000, workspaceQuotaBytes: 10_000_000, cacheQuotaBytes: 10_000_000, artifactQuotaBytes: 10_000_000 },
     runtime: { maxWorkers: 2, maxWorkersTotal: 4, maxWorkersPerProject: 4, maxWorkersPerRequester: 4, maxTasks: 10, maxTasksPerRequester: 5, maxTasksPerPrincipal: 5, maxArtifactBytes: 100_000, piCommand: "pi", piTimeoutMs: 5000, workerSandboxCommand: "bwrap", piAgentDir: "/tmp/pi-agent" },
   } as AppConfig;
 }
 
 function fakePrincipals(root: string): PrincipalService {
-  const principal = (principalId: string) => ({ principalId, runtimeUid: principalId === "principal:owner" ? 10001 : 20001, runtimeGid: principalId === "principal:owner" ? 10001 : 20001, role: principalId === "principal:owner" ? "OWNER" as const : "GUEST" as const });
+  const principal = (principalId: string) => ({ principalId, runtimeUid: 20001, runtimeGid: 20001 });
   const principalRoot = (principalId: string) => join(root, "principals", principalId);
   return {
     get: principal,
@@ -80,7 +79,7 @@ async function createExecHelper(root: string): Promise<string> {
   return helper;
 }
 
-test("Guest default Worker profile is writable and Pi tool dispatch keeps Principal ExecutionContext", async () => {
+test("default Worker profile is writable and Pi tool dispatch keeps Principal ExecutionContext", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-workspace-context-"));
   const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
   const principals = fakePrincipals(root);
@@ -89,7 +88,7 @@ test("Guest default Worker profile is writable and Pi tool dispatch keeps Princi
   const requester: TaskRequester = { platform: "qq", accountId: "default", userId: "guest-user", principalId: "principal_guest-test" };
   const taskCaps = capabilities();
   const service = new TaskService(db, { } as never, new ArtifactService(db, root), config, { workerRoot: root, principals, principalExecCommand: helper }, logger);
-  const task = service.createTask({ title: "write own workspace", goal: "create a file", requester, trust: "GUEST", originConversationId: "conversation", notificationConversationId: "conversation", parentCapabilities: taskCaps });
+  const task = service.createTask({ title: "write own workspace", goal: "create a file", requester, originConversationId: "conversation", notificationConversationId: "conversation", parentCapabilities: taskCaps });
   const workerId = "worker_guest-write";
   const workerCaps = { ...taskCaps, projects: [{ projectId: "default", access: "WRITE" as const }] };
   const timestamp = new Date().toISOString();
@@ -117,7 +116,6 @@ test("Guest default Worker profile is writable and Pi tool dispatch keeps Princi
       conversationId: "conversation",
       requesterId: requester.userId,
       requester,
-      trust: "GUEST",
       address: { platform: "qq", accountId: "default", kind: "private", platformConversationId: requester.userId, threadId: null },
       capabilities: workerCaps,
       taskId: task.id,
@@ -162,7 +160,7 @@ test("Guest default Worker profile is writable and Pi tool dispatch keeps Princi
   }
 });
 
-test("Guest Worker cannot write another Principal workspace and read-only profiles stay read-only", async () => {
+test("Workers cannot write another Principal workspace and read-only profiles stay read-only", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-workspace-isolation-"));
   const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
   const principals = fakePrincipals(root);
@@ -170,7 +168,7 @@ test("Guest Worker cannot write another Principal workspace and read-only profil
   const requester: TaskRequester = { platform: "qq", accountId: "default", userId: "guest", principalId: "principal_guest-isolated" };
   const caps = capabilities();
   const service = new TaskService(db, {} as never, new ArtifactService(db, root), config, { workerRoot: root, principals, principalExecCommand: await createExecHelper(root) }, logger);
-  const task = service.createTask({ title: "isolation", goal: "isolation", requester, trust: "GUEST", originConversationId: "conversation", notificationConversationId: "conversation", parentCapabilities: caps });
+  const task = service.createTask({ title: "isolation", goal: "isolation", requester, originConversationId: "conversation", notificationConversationId: "conversation", parentCapabilities: caps });
   const otherWorkspace = await principals.ensureConversationWorkspacePath("conversation-other", "default");
   const timestamp = new Date().toISOString();
   const insertWorker = (id: string, access: "READ" | "WRITE", projectAccess: "READ" | "WRITE") => {
@@ -199,7 +197,7 @@ test("durable Principal Worker context fails closed and differentiates workspace
   const requester: TaskRequester = { platform: "qq", accountId: "default", userId: "guest", principalId: "principal_guest-recovery" };
   const caps = capabilities();
   const service = new TaskService(db, {} as never, new ArtifactService(db, root), testConfig(), { workerRoot: root, principals, principalExecCommand: await createExecHelper(root) }, logger);
-  const task = service.createTask({ title: "recovered", goal: "recovered", requester, trust: "GUEST", originConversationId: "conversation", notificationConversationId: "conversation", parentCapabilities: caps });
+  const task = service.createTask({ title: "recovered", goal: "recovered", requester, originConversationId: "conversation", notificationConversationId: "conversation", parentCapabilities: caps });
   const timestamp = new Date().toISOString();
   const insert = (id: string, snapshot: CapabilitySet | null) => db.run("INSERT INTO worker_executions(id,task_id,objective,status,harness,workspace_id,workspace_access,capabilities_json,updated_at,principal_id,runtime_uid,runtime_gid,workspace_scope_id,process_mode,workspace_gid) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", id, task.id, id, "RUNNING", "pi", "default", "WRITE", snapshot ? JSON.stringify(snapshot) : null, timestamp, requester.principalId!, 20001, 20001, "conversation:conversation:default", "PRINCIPAL_BROKERED", 30001);
   insert("worker-recovered", { ...caps, projects: [{ projectId: "default", access: "WRITE" }] });

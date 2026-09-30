@@ -14,8 +14,6 @@ import { spawn } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 import { resolveWebSocketEndpoint } from "./qq/onebot.js";
 import { createProxyRelay } from "./proxy-relay.js";
-import { migrateCurrentState } from "./runtime/manual-migration.js";
-import { migrateBootstrapStateConfig } from "./runtime/manual-migration.js";
 
 async function main(): Promise<void> {
   const command = process.argv[2] ?? "help";
@@ -28,14 +26,7 @@ async function main(): Promise<void> {
     await waitForSignal(() => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())));
     return;
   }
-  if (command === "migrate-state") {
-    const stateRoot = process.env.AGENT_HOME_STATE ?? "/state";
-    await migrateBootstrapStateConfig(stateRoot);
-    const config = await loadConfig();
-    process.stdout.write(`${JSON.stringify(await migrateCurrentState(config))}\n`);
-    return;
-  }
-  if (command === "help") { process.stdout.write("agent-home gateway|runtime|control stream|control ping|control backup-prepare|control backup-finish|control set-pi-model <provider> <model>|control set-pi-thinking-level <level>|bootstrap|migrate-state|doctor|status\n"); return; }
+  if (command === "help") { process.stdout.write("agent-home gateway|runtime|control stream|control ping|control backup-prepare|control backup-finish|control set-pi-model <provider> <model>|control set-pi-thinking-level <level>|bootstrap|doctor|status\n"); return; }
   let config: Awaited<ReturnType<typeof loadConfig>>;
   try { config = await loadConfig(); } catch (error) {
     if (command === "doctor" || command === "status") { await doctorUnavailable(String(error)); return; }
@@ -159,7 +150,7 @@ async function loadConfigForState(): Promise<Awaited<ReturnType<typeof loadConfi
     try {
       const value = JSON.parse(await readFile(bootstrap, "utf8")) as Partial<Awaited<ReturnType<typeof loadConfig>>>;
       await mkdir(dirname(bootstrap), { recursive: true });
-        return { ...(value as Awaited<ReturnType<typeof loadConfig>>), paths: { gatewayState: "./.agent-home/runtime-state/gateway.sqlite", pluginData: "./.agent-home/runtime-state/plugin-data", backupDir: "./backups", stateRoot, runtimeSocket: "/run/agent-home/control.sock" }, snowluma: { ...(value.snowluma as Awaited<ReturnType<typeof loadConfig>>["snowluma"]), accountId: "default", reverseWebSocketPath: (value.snowluma as Awaited<ReturnType<typeof loadConfig>>["snowluma"]).reverseWebSocketPath ?? "/onebot/v11/ws", reconnectMs: 2000, requestTimeoutMs: 15000 }, chat: { global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, conversationOverrides: {} }, agent: { persona: typeof value.agent?.persona === "string" ? value.agent.persona : "" }, runtime: { maxInFlight: 16, maxWorkers: 2, maxWorkersTotal: 8, maxWorkersPerProject: 2, maxWorkersPerRequester: 4, maxTasks: 32, maxTasksPerRequester: 8, maxTasksPerPrincipal: 8, maxArtifactBytes: 52428800, piCommand: process.env.PI_COMMAND ?? "pi", piTimeoutMs: 3600000, workerSandboxCommand: process.env.AGENT_HOME_WORKER_SANDBOX ?? "bwrap", piAgentDir: `${stateRoot}/model/pi/agent` }, guest: { enabled: false, maxWorkersPerPrincipal: 1, taskTimeoutMs: 1800000, commandTimeoutMs: 600000, cpuSeconds: 600, memoryBytes: 17179869184, pids: 128, maxFileBytes: 536870912, workspaceQuotaBytes: 2147483648, cacheQuotaBytes: 1073741824, artifactQuotaBytes: 536870912 }, plugins: { enabled: [] }, logging: { level: "info" } };
+        return { ...(value as Awaited<ReturnType<typeof loadConfig>>), paths: { gatewayState: "./.agent-home/runtime-state/gateway.sqlite", pluginData: "./.agent-home/runtime-state/plugin-data", backupDir: "./backups", stateRoot, runtimeSocket: "/run/agent-home/control.sock" }, snowluma: { ...(value.snowluma as Awaited<ReturnType<typeof loadConfig>>["snowluma"]), accountId: "default", reverseWebSocketPath: (value.snowluma as Awaited<ReturnType<typeof loadConfig>>["snowluma"]).reverseWebSocketPath ?? "/onebot/v11/ws", reconnectMs: 2000, requestTimeoutMs: 15000 }, chat: { global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, conversationOverrides: {} }, agent: { persona: typeof value.agent?.persona === "string" ? value.agent.persona : "" }, runtime: { maxInFlight: 16, maxWorkers: 2, maxWorkersTotal: 8, maxWorkersPerProject: 2, maxWorkersPerRequester: 4, maxTasks: 32, maxTasksPerRequester: 8, maxTasksPerPrincipal: 8, maxArtifactBytes: 52428800, piCommand: process.env.PI_COMMAND ?? "pi", piTimeoutMs: 3600000, workerSandboxCommand: process.env.AGENT_HOME_WORKER_SANDBOX ?? "bwrap", piAgentDir: `${stateRoot}/model/pi/agent` }, principalExecution: { maxWorkersPerPrincipal: 1, taskTimeoutMs: 1800000, commandTimeoutMs: 600000, cpuSeconds: 600, memoryBytes: 17179869184, pids: 128, maxFileBytes: 536870912, workspaceQuotaBytes: 2147483648, cacheQuotaBytes: 1073741824, artifactQuotaBytes: 536870912 }, plugins: { enabled: [] }, logging: { level: "info" } };
     } catch { throw error; }
   }
 }

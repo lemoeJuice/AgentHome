@@ -2,15 +2,11 @@ import { chown, chmod, lchown, lstat, mkdir, readdir, realpath } from "node:fs/p
 import { createHash } from "node:crypto";
 import { join, relative, resolve } from "node:path";
 import type { SqliteStore } from "../db.js";
-import type { Trust } from "../shared/types.js";
 import { newId, nowIso } from "../shared/ids.js";
 import { proxyEnvironment } from "./network.js";
 
 export const PRINCIPAL_UID_MIN = 20_000;
 export const PRINCIPAL_UID_MAX = 60_000;
-export const OWNER_PRINCIPAL_ID = "principal:owner";
-export const OWNER_RUNTIME_UID = 10_001;
-export const OWNER_RUNTIME_GID = 10_001;
 export const WORKSPACE_RUNTIME_GID_MIN = 60_001;
 export const WORKSPACE_RUNTIME_GID_MAX = 65_535;
 
@@ -20,7 +16,7 @@ export interface PrincipalRecord {
   runtimeGid: number;
 }
 
-type PrincipalRow = { principal_id: string; trust: Trust; runtime_uid: number | null; runtime_gid: number | null };
+type PrincipalRow = { principal_id: string; runtime_uid: number | null; runtime_gid: number | null };
 
 export class PrincipalService {
   private readonly db: SqliteStore;
@@ -31,34 +27,22 @@ export class PrincipalService {
     this.stateRoot = resolve(stateRoot);
   }
 
-  ensureOwnerPrincipal(): PrincipalRecord {
+  resolveIdentity(platform: string, accountId: string, externalId: string): { principalId: string } {
     return this.db.transaction(() => {
-      const row = this.ensureRuntimeIdentity(OWNER_PRINCIPAL_ID, "OWNER");
-      if (row.runtime_uid === null || row.runtime_gid === null) throw new Error("PRINCIPAL_UID_ASSIGNMENT_FAILED");
-      return { principalId: row.principal_id, runtimeUid: row.runtime_uid, runtimeGid: row.runtime_gid };
-    });
-  }
-
-  resolveIdentity(platform: string, accountId: string, externalId: string, configuredOwners?: { platform: string; accountId: string; userId: string } | Array<{ platform: string; accountId: string; userId: string }>): { principalId: string; trust: Trust } {
-    const owners = configuredOwners ? (Array.isArray(configuredOwners) ? configuredOwners : [configuredOwners]) : [];
-    const isConfiguredOwner = owners.some((owner) => platform === owner.platform && accountId === owner.accountId && externalId === owner.userId);
-    return this.db.transaction(() => {
-      const existing = this.db.get<{ principal_id: string; trust: Trust }>("SELECT p.principal_id,p.trust FROM platform_identities i JOIN principals p ON p.principal_id=i.principal_id WHERE i.platform=? AND i.account_id=? AND i.user_id=?", platform, accountId, externalId);
+      const existing = this.db.get<{ principal_id: string }>("SELECT principal_id FROM platform_identities WHERE platform=? AND account_id=? AND user_id=?", platform, accountId, externalId);
       if (existing) {
-        const trust = isConfiguredOwner ? "OWNER" : existing.trust;
-        this.ensureRuntimeIdentity(existing.principal_id, trust);
-        return { principalId: existing.principal_id, trust };
+        this.ensureRuntimeIdentity(existing.principal_id);
+        return { principalId: existing.principal_id };
       }
-      const ownerIdentityAssigned = Boolean(this.db.get("SELECT 1 AS found FROM platform_identities WHERE principal_id=?", OWNER_PRINCIPAL_ID));
-      const principalId = isConfiguredOwner && !ownerIdentityAssigned ? OWNER_PRINCIPAL_ID : newId("principal");
-      this.ensureRuntimeIdentity(principalId, isConfiguredOwner ? "OWNER" : "GUEST");
+      const principalId = newId("principal");
+      this.ensureRuntimeIdentity(principalId);
       this.db.run("INSERT INTO platform_identities(platform,account_id,user_id,principal_id) VALUES (?,?,?,?)", platform, accountId, externalId, principalId);
-      return { principalId, trust: isConfiguredOwner ? "OWNER" : "GUEST" };
+      return { principalId };
     });
   }
 
   get(principalId: string): PrincipalRecord {
-    const row = this.db.get<PrincipalRow>("SELECT principal_id,trust,runtime_uid,runtime_gid FROM principals WHERE principal_id=?", principalId);
+    const row = this.db.get<PrincipalRow>("SELECT principal_id,runtime_uid,runtime_gid FROM principals WHERE principal_id=?", principalId);
     if (!row || row.runtime_uid === null || row.runtime_gid === null) throw new Error("PRINCIPAL_NOT_PROVISIONED");
     return { principalId: row.principal_id, runtimeUid: row.runtime_uid, runtimeGid: row.runtime_gid };
   }
@@ -84,10 +68,6 @@ export class PrincipalService {
     projects = join(root, "projects");
     await this.ensureOwnedDirectory(projects, principal.runtimeUid, principal.runtimeGid, 0o700);
     return { root, home, projects, cache, artifacts, agent };
-  }
-
-  async ensureOwnerDirectories(): Promise<void> {
-    await this.ensurePrincipalDirectories(OWNER_PRINCIPAL_ID);
   }
 
   principalMemoryPath(principalId: string): string {
@@ -161,9 +141,8 @@ export class PrincipalService {
   }
 
   private async ensureSystemDirectories(): Promise<void> {
-    const ownerRow = this.db.get<{ runtime_uid: number | null; runtime_gid: number | null }>("SELECT runtime_uid,runtime_gid FROM principals WHERE principal_id=?", OWNER_PRINCIPAL_ID);
-    const serviceUid = ownerRow?.runtime_uid ?? 0;
-    const serviceGid = ownerRow?.runtime_gid ?? 0;
+    const serviceUid = 0;
+    const serviceGid = 0;
     await chown(this.stateRoot, 0, 0);
     await chmod(this.stateRoot, 0o711);
     for (const name of ["config", "secrets", "data", "inbox", "artifacts", "snowluma", "backups"]) {
@@ -229,28 +208,26 @@ export class PrincipalService {
     };
   }
 
-  private ensureRuntimeIdentity(principalId: string, role: Trust): PrincipalRow {
-    const existing = this.db.get<PrincipalRow>("SELECT principal_id,trust,runtime_uid,runtime_gid FROM principals WHERE principal_id=?", principalId);
+  private ensureRuntimeIdentity(principalId: string): PrincipalRow {
+    const existing = this.db.get<PrincipalRow>("SELECT principal_id,runtime_uid,runtime_gid FROM principals WHERE principal_id=?", principalId);
     if (existing && existing.runtime_uid !== null && existing.runtime_gid !== null) {
-      if (existing.trust !== role) this.db.run("UPDATE principals SET trust=? WHERE principal_id=?", role, principalId);
-      return { ...existing, trust: role };
+      return existing;
     }
-    if (!existing) this.db.run("INSERT INTO principals(principal_id,trust,created_at) VALUES (?,?,?)", principalId, role, nowIso());
+    if (!existing) this.db.run("INSERT INTO principals(principal_id,created_at) VALUES (?,?)", principalId, nowIso());
     const used = new Set(this.db.all<{ runtime_uid: number }>("SELECT runtime_uid FROM principals WHERE runtime_uid IS NOT NULL").map((row) => Number(row.runtime_uid)));
-    let uid = existing?.runtime_uid ?? (principalId === OWNER_PRINCIPAL_ID ? OWNER_RUNTIME_UID : PRINCIPAL_UID_MIN);
+    let uid = existing?.runtime_uid ?? PRINCIPAL_UID_MIN;
     if (!existing || existing.runtime_uid === null) {
-      if (principalId !== OWNER_PRINCIPAL_ID) while (uid <= PRINCIPAL_UID_MAX && used.has(uid)) uid += 1;
-      else if (used.has(OWNER_RUNTIME_UID)) throw new Error("OWNER_RUNTIME_UID_CONFLICT");
+      while (uid <= PRINCIPAL_UID_MAX && used.has(uid)) uid += 1;
     }
-    if (principalId !== OWNER_PRINCIPAL_ID && uid > PRINCIPAL_UID_MAX) throw new Error("PRINCIPAL_UID_RANGE_EXHAUSTED");
-    this.db.run("UPDATE principals SET trust=?,runtime_uid=?,runtime_gid=? WHERE principal_id=?", role, uid, existing?.runtime_gid ?? (principalId === OWNER_PRINCIPAL_ID ? OWNER_RUNTIME_GID : uid), principalId);
-    const assigned = this.db.get<PrincipalRow>("SELECT principal_id,trust,runtime_uid,runtime_gid FROM principals WHERE principal_id=?", principalId);
+    if (uid > PRINCIPAL_UID_MAX) throw new Error("PRINCIPAL_UID_RANGE_EXHAUSTED");
+    this.db.run("UPDATE principals SET runtime_uid=?,runtime_gid=? WHERE principal_id=?", uid, existing?.runtime_gid ?? uid, principalId);
+    const assigned = this.db.get<PrincipalRow>("SELECT principal_id,runtime_uid,runtime_gid FROM principals WHERE principal_id=?", principalId);
     if (!assigned || assigned.runtime_uid === null || assigned.runtime_gid === null) throw new Error("PRINCIPAL_UID_ASSIGNMENT_FAILED");
     return assigned;
   }
 
   private principalRoot(principalId: string): string {
-    if (!/^(?:principal:owner|principal_[A-Za-z0-9_-]+)$/.test(principalId)) throw new Error("PRINCIPAL_ID_INVALID");
+    if (!/^principal_[A-Za-z0-9_-]+$/.test(principalId)) throw new Error("PRINCIPAL_ID_INVALID");
     const principal = this.get(principalId);
     const root = resolve(this.stateRoot, "principals", `uid-${principal.runtimeUid}`);
     if (!isWithin(resolve(this.stateRoot, "principals"), root)) throw new Error("PRINCIPAL_PATH_INVALID");

@@ -1,8 +1,5 @@
-import { chown, chmod, copyFile, lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
-import { createHash } from "node:crypto";
+import { chown, chmod, lstat, mkdir, readdir } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import type { SqliteStore } from "../db.js";
-import { OWNER_RUNTIME_UID } from "./principals.js";
 
 export const MODEL_RUNTIME_UID = 10_002;
 export const MODEL_RUNTIME_GID = 10_002;
@@ -18,13 +15,9 @@ export interface ModelPlanePaths {
 
 export class ModelPlaneService {
   readonly paths: ModelPlanePaths;
-  private readonly stateRoot: string;
-  private readonly db: SqliteStore;
-
-  constructor(db: SqliteStore, stateRoot: string, agentDir = join(stateRoot, "model", "pi", "agent")) {
-    this.db = db;
-    this.stateRoot = resolve(stateRoot);
-    const root = join(this.stateRoot, "model");
+  constructor(stateRoot: string, agentDir = join(stateRoot, "model", "pi", "agent")) {
+    const resolvedStateRoot = resolve(stateRoot);
+    const root = join(resolvedStateRoot, "model");
     this.paths = {
       root,
       home: join(root, "home"),
@@ -50,11 +43,6 @@ export class ModelPlaneService {
     await this.chownSessionTree(this.paths.sessionsRoot, uid, gid);
   }
 
-  async migrateLegacyState(): Promise<void> {
-    await this.migrateLegacyAgentDirectory();
-    await this.migrateSessions();
-  }
-
   async ensureSessionDirectory(path: string): Promise<void> {
     const resolved = resolve(path);
     if (!isWithin(this.paths.sessionsRoot, resolved)) throw new Error("MODEL_SESSION_DIRECTORY_OUTSIDE_MODEL_PLANE");
@@ -62,96 +50,6 @@ export class ModelPlaneService {
     const gid = process.getgid?.() === 0 ? MODEL_RUNTIME_GID : process.getgid?.() ?? 0;
     await this.ensureDirectory(resolved, uid, gid, 0o700);
     await this.chownSessionTree(resolved, uid, gid);
-  }
-
-  private async migrateLegacyAgentDirectory(): Promise<void> {
-    const legacy = join(this.stateRoot, "principals", `uid-${OWNER_RUNTIME_UID}`, "home", ".pi", "agent");
-    const destination = this.paths.agentDir;
-    if (resolve(legacy) === destination) return;
-    let sourceInfo;
-    try { sourceInfo = await lstat(legacy); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
-    if (sourceInfo.isSymbolicLink()) {
-      const target = await realpath(legacy).catch(() => "");
-      if (target === destination) return;
-      throw new Error("LEGACY_PI_AGENT_DIRECTORY_INVALID");
-    }
-    if (!sourceInfo.isDirectory()) throw new Error("LEGACY_PI_AGENT_DIRECTORY_INVALID");
-    await this.validateAgentTree(legacy);
-    let destinationInfo;
-    try { destinationInfo = await lstat(destination); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-    if (destinationInfo) {
-      if (!destinationInfo.isDirectory() || destinationInfo.isSymbolicLink()) throw new Error("MODEL_AGENT_MIGRATION_COLLISION");
-      await this.validateAgentTree(destination);
-      await this.mergeAgentTree(legacy, destination);
-      await rm(legacy, { recursive: true });
-      return;
-    }
-    await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
-    await rename(legacy, destination);
-    const uid = process.getuid?.() === 0 ? MODEL_RUNTIME_UID : process.getuid?.() ?? 0;
-    const gid = process.getgid?.() === 0 ? MODEL_RUNTIME_GID : process.getgid?.() ?? 0;
-    await this.chownTree(destination, uid, gid);
-    await chmod(destination, 0o700);
-  }
-
-  private async mergeAgentTree(source: string, destination: string): Promise<void> {
-    for (const entry of await readdir(source, { withFileTypes: true })) {
-      const sourcePath = join(source, entry.name);
-      const destinationPath = join(destination, entry.name);
-      const sourceInfo = await lstat(sourcePath);
-      let destinationInfo;
-      try { destinationInfo = await lstat(destinationPath); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-
-      if (sourceInfo.isDirectory()) {
-        if (destinationInfo && (!destinationInfo.isDirectory() || destinationInfo.isSymbolicLink())) throw new Error("MODEL_AGENT_MIGRATION_COLLISION");
-        if (!destinationInfo) await mkdir(destinationPath, { mode: sourceInfo.mode & 0o777 });
-        await this.mergeAgentTree(sourcePath, destinationPath);
-        continue;
-      }
-
-      if (!sourceInfo.isFile() || sourceInfo.isSymbolicLink() || sourceInfo.nlink > 1) throw new Error("MODEL_AGENT_UNSAFE_FILE_ENTRY");
-      if (!destinationInfo) {
-        await copyFile(sourcePath, destinationPath);
-        continue;
-      }
-      if (!destinationInfo.isFile() || destinationInfo.isSymbolicLink() || destinationInfo.nlink > 1) throw new Error("MODEL_AGENT_MIGRATION_COLLISION");
-      const [sourceBytes, destinationBytes] = await Promise.all([readFile(sourcePath), readFile(destinationPath)]);
-      if (sourceBytes.equals(destinationBytes) || isEmptyLegacyAgentPlaceholder(entry.name, sourceBytes)) continue;
-      if (isEmptyLegacyAgentPlaceholder(entry.name, destinationBytes)) {
-        const temporary = `${destinationPath}.migration-${process.pid}`;
-        await writeFile(temporary, sourceBytes, { mode: sourceInfo.mode & 0o777 });
-        await rename(temporary, destinationPath);
-        continue;
-      }
-      throw new Error("MODEL_AGENT_MIGRATION_COLLISION");
-    }
-  }
-
-  private async migrateSessions(): Promise<void> {
-    const conversations = this.db.all<{ conversation_id: string; main_session_path: string | null }>("SELECT conversation_id,main_session_path FROM conversations WHERE main_session_path IS NOT NULL");
-    for (const row of conversations) {
-      const destination = join(this.paths.mainSessions, safeSegment(row.conversation_id), "session.jsonl");
-      if (row.main_session_path && resolve(row.main_session_path) !== resolve(destination)) {
-        const moved = await moveSession(row.main_session_path, destination);
-        if (!moved && !await exists(destination)) {
-          this.db.run("UPDATE conversations SET main_session_id=NULL,main_session_path=NULL WHERE conversation_id=?", row.conversation_id);
-          continue;
-        }
-        this.db.run("UPDATE conversations SET main_session_path=? WHERE conversation_id=?", destination, row.conversation_id);
-      }
-      await rewriteSessionWorkingDirectory(destination, dirname(destination));
-    }
-    const workers = this.db.all<{ id: string; harness_session_path: string | null }>("SELECT id,harness_session_path FROM worker_executions WHERE harness_session_path IS NOT NULL");
-    for (const row of workers) {
-      const destination = join(this.paths.workerSessions, safeWorkerSegment(row.id), "session.jsonl");
-      if (row.harness_session_path && resolve(row.harness_session_path) !== resolve(destination)) {
-        await moveSession(row.harness_session_path, destination);
-        this.db.run("UPDATE worker_executions SET harness_session_path=? WHERE id=?", destination, row.id);
-      }
-      await rewriteSessionWorkingDirectory(destination, dirname(destination));
-    }
   }
 
   private async ensureDirectory(path: string, uid: number, gid: number, mode: number): Promise<void> {
@@ -196,92 +94,6 @@ export class ModelPlaneService {
     await chmod(path, 0o700);
   }
 
-  private async validateAgentTree(path: string): Promise<void> {
-    for (const entry of await readdir(path, { withFileTypes: true })) {
-      const child = join(path, entry.name);
-      const info = await lstat(child);
-      if (info.isSymbolicLink() || info.nlink > 1 || (!info.isDirectory() && !info.isFile())) throw new Error("MODEL_AGENT_UNSAFE_FILE_ENTRY");
-      if (info.isDirectory()) await this.validateAgentTree(child);
-    }
-  }
-}
-
-function isEmptyLegacyAgentPlaceholder(name: string, bytes: Buffer): boolean {
-  if (name !== "auth.json" && name !== "models-store.json") return false;
-  try {
-    const value = JSON.parse(bytes.toString("utf8")) as unknown;
-    return Boolean(value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length === 0);
-  } catch { return false; }
-}
-
-async function moveSession(source: string, destination: string): Promise<boolean> {
-  let sourceInfo;
-  try { sourceInfo = await lstat(source); } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    try {
-      const destinationInfo = await lstat(destination);
-      if (!destinationInfo.isFile() || destinationInfo.isSymbolicLink()) throw new Error("MODEL_SESSION_MIGRATION_TARGET_INVALID");
-      if (process.getuid?.() === 0) {
-        await chown(dirname(destination), MODEL_RUNTIME_UID, MODEL_RUNTIME_GID);
-        await chmod(dirname(destination), 0o700);
-        await chown(destination, MODEL_RUNTIME_UID, MODEL_RUNTIME_GID);
-      }
-      await chmod(destination, 0o600);
-      return false;
-    } catch (destinationError) {
-      if ((destinationError as NodeJS.ErrnoException).code === "ENOENT") return false;
-      throw destinationError;
-    }
-  }
-  if (!sourceInfo.isFile() || sourceInfo.isSymbolicLink()) throw new Error("LEGACY_PI_SESSION_INVALID");
-  try { await lstat(destination); throw new Error("MODEL_SESSION_MIGRATION_COLLISION"); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-  await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
-  await rename(source, destination);
-  if (process.getuid?.() === 0) {
-    await chown(dirname(destination), MODEL_RUNTIME_UID, MODEL_RUNTIME_GID);
-    await chmod(dirname(destination), 0o700);
-    await chown(destination, MODEL_RUNTIME_UID, MODEL_RUNTIME_GID);
-  }
-  await chmod(destination, 0o600);
-  return true;
-}
-
-async function exists(path: string): Promise<boolean> {
-  try { await lstat(path); return true; } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
-}
-
-async function rewriteSessionWorkingDirectory(path: string, cwd: string): Promise<void> {
-  let text: string;
-  try { text = await readFile(path, "utf8"); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
-  const lines = text.split("\n");
-  let changed = false;
-  for (let index = 0; index < lines.length; index += 1) {
-    if (!lines[index]?.trim()) continue;
-    let record: Record<string, unknown>;
-    try { record = JSON.parse(lines[index]!) as Record<string, unknown>; } catch { continue; }
-    if (record.type !== "session") continue;
-    if (record.cwd === cwd) return;
-    record.cwd = cwd;
-    lines[index] = JSON.stringify(record);
-    changed = true;
-    break;
-  }
-  if (!changed) return;
-  const temporary = `${path}.cwd-${process.pid}`;
-  await writeFile(temporary, lines.join("\n"), { mode: 0o600 });
-  if (process.getuid?.() === 0) await chown(temporary, MODEL_RUNTIME_UID, MODEL_RUNTIME_GID);
-  await chmod(temporary, 0o600);
-  await rename(temporary, path);
-}
-
-function safeSegment(value: string): string {
-  return createHash("sha256").update(value).digest("hex");
-}
-
-function safeWorkerSegment(value: string): string {
-  if (!/^[A-Za-z0-9_-]{1,128}$/.test(value)) throw new Error("WORKER_SESSION_ID_INVALID");
-  return value;
 }
 
 function isWithin(root: string, path: string): boolean {

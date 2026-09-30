@@ -5,18 +5,18 @@ import { unlink } from "node:fs/promises";
 import { createServer, type Server } from "node:net";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { configuredOwners, type AppConfig } from "../config.js";
+import { configuredSystemAdmins, type AppConfig } from "../config.js";
 import { migrate, SqliteStore } from "../db.js";
 import { deriveCapabilities, authorizeSend, validateCapabilitySet, type PluginCapabilityPolicy } from "../auth.js";
 import { runtimeMigrations } from "../schema.js";
 import { newId, nowIso, messageKey } from "../shared/ids.js";
-import type { ArtifactRef, CapabilitySet, ControllerEventEnvelope, ConversationAddress, JsonValue, MemoryScope, PlatformIdentityRef, PlatformMessageRef, TaskRecord, Trust } from "../shared/types.js";
+import type { ArtifactRef, CapabilitySet, ControllerEventEnvelope, ConversationAddress, JsonValue, MemoryScope, PlatformIdentityRef, PlatformMessageRef, TaskRecord } from "../shared/types.js";
 import type { Logger } from "../shared/logger.js";
 import { PiCliHarness, PiTurnError, piNetworkFailureHint, type PiImageContent } from "./pi.js";
 import { ArtifactService } from "./artifacts.js";
 import { MemoryService } from "./memory.js";
 import { TaskService, type RuntimeEvent } from "./tasks.js";
-import { PrincipalService, OWNER_PRINCIPAL_ID, OWNER_RUNTIME_UID, PRINCIPAL_UID_MAX, PRINCIPAL_UID_MIN } from "./principals.js";
+import { PrincipalService, PRINCIPAL_UID_MAX, PRINCIPAL_UID_MIN } from "./principals.js";
 import { MODEL_RUNTIME_GID, MODEL_RUNTIME_UID, ModelPlaneService } from "./model-plane.js";
 import { installPrincipalEgressFilter } from "./principal-network.js";
 import { SnowLumaQQCapability } from "../qq/capability.js";
@@ -73,25 +73,17 @@ export class RuntimeApp {
     this.log = logger.child("runtime");
     this.modelRuntimeUid = process.getuid?.() === 0 ? MODEL_RUNTIME_UID : process.getuid?.() ?? MODEL_RUNTIME_UID;
     this.modelRuntimeGid = process.getgid?.() === 0 ? MODEL_RUNTIME_GID : process.getgid?.() ?? MODEL_RUNTIME_GID;
-    this.pluginPolicy = { allowedActions: config.plugins.allowedActions, allowedPermissions: config.plugins.allowedPermissions, guestAllowedActions: config.plugins.guestAllowedActions, guestAllowedPermissions: config.plugins.guestAllowedPermissions, guestTaskExecutionEnabled: config.guest?.enabled ?? true };
+    this.pluginPolicy = { allowedActions: config.plugins.allowedActions, allowedPermissions: config.plugins.allowedPermissions };
     const readSecret = (name: string): string | undefined => { try { return readFileSync(join(config.paths.stateRoot, "secrets", name), "utf8").trim() || undefined; } catch { return undefined; } };
     this.controlToken = readSecret("control-token") ?? process.env.AGENT_HOME_CONTROL_TOKEN;
     this.db = new SqliteStore(join(config.paths.stateRoot, "data", "agent.db"));
     migrate(this.db, runtimeMigrations);
-    const migrationMarker = this.db.get("SELECT 1 AS applied FROM runtime_meta WHERE key='principal_workspace_manual_migration'");
-    const existingPrincipalState = this.db.get<{ principals: number; tasks: number; workers: number }>("SELECT (SELECT count(*) FROM principals) AS principals,(SELECT count(*) FROM tasks) AS tasks,(SELECT count(*) FROM worker_executions) AS workers");
-    const freshState = !existingPrincipalState?.principals && !existingPrincipalState?.tasks && !existingPrincipalState?.workers;
-    if (!migrationMarker && !freshState) throw new Error("MANUAL_STATE_MIGRATION_REQUIRED:run agent-home migrate-state before starting Runtime");
-    if (freshState) this.db.run("INSERT INTO runtime_meta(key,value) VALUES ('principal_workspace_manual_migration','1') ON CONFLICT(key) DO NOTHING");
     this.principals = new PrincipalService(this.db, config.paths.stateRoot);
-    this.modelPlane = new ModelPlaneService(this.db, config.paths.stateRoot, config.runtime.piAgentDir);
-    this.principals.ensureOwnerPrincipal();
-    const owners = configuredOwners(config);
-    for (const owner of owners) this.principals.resolveIdentity(owner.platform, owner.accountId, owner.userId, owners);
+    this.modelPlane = new ModelPlaneService(config.paths.stateRoot, config.runtime.piAgentDir);
     this.db.run("UPDATE ingress_events SET status='PENDING',updated_at=? WHERE status='PROCESSING'", nowIso());
     this.db.run("UPDATE main_turn_queue SET status='PENDING',started_at=NULL WHERE status='PROCESSING'");
     this.db.run("UPDATE task_event_outbox SET status='PENDING' WHERE status='ENQUEUED'");
-    this.memory = new MemoryService(this.db, owners, config.memory);
+    this.memory = new MemoryService(this.db, config.memory);
     this.memory.recover();
     this.artifacts = new ArtifactService(this.db, config.paths.stateRoot);
       this.pi = new PiCliHarness(config.runtime.piCommand, this.log, config.runtime.workerSandboxCommand, undefined, { agentDir: config.runtime.piAgentDir, launcherUid: this.modelRuntimeUid, launcherGid: this.modelRuntimeGid });
@@ -117,14 +109,12 @@ export class RuntimeApp {
   async start(): Promise<void> {
     await this.modelPlane.ensure();
     if (process.getuid?.() === 0 && process.getgid?.() === 0) {
-      await this.principals.ensureOwnerDirectories();
       const toolDirectory = dirname(this.toolSocketPath);
       await mkdir(toolDirectory, { recursive: true });
       await chown(toolDirectory, 0, this.modelRuntimeGid);
       await chmod(toolDirectory, 0o710);
-      installPrincipalEgressFilter(OWNER_RUNTIME_UID, PRINCIPAL_UID_MAX, "/etc/resolv.conf", this.config.network?.modelProxyUrl);
-    } else if (this.config.guest?.enabled) {
-      throw new Error("PRINCIPAL_EXECUTION_REQUIRES_ROOTFUL_OUTER_CONTAINER_USERNS");
+      const legacyPrincipalUids = this.db.all<{ runtime_uid: number }>("SELECT runtime_uid FROM principals WHERE runtime_uid IS NOT NULL AND runtime_uid<?", PRINCIPAL_UID_MIN).map((row) => Number(row.runtime_uid)).filter((uid) => uid !== this.modelRuntimeUid);
+      installPrincipalEgressFilter(PRINCIPAL_UID_MIN, PRINCIPAL_UID_MAX, "/etc/resolv.conf", this.config.network?.modelProxyUrl, legacyPrincipalUids);
     }
     await this.toolServer.start();
     this.artifactMaintenance = setInterval(() => { void this.artifacts.cleanupExpired().catch((error) => this.log.warn("Artifact cleanup failed", { error: String(error) })); }, 60_000).unref();
@@ -374,8 +364,8 @@ export class RuntimeApp {
     const task = this.tasks.getTask(job.taskId);
     if (!task.capabilities.qq.sendConversations.includes("*") && !task.capabilities.qq.sendConversations.includes(task.notificationConversationId)) throw new Error("TASK_NOTIFICATION_DENIED");
     const conversation = this.getConversation(task.notificationConversationId);
-    const requester = { ...task.requester, conversationId: conversation.id, trust: this.resolvePrincipalIdentity(task.requester.platform, task.requester.accountId, task.requester.userId).trust };
-    const caps = deriveCapabilities(requester, conversation.address, configuredOwners(this.config), conversation.id, this.pluginPolicy);
+    const requester = { ...task.requester, conversationId: conversation.id };
+    const caps = deriveCapabilities(requester, conversation.address, conversation.id, this.pluginPolicy);
     const syntheticEvent: ControllerEventEnvelope = {
       protocolVersion: 1, eventId: newId("main-event"), instanceId: this.config.instanceId, type: "chat.message", occurredAt: nowIso(),
       source: { platform: task.requester.platform, accountId: task.requester.accountId, adapter: "runtime" },
@@ -409,7 +399,7 @@ export class RuntimeApp {
   private async processEvent(event: ControllerEventEnvelope): Promise<void> {
     if (!event.conversation?.address) return;
     const requesterPrincipal = this.resolvePrincipalIdentity(event.source.platform, event.source.accountId, event.trustedIdentity?.userId ?? "unknown");
-    const conversation = this.getOrCreateConversation(event.conversation.address, requesterPrincipal);
+    const conversation = this.getOrCreateConversation(event.conversation.address);
     const payload = (event.payload ?? {}) as Record<string, unknown>;
     if (event.type === "control.command") { await this.controlCommand(conversation.id, event, String(payload.command ?? ""), Array.isArray(payload.args) ? payload.args.map(String) : []); return; }
     if (event.type !== "chat.message") return;
@@ -417,19 +407,19 @@ export class RuntimeApp {
     if (replyTo && typeof replyTo === "object" && "messageId" in replyTo) {
       const question = this.db.get<{ binding_id: string }>("SELECT binding_id FROM message_bindings WHERE platform=? AND account_id=? AND platform_conversation_id=? AND thread_id_json=? AND message_id=? AND binding_type='PENDING_QUESTION'", replyTo.platform, replyTo.accountId, replyTo.platformConversationId, JSON.stringify(replyTo.threadId), replyTo.messageId);
       if (question) {
-        await this.tasks.answerQuestion(question.binding_id, String(payload.text ?? ""), { message: event.message?.ref as PlatformMessageRef, conversationId: conversation.id, requester: { platform: event.source.platform, accountId: event.source.accountId, userId: event.trustedIdentity?.userId ?? "unknown", principalId: requesterPrincipal.principalId }, trust: requesterPrincipal.trust, capabilities: deriveCapabilities({ platform: event.source.platform, accountId: event.source.accountId, userId: event.trustedIdentity?.userId ?? "unknown", principalId: requesterPrincipal.principalId, trust: requesterPrincipal.trust, conversationId: conversation.id }, conversation.address, configuredOwners(this.config), conversation.id, this.pluginPolicy) });
+        await this.tasks.answerQuestion(question.binding_id, String(payload.text ?? ""), { message: event.message?.ref as PlatformMessageRef, conversationId: conversation.id, requester: { platform: event.source.platform, accountId: event.source.accountId, userId: event.trustedIdentity?.userId ?? "unknown", principalId: requesterPrincipal.principalId }, capabilities: deriveCapabilities({ platform: event.source.platform, accountId: event.source.accountId, userId: event.trustedIdentity?.userId ?? "unknown", principalId: requesterPrincipal.principalId, conversationId: conversation.id }, conversation.address, conversation.id, this.pluginPolicy) });
         return;
       }
     }
      const text = String(payload.text ?? "").trim() || (event.message ? "用户发送了一条消息，请通过当前会话能力读取需要的上下文。" : "");
     if (!text) return;
-    const requester = { platform: event.source.platform, accountId: event.source.accountId, userId: event.trustedIdentity?.userId ?? "unknown", principalId: requesterPrincipal.principalId, trust: requesterPrincipal.trust, conversationId: conversation.id };
-    const caps = deriveCapabilities(requester, conversation.address, configuredOwners(this.config), conversation.id, this.pluginPolicy);
+    const requester = { platform: event.source.platform, accountId: event.source.accountId, userId: event.trustedIdentity?.userId ?? "unknown", principalId: requesterPrincipal.principalId, conversationId: conversation.id };
+    const caps = deriveCapabilities(requester, conversation.address, conversation.id, this.pluginPolicy);
     const episodeScope: MemoryScope = `user:${requester.principalId!}`;
     if (caps.memory.allowedScopes.includes(episodeScope)) {
       this.memory.ingestEpisode({
-        access: { requesterId: requester.userId, principalId: requester.principalId!, trust: requesterPrincipal.trust, allowedScopes: caps.memory.allowedScopes, conversationId: conversation.id },
-        episode: { scope: episodeScope, source: { type: "chat.message", platform: event.source.platform, sourceId: event.eventId }, actor: { type: "user", id: requester.userId }, content: text, occurredAt: event.occurredAt, trust: requesterPrincipal.trust === "OWNER" ? "owner" : "guest" },
+        access: { requesterId: requester.userId, principalId: requester.principalId!, allowedScopes: caps.memory.allowedScopes, conversationId: conversation.id },
+        episode: { scope: episodeScope, source: { type: "chat.message", platform: event.source.platform, sourceId: event.eventId }, actor: { type: "user", id: requester.userId }, content: text, occurredAt: event.occurredAt },
       });
     }
       this.enqueueMainTurn({ kind: "MESSAGE", conversationId: conversation.id, address: conversation.address, event, text, payload, capabilities: caps });
@@ -448,7 +438,6 @@ export class RuntimeApp {
       conversationId,
       requesterId: event.trustedIdentity?.userId ?? "unknown",
       requester: { platform: event.source.platform, accountId: event.source.accountId, userId: event.trustedIdentity?.userId ?? "unknown", principalId: requesterPrincipal.principalId },
-      trust: requesterPrincipal.trust,
       address,
       capabilities: caps,
       eventId: event.eventId,
@@ -480,15 +469,15 @@ export class RuntimeApp {
         const artifact = this.artifacts.authorizeRead(ref as ArtifactRef, { conversationId, requesterId: event.trustedIdentity?.userId ?? "unknown", ...(typeof payload.taskId === "string" ? { taskId: payload.taskId } : {}), sourceEventId: event.eventId, readCapability: caps.artifacts });
         inboundFiles.push(`${ref.artifactId} ${artifact.filename} (${artifact.mime ?? "application/octet-stream"}, ${artifact.size} bytes); use the authorized read_artifact tool when content is needed`);
         if (artifact.mime?.startsWith("image/") || /\.(?:jpe?g|png|gif|webp|bmp|tiff?|avif)$/i.test(artifact.filename)) {
-          const visual = await this.imageInputForArtifact(ref as ArtifactRef, { conversationId, requesterId: event.trustedIdentity?.userId ?? "unknown", principalId: requesterPrincipal.principalId, role: requesterPrincipal.trust, ...(typeof payload.taskId === "string" ? { taskId: payload.taskId } : {}), sourceEventId: event.eventId, readCapability: caps.artifacts });
+          const visual = await this.imageInputForArtifact(ref as ArtifactRef, { conversationId, requesterId: event.trustedIdentity?.userId ?? "unknown", principalId: requesterPrincipal.principalId, ...(typeof payload.taskId === "string" ? { taskId: payload.taskId } : {}), sourceEventId: event.eventId, readCapability: caps.artifacts });
           if (visual.imageInput) imageInputs.push(visual.imageInput);
-          else this.log.warn("Authorized inbound image was not injected into Main Pi", { artifactId: ref.artifactId, reason: visual.reason, principalId: requesterPrincipal.principalId, role: requesterPrincipal.trust, contextSource: "authorized-task-or-ingress-artifact" });
+          else this.log.warn("Authorized inbound image was not injected into Main Pi", { artifactId: ref.artifactId, reason: visual.reason, principalId: requesterPrincipal.principalId, contextSource: "authorized-task-or-ingress-artifact" });
         }
       } catch (error) {
         this.log.warn("Inbound artifact was not made available to Main", { artifactId: ref.artifactId, conversationId, error: String(error) });
       }
     }
-    const memory = this.memory.promptContext(this.memory.retrieve({ text, access: { requesterId: event.trustedIdentity?.userId ?? "unknown", principalId: requesterPrincipal.principalId, trust: requesterPrincipal.trust, allowedScopes: caps.memory.allowedScopes, conversationId }, limit: 8 }), this.config.memory?.maxPromptBytes);
+    const memory = this.memory.promptContext(this.memory.retrieve({ text, access: { requesterId: event.trustedIdentity?.userId ?? "unknown", principalId: requesterPrincipal.principalId, allowedScopes: caps.memory.allowedScopes, conversationId }, limit: 8 }), this.config.memory?.maxPromptBytes);
     const persona = (this.config.agent?.persona ?? "").trim();
     const snowLumaActionContext = event.message ? {
       platform: address.platform,
@@ -557,7 +546,7 @@ export class RuntimeApp {
         const title = requiredText(values.title, "title");
         const goal = requiredText(values.goal, "goal");
         const task = this.tasks.createTask({
-          title, goal, requester: context.requester, trust: context.trust,
+          title, goal, requester: context.requester,
           originConversationId: context.conversationId, notificationConversationId: context.conversationId,
           parentCapabilities: context.capabilities,
           ...(typeof values.parentTaskId === "string" ? { parentTaskId: values.parentTaskId } : {}),
@@ -658,12 +647,12 @@ export class RuntimeApp {
           conversationId: context.conversationId,
           requesterId: context.requesterId,
           principalId: context.requester.principalId!,
-          principalQuotaBytes: this.config.guest?.artifactQuotaBytes ?? this.config.runtime.maxArtifactBytes,
+          principalQuotaBytes: this.config.principalExecution.artifactQuotaBytes,
           ...(context.eventId ? { eventId: context.eventId } : {}),
           maxBytes: this.config.runtime.maxArtifactBytes,
         });
         const visual = artifact.mime?.startsWith("image/")
-          ? await this.imageInputForArtifact(artifact.ref, { conversationId: context.conversationId, requesterId: context.requesterId, principalId: context.requester.principalId, role: context.trust, ...(context.taskId ? { taskId: context.taskId } : {}), ...(context.eventId ? { sourceEventId: context.eventId } : {}), readCapability: context.capabilities.artifacts })
+          ? await this.imageInputForArtifact(artifact.ref, { conversationId: context.conversationId, requesterId: context.requesterId, principalId: context.requester.principalId, ...(context.taskId ? { taskId: context.taskId } : {}), ...(context.eventId ? { sourceEventId: context.eventId } : {}), readCapability: context.capabilities.artifacts })
           : {};
         return { ...artifact, ...(visual.imageInput ? { imageInput: visual.imageInput } : visual.reason ? { imageInputUnavailable: visual.reason } : {}) } as never;
       }
@@ -725,7 +714,6 @@ export class RuntimeApp {
       conversationId: task.originConversationId,
       requesterId: task.requester.userId,
       requester: task.requester,
-      trust: task.trust,
       address: conversation.address,
       capabilities: worker.capabilities,
       taskId: task.id,
@@ -735,10 +723,10 @@ export class RuntimeApp {
     return { token, socketPath: this.toolSocketPath };
   }
 
-  private async imageInputForArtifact(ref: ArtifactRef, access: { conversationId: string; requesterId?: string; principalId?: string; role?: Trust; taskId?: string; sourceEventId?: string; readCapability: CapabilitySet["artifacts"] }): Promise<{ imageInput?: PiImageContent; reason?: string }> {
+  private async imageInputForArtifact(ref: ArtifactRef, access: { conversationId: string; requesterId?: string; principalId?: string; taskId?: string; sourceEventId?: string; readCapability: CapabilitySet["artifacts"] }): Promise<{ imageInput?: PiImageContent; reason?: string }> {
     const metadata = this.artifacts.authorizeRead(ref, access);
     if (metadata.size > PI_IMAGE_INPUT_MAX_BYTES) {
-      this.log.warn("Authorized image Artifact exceeds Pi visual input limit", { artifactId: ref.artifactId, size: metadata.size, maxBytes: PI_IMAGE_INPUT_MAX_BYTES, principalId: access.principalId, role: access.role, taskId: access.taskId, contextSource: "authorized-artifact-image-input" });
+      this.log.warn("Authorized image Artifact exceeds Pi visual input limit", { artifactId: ref.artifactId, size: metadata.size, maxBytes: PI_IMAGE_INPUT_MAX_BYTES, principalId: access.principalId, taskId: access.taskId, contextSource: "authorized-artifact-image-input" });
       return { reason: "IMAGE_INPUT_SIZE_LIMIT" };
     }
     const opened = await this.artifacts.openAuthorized(ref, access);
@@ -751,7 +739,7 @@ export class RuntimeApp {
     }
     const imageInput = piImageContent(Buffer.concat(chunks), metadata.mime);
     if (!imageInput) {
-      this.log.warn("Authorized attachment is not a supported Pi visual image", { artifactId: ref.artifactId, mime: metadata.mime, filename: metadata.filename, principalId: access.principalId, role: access.role, taskId: access.taskId, contextSource: "authorized-artifact-image-input" });
+      this.log.warn("Authorized attachment is not a supported Pi visual image", { artifactId: ref.artifactId, mime: metadata.mime, filename: metadata.filename, principalId: access.principalId, taskId: access.taskId, contextSource: "authorized-artifact-image-input" });
       return { reason: "IMAGE_FORMAT_UNSUPPORTED" };
     }
     return { imageInput };
@@ -772,7 +760,7 @@ export class RuntimeApp {
 
   private async resolveWorkerExecutionContext(context: RuntimeToolContext, action: string): Promise<import("./execution.js").ExecutionContext> {
     if (!context.workerId || !context.taskId || !context.executionContextId) throw new Error("WORKER_EXEC_CONTEXT_REQUIRED");
-    this.log.debug("Authenticated Worker tool request", { action, taskId: context.taskId, workerId: context.workerId, principalId: context.requester.principalId, role: context.trust, capabilities: { projects: context.capabilities.projects }, executionProfile: "resolved-from-durable-worker-record", scope: context.taskId, contextSource: "authenticated-worker-tool-token" });
+    this.log.debug("Authenticated Worker tool request", { action, taskId: context.taskId, workerId: context.workerId, principalId: context.requester.principalId, capabilities: { projects: context.capabilities.projects }, executionProfile: "resolved-from-durable-worker-record", scope: context.taskId, contextSource: "authenticated-worker-tool-token" });
     const executionContext = await this.tasks.executionContext(context.workerId);
     if (executionContext.executionContextId !== context.executionContextId || executionContext.taskId !== context.taskId) throw new Error("EXECUTION_CONTEXT_STALE_OR_FORGED");
     return executionContext;
@@ -788,9 +776,9 @@ export class RuntimeApp {
     return { id: task.id, title: task.title, goal: task.goal, status: task.status, originConversationId: task.originConversationId, notificationConversationId: task.notificationConversationId, createdAt: task.createdAt, updatedAt: task.updatedAt };
   }
 
-  private memoryAccess(context: RuntimeToolContext): { requesterId: string; principalId?: string; trust: "OWNER" | "GUEST"; allowedScopes: MemoryScope[]; projectIds: string[]; conversationId: string } {
+  private memoryAccess(context: RuntimeToolContext): { requesterId: string; principalId?: string; allowedScopes: MemoryScope[]; conversationId: string } {
     if (!context.requester.principalId) throw new Error("REQUESTER_PRINCIPAL_REQUIRED");
-    return { requesterId: context.requesterId, principalId: context.requester.principalId, trust: context.trust, allowedScopes: context.capabilities.memory.allowedScopes, projectIds: context.capabilities.projects.map((project) => project.projectId), conversationId: context.conversationId };
+    return { requesterId: context.requesterId, principalId: context.requester.principalId, allowedScopes: context.capabilities.memory.allowedScopes, conversationId: context.conversationId };
   }
 
   private actionAllowed(name: string, permission: string, capabilities: CapabilitySet): boolean {
@@ -800,11 +788,9 @@ export class RuntimeApp {
   }
 
   private authorizeSnowLumaAction(operation: string, action: string, context: RuntimeToolContext): void {
-    const owner = context.trust === "OWNER" && (
-      this.isConfiguredOwner(context.requester.platform, context.requester.accountId, context.requester.userId)
-    );
-    this.db.run("INSERT INTO authorization_audit_events(id,operation,decision,reason,resource,requester_id,task_id,conversation_id,metadata_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)", newId("authz"), operation, owner ? "ALLOW" : "DENY", owner ? null : "SNOWLUMA_OWNER_REQUIRED", action, context.requesterId, context.taskId ?? null, context.conversationId, JSON.stringify({ action }), nowIso());
-    if (!owner) throw new Error("SNOWLUMA_OWNER_REQUIRED");
+    const systemAdmin = !context.workerId && this.isSystemAdmin(context.requester.platform, context.requester.accountId, context.requester.userId);
+    this.db.run("INSERT INTO authorization_audit_events(id,operation,decision,reason,resource,requester_id,task_id,conversation_id,metadata_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)", newId("authz"), operation, systemAdmin ? "ALLOW" : "DENY", systemAdmin ? null : "SYSTEM_ADMIN_REQUIRED", action, context.requesterId, context.taskId ?? null, context.conversationId, JSON.stringify({ action }), nowIso());
+    if (!systemAdmin) throw new Error("SYSTEM_ADMIN_REQUIRED");
   }
 
   private messageRef(value: unknown): PlatformMessageRef | undefined {
@@ -815,17 +801,17 @@ export class RuntimeApp {
   private async controlCommand(conversationId: string, event: ControllerEventEnvelope, command: string, args: string[]): Promise<void> {
     const conversation = this.getConversation(conversationId);
     const principal = this.resolvePrincipalIdentity(event.source.platform, event.source.accountId, event.trustedIdentity?.userId ?? "unknown");
-    const caps = deriveCapabilities({ platform: event.source.platform, accountId: event.source.accountId, userId: event.trustedIdentity?.userId ?? "unknown", principalId: principal.principalId, trust: principal.trust, conversationId }, conversation.address, configuredOwners(this.config), conversationId, this.pluginPolicy);
+    const caps = deriveCapabilities({ platform: event.source.platform, accountId: event.source.accountId, userId: event.trustedIdentity?.userId ?? "unknown", principalId: principal.principalId, conversationId }, conversation.address, conversationId, this.pluginPolicy);
     if (command === "help") { await this.sendText(conversation.address, "/status /tasks /stop /new /usage /bind /unbind /help\n自然语言消息会交给 Main。", event.message?.ref, conversationId, caps); return; }
     if (command === "bind" || command === "unbind") {
-      if (conversation.address.kind !== "private" || !this.isConfiguredOwner(event.source.platform, event.source.accountId, event.trustedIdentity?.userId ?? "unknown")) throw new Error("IDENTITY_BINDING_DENIED");
+      if (conversation.address.kind !== "private" || !this.isSystemAdmin(event.source.platform, event.source.accountId, event.trustedIdentity?.userId ?? "unknown")) throw new Error("SYSTEM_ADMIN_REQUIRED");
       if (args.length !== 3 || args.some((value) => !value.trim())) throw new Error("IDENTITY_BINDING_ARGUMENTS_REQUIRED");
       const [platform = "", accountId = "", userId = ""] = args;
       const target: PlatformIdentityRef = { platform, accountId, userId };
       const actor: PlatformIdentityRef = { platform: event.source.platform, accountId: event.source.accountId, userId: event.trustedIdentity?.userId ?? "unknown" };
       if (command === "bind") this.bindPlatformIdentity(actor, target);
       else this.unbindPlatformIdentity(actor, target);
-      await this.sendText(conversation.address, command === "bind" ? `已绑定 ${target.platform}/${target.accountId}/${target.userId} 到 Owner Principal。` : `已解除 ${target.platform}/${target.accountId}/${target.userId} 的 Principal 绑定。`, event.message?.ref, conversationId, caps);
+      await this.sendText(conversation.address, command === "bind" ? `已绑定 ${target.platform}/${target.accountId}/${target.userId} 到当前 Principal。` : `已解除 ${target.platform}/${target.accountId}/${target.userId} 的 Principal 绑定。`, event.message?.ref, conversationId, caps);
       return;
     }
     if (command === "new") {
@@ -844,7 +830,6 @@ export class RuntimeApp {
         conversationId,
         requesterId: event.trustedIdentity?.userId ?? "unknown",
          requester: { platform: event.source.platform, accountId: event.source.accountId, userId: event.trustedIdentity?.userId ?? "unknown", principalId: principal.principalId },
-         trust: principal.trust,
         address: conversation.address,
         capabilities: caps,
         ...(event.message?.ref ? { message: event.message.ref } : {}),
@@ -917,11 +902,11 @@ export class RuntimeApp {
     if (!summary) return;
     const conversation = this.db.get<{ kind: ConversationAddress["kind"] }>("SELECT kind FROM conversations WHERE conversation_id=?", task.originConversationId);
     const principal = task.requester.principalId!;
-    const candidates: MemoryScope[] = [`workspace:${task.originConversationId}`, `user:${principal}`, "global_agent"];
+    const candidates: MemoryScope[] = [`workspace:${task.originConversationId}`, `user:${principal}`];
     const scope = candidates.find((candidate) => task.capabilities.memory.allowedScopes.includes(candidate));
     if (!scope) return;
     this.memory.ingestTaskEpisode({
-      access: { requesterId: task.requester.userId, principalId: task.requester.principalId!, trust: task.trust, allowedScopes: task.capabilities.memory.allowedScopes, conversationId: task.originConversationId },
+      access: { requesterId: task.requester.userId, principalId: task.requester.principalId!, allowedScopes: task.capabilities.memory.allowedScopes, conversationId: task.originConversationId },
       scope,
       taskId: task.id,
       sourceId,
@@ -998,81 +983,49 @@ export class RuntimeApp {
     });
   }
 
-  private getOrCreateConversation(address: ConversationAddress, requesterPrincipal?: { principalId: string; trust: Trust }): { id: string; address: ConversationAddress; principalId: string; trust: Trust } {
+  private getOrCreateConversation(address: ConversationAddress): { id: string; address: ConversationAddress } {
     const thread = JSON.stringify(address.threadId);
-    const existing = this.db.get<{ conversation_id: string; principal_id: string | null; trust: "OWNER" | "GUEST" }>("SELECT conversation_id,principal_id,trust FROM conversations WHERE platform=? AND account_id=? AND platform_conversation_id=? AND thread_id_json=?", address.platform, address.accountId, address.platformConversationId, thread);
-    if (existing) {
-      const trust = this.conversationTrust(address, requesterPrincipal, existing.trust);
-      const principalId = address.kind === "group"
-        ? existing.principal_id ?? this.conversationPrincipalId(address)
-        : requesterPrincipal?.principalId ?? existing.principal_id ?? this.conversationPrincipalId(address);
-      if (trust !== existing.trust || principalId !== existing.principal_id) {
-        this.db.run("UPDATE conversations SET principal_id=?,trust=?,memory_scopes_json=?,updated_at=? WHERE conversation_id=?", principalId, trust, JSON.stringify(this.conversationScopes(existing.conversation_id, address, principalId, trust)), nowIso(), existing.conversation_id);
-      }
-      return { id: existing.conversation_id, address, principalId, trust };
-    }
+    const existing = this.db.get<{ conversation_id: string }>("SELECT conversation_id FROM conversations WHERE platform=? AND account_id=? AND platform_conversation_id=? AND thread_id_json=?", address.platform, address.accountId, address.platformConversationId, thread);
+    if (existing) return { id: existing.conversation_id, address };
     const id = newId("conv");
-    const identity = address.kind === "group" ? this.resolvePrincipal(address) : requesterPrincipal ?? this.resolvePrincipal(address);
-    const trust = this.conversationTrust(address, requesterPrincipal, identity.trust);
-    const scopes = this.conversationScopes(id, address, identity.principalId, trust);
-    this.db.run("INSERT INTO conversations(conversation_id,platform,account_id,kind,platform_conversation_id,thread_id_json,principal_id,trust,memory_scopes_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", id, address.platform, address.accountId, address.kind, address.platformConversationId, thread, identity.principalId, trust, JSON.stringify(scopes), nowIso(), nowIso());
-    return { id, address, principalId: identity.principalId, trust };
+    this.db.run("INSERT INTO conversations(conversation_id,platform,account_id,kind,platform_conversation_id,thread_id_json,memory_scopes_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)", id, address.platform, address.accountId, address.kind, address.platformConversationId, thread, JSON.stringify([`workspace:${id}`]), nowIso(), nowIso());
+    return { id, address };
   }
 
-  private getConversation(id: string): { id: string; address: ConversationAddress; principalId: string; trust: "OWNER" | "GUEST" } {
-    const row = this.db.get<{ conversation_id: string; platform: string; account_id: string; kind: "private" | "group"; platform_conversation_id: string; thread_id_json: string; principal_id: string | null; trust: "OWNER" | "GUEST" }>("SELECT conversation_id,platform,account_id,kind,platform_conversation_id,thread_id_json,principal_id,trust FROM conversations WHERE conversation_id=?", id);
+  private getConversation(id: string): { id: string; address: ConversationAddress } {
+    const row = this.db.get<{ conversation_id: string; platform: string; account_id: string; kind: "private" | "group"; platform_conversation_id: string; thread_id_json: string }>("SELECT conversation_id,platform,account_id,kind,platform_conversation_id,thread_id_json FROM conversations WHERE conversation_id=?", id);
     if (!row) throw new Error("CONVERSATION_NOT_FOUND");
     const address = { platform: row.platform, accountId: row.account_id, kind: row.kind, platformConversationId: row.platform_conversation_id, threadId: JSON.parse(row.thread_id_json) } as ConversationAddress;
-    return { id: row.conversation_id, address, principalId: row.principal_id ?? this.conversationPrincipalId(address), trust: row.trust };
+    return { id: row.conversation_id, address };
   }
 
-  private resolvePrincipal(address: ConversationAddress): { principalId: string; trust: "OWNER" | "GUEST" } {
-    if (address.kind === "group") return { principalId: this.conversationPrincipalId(address), trust: "GUEST" };
-    return this.resolvePrincipalIdentity(address.platform, address.accountId, address.platformConversationId);
-  }
-
-  private resolvePrincipalIdentity(platform: string, accountId: string, userId: string): { principalId: string; trust: Trust } {
-    const identity = this.principals.resolveIdentity(platform, accountId, userId, configuredOwners(this.config));
+  private resolvePrincipalIdentity(platform: string, accountId: string, userId: string): { principalId: string } {
+    const identity = this.principals.resolveIdentity(platform, accountId, userId);
     const principal = this.principals.get(identity.principalId);
-    this.log.debug("Message sender Principal resolved", { principalId: identity.principalId, role: identity.trust, uid: principal.runtimeUid, gid: principal.runtimeGid, contextSource: "trusted-message-sender-and-platform-identity-binding" });
+    this.log.debug("Message sender Principal resolved", { principalId: identity.principalId, uid: principal.runtimeUid, gid: principal.runtimeGid, contextSource: "trusted-message-sender-and-platform-identity-binding" });
     return identity;
   }
 
   private bindPlatformIdentity(actor: PlatformIdentityRef, target: PlatformIdentityRef): void {
-    if (!this.isConfiguredOwner(actor.platform, actor.accountId, actor.userId)) throw new Error("IDENTITY_BINDING_DENIED");
+    if (!this.isSystemAdmin(actor.platform, actor.accountId, actor.userId)) throw new Error("SYSTEM_ADMIN_REQUIRED");
     if (!target.platform || !target.accountId || !target.userId) throw new Error("IDENTITY_BINDING_ARGUMENTS_REQUIRED");
-    this.principals.resolveIdentity(actor.platform, actor.accountId, actor.userId, configuredOwners(this.config));
+    const principalId = this.principals.resolveIdentity(actor.platform, actor.accountId, actor.userId).principalId;
     this.db.transaction(() => {
-      const changed = this.db.run("UPDATE platform_identities SET principal_id=? WHERE platform=? AND account_id=? AND user_id=?", OWNER_PRINCIPAL_ID, target.platform, target.accountId, target.userId);
-      if (changed.changes === 0) this.db.run("INSERT INTO platform_identities(platform,account_id,user_id,principal_id) VALUES (?,?,?,?)", target.platform, target.accountId, target.userId, OWNER_PRINCIPAL_ID);
+      const changed = this.db.run("UPDATE platform_identities SET principal_id=? WHERE platform=? AND account_id=? AND user_id=?", principalId, target.platform, target.accountId, target.userId);
+      if (changed.changes === 0) {
+        this.principals.resolveIdentity(target.platform, target.accountId, target.userId);
+        this.db.run("UPDATE platform_identities SET principal_id=? WHERE platform=? AND account_id=? AND user_id=?", principalId, target.platform, target.accountId, target.userId);
+      }
     });
   }
 
   private unbindPlatformIdentity(actor: PlatformIdentityRef, target: PlatformIdentityRef): void {
-    if (!this.isConfiguredOwner(actor.platform, actor.accountId, actor.userId)) throw new Error("IDENTITY_BINDING_DENIED");
-    if (this.isConfiguredOwner(target.platform, target.accountId, target.userId)) throw new Error("OWNER_IDENTITY_CANNOT_UNBIND");
+    if (!this.isSystemAdmin(actor.platform, actor.accountId, actor.userId)) throw new Error("SYSTEM_ADMIN_REQUIRED");
     this.db.run("DELETE FROM platform_identities WHERE platform=? AND account_id=? AND user_id=?", target.platform, target.accountId, target.userId);
   }
 
-  private isConfiguredOwner(platform: string, accountId: string, userId: string): boolean {
-    return configuredOwners(this.config).some((owner) => platform === owner.platform && accountId === owner.accountId && userId === owner.userId);
-  }
-
-  private conversationTrust(address: ConversationAddress, requesterPrincipal: { trust: Trust } | undefined, fallback: Trust): Trust {
-    if (address.kind === "group") return "GUEST";
-    if (this.isConfiguredOwner(address.platform, address.accountId, address.platformConversationId)) return "OWNER";
-    return requesterPrincipal?.trust ?? fallback;
-  }
-
-  private conversationPrincipalId(address: ConversationAddress): string {
-    return `principal:conversation:${address.platform}:${address.accountId}:${address.kind}:${address.platformConversationId}:${JSON.stringify(address.threadId)}`;
-  }
-
-  private conversationScopes(conversationId: string, address: ConversationAddress, principalId: string, trust: Trust): string[] {
-    const scopes = [`user:${principalId}`, `workspace:${conversationId}`];
-    if (trust === "OWNER") scopes.push("global_agent");
-    if (trust === "OWNER" && address.kind === "private") scopes.push("owner_private");
-    return scopes;
+  private isSystemAdmin(platform: string, accountId: string, userId: string): boolean {
+    return configuredSystemAdmins(this.config).some((admin) => platform === admin.platform && accountId === admin.accountId && userId === admin.userId);
   }
 
 }

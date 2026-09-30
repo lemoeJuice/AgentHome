@@ -6,7 +6,6 @@ import { join } from "node:path";
 import { SqliteStore, migrate } from "../src/db.js";
 import { runtimeMigrations } from "../src/schema.js";
 import { MemoryService } from "../src/runtime/memory.js";
-import { PrincipalService } from "../src/runtime/principals.js";
 import { authorizeMemory, attenuateTask, attenuateWorker, capabilityWithin, CapabilityRequestDeniedError, deriveCapabilities } from "../src/auth.js";
 import { messageKey, namespaceKey } from "../src/shared/ids.js";
 import { NOT_IMPLEMENTED } from "../src/shared/types.js";
@@ -18,44 +17,41 @@ test("message references keep platform/account/conversation namespaces", () => {
   assert.equal(namespaceKey(["qq", "a", "1", null]), "qq\u001fa\u001f1\u001f<null>");
 });
 
-test("missing Owner configuration never grants Owner capabilities", () => {
-  const capabilities = deriveCapabilities(
-    { platform: "qq", accountId: "default", userId: "anyone", trust: "GUEST", conversationId: "private" },
-    { platform: "qq", accountId: "default", kind: "private", platformConversationId: "anyone", threadId: null },
-    undefined,
-    "private",
-  );
-  assert.equal(capabilities.tasks.canCreate, false);
-  assert.equal(capabilities.tasks.canCancel, false);
-  assert.equal(capabilities.projects.length, 0);
-  assert.equal(capabilities.memory.allowedScopes.includes("owner_private"), false);
+test("authenticated Principals receive the same execution capabilities independent of control-plane membership", () => {
+  const conversation = { platform: "qq", accountId: "default", kind: "private" as const, platformConversationId: "user", threadId: null };
+  const ordinary = deriveCapabilities({ platform: "qq", accountId: "default", userId: "ordinary", principalId: "principal:ordinary", conversationId: "private" }, conversation, "private", { allowedActions: ["project.read"] });
+  const admin = deriveCapabilities({ platform: "qq", accountId: "default", userId: "admin", principalId: "principal:admin", conversationId: "private" }, conversation, "private", { allowedActions: ["project.read"] });
+  assert.deepEqual(ordinary.projects, [{ projectId: "*", access: "WRITE" }]);
+  assert.equal(ordinary.tasks.canCreate, true);
+  assert.deepEqual(ordinary.plugins, admin.plugins);
+  assert.deepEqual(ordinary.artifacts, admin.artifacts);
+  assert.deepEqual(ordinary.tasks, admin.tasks);
+  assert.deepEqual(ordinary.memory.allowedScopes, ["user:principal:ordinary", "workspace:private"]);
 });
 
 test("memory service enforces scope at the service boundary", () => {
   const db = new SqliteStore(":memory:");
   migrate(db, runtimeMigrations);
   const memory = new MemoryService(db);
-  assert.throws(() => memory.remember({ access: { requesterId: "owner", trust: "OWNER", allowedScopes: ["owner_private"] }, scope: "owner_private", content: "private secret" }), /MEMORY_SCOPE_DENIED/);
-  assert.deepEqual(memory.retrieve({ text: "secret", access: { requesterId: "guest", trust: "GUEST", allowedScopes: ["owner_private"] } }).items, []);
-  assert.equal(authorizeMemory({ memory: { allowedScopes: ["global_agent"] }, projects: [], qq: { readConversations: [], sendConversations: [] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: [], publishTaskIds: [], allowedDestinations: [] }, tasks: { canCreate: false, visibleTaskIds: [], canCancel: false, canFollowUp: false } }, "owner_private").allowed, false);
+  assert.throws(() => memory.remember({ access: { requesterId: "owner", allowedScopes: ["user:other"] }, scope: "user:other", content: "private secret" }), /MEMORY_SCOPE_DENIED/);
+  assert.deepEqual(memory.retrieve({ text: "secret", access: { requesterId: "guest", allowedScopes: ["user:owner"] } }).items, []);
+  assert.equal(authorizeMemory({ memory: { allowedScopes: ["user:owner"] }, projects: [], qq: { readConversations: [], sendConversations: [] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: [], publishTaskIds: [], allowedDestinations: [] }, tasks: { canCreate: false, visibleTaskIds: [], canCancel: false, canFollowUp: false } }, "workspace:owner").allowed, false);
   db.close();
 });
 
-test("configured MemoryService rejects forged owner scope and accepts canonical owner private scope", () => {
+test("MemoryService authorizes only canonical Principal and Workspace scopes", () => {
   const db = new SqliteStore(":memory:");
   migrate(db, runtimeMigrations);
-  db.run("INSERT INTO conversations(conversation_id,platform,account_id,kind,platform_conversation_id,thread_id_json,trust,memory_scopes_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)", "group-conv", "qq", "a", "group", "g", "null", "GUEST", JSON.stringify(["global_agent", "group:group-conv"]), new Date().toISOString(), new Date().toISOString());
-  db.run("INSERT INTO conversations(conversation_id,platform,account_id,kind,platform_conversation_id,thread_id_json,trust,memory_scopes_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)", "private-conv", "qq", "a", "private", "owner", "null", "OWNER", JSON.stringify(["global_agent", "user:owner", "owner_private"]), new Date().toISOString(), new Date().toISOString());
-  const memory = new MemoryService(db, { platform: "qq", accountId: "a", userId: "owner" });
-  assert.throws(() => memory.remember({ access: { requesterId: "guest", trust: "GUEST", allowedScopes: ["owner_private"], conversationId: "group-conv" }, scope: "owner_private", content: "forged" }), /MEMORY_SCOPE_DENIED/);
-  assert.equal(memory.remember({ access: { requesterId: "owner", trust: "OWNER", allowedScopes: ["owner_private"], conversationId: "private-conv" }, scope: "owner_private", content: "canonical" }).content, "canonical");
+  const memory = new MemoryService(db);
+  assert.throws(() => memory.remember({ access: { requesterId: "guest", principalId: "principal:guest", allowedScopes: ["user:principal:owner"], conversationId: "group-conv" }, scope: "user:principal:owner", content: "forged" }), /MEMORY_SCOPE_DENIED/);
+  assert.equal(memory.remember({ access: { requesterId: "owner", principalId: "principal:owner", allowedScopes: ["user:principal:owner", "workspace:private-conv"], conversationId: "private-conv" }, scope: "user:principal:owner", content: "canonical" }).content, "canonical");
   db.close();
 });
 
 test("capability attenuation rejects out-of-range requests with structured decisions", () => {
-  const parent = { memory: { allowedScopes: ["global_agent"] as const }, projects: [{ projectId: "p", access: "READ" as const }], qq: { readConversations: ["c"], sendConversations: ["c"] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: ["agent-home"], publishTaskIds: [], allowedDestinations: ["c"] }, tasks: { canCreate: true, visibleTaskIds: [], canCancel: true, canFollowUp: true } };
+  const parent = { memory: { allowedScopes: ["user:p"] as const }, projects: [{ projectId: "p", access: "READ" as const }], qq: { readConversations: ["c"], sendConversations: ["c"] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: ["agent-home"], publishTaskIds: [], allowedDestinations: ["c"] }, tasks: { canCreate: true, visibleTaskIds: [], canCancel: true, canFollowUp: true } };
   assert.throws(
-    () => attenuateTask(parent, { projects: [{ projectId: "other", access: "WRITE" }], memory: { allowedScopes: ["owner_private"] } }, "t"),
+    () => attenuateTask(parent, { projects: [{ projectId: "other", access: "WRITE" }], memory: { allowedScopes: ["user:other"] } }, "t"),
     (error: unknown) => error instanceof CapabilityRequestDeniedError
       && error.decision.reason === "PRIVILEGE_ESCALATION_DENIED"
       && error.decision.operation === "task.create"
@@ -82,7 +78,7 @@ test("capability attenuation rejects out-of-range requests with structured decis
 
 test("plugin permission scopes attenuate independently from action names", () => {
   const parent = {
-    memory: { allowedScopes: ["global_agent"] as const }, projects: [],
+    memory: { allowedScopes: ["user:p"] as const }, projects: [],
     qq: { readConversations: ["conversation"], sendConversations: ["conversation"] },
     plugins: { allowedActions: ["project.read", "project.write"] },
     artifacts: { readableArtifactAuthorities: [], publishTaskIds: [], allowedDestinations: ["conversation"] },
@@ -96,21 +92,19 @@ test("plugin permission scopes attenuate independently from action names", () =>
   assert.throws(() => attenuateTask({ ...parent, plugins: { ...parent.plugins, allowedPermissions: ["project.read"] } }, { plugins: { allowedPermissions: ["project.write"] } }, "task-2"), /PRIVILEGE_ESCALATION_DENIED/);
 });
 
-test("derived private conversation scopes do not fall back to a group scope", () => {
+test("derived conversation scopes use only Principal and Workspace identities", () => {
   const conversation = { platform: "qq", accountId: "a", kind: "private" as const, platformConversationId: "guest", threadId: null };
-  const guest = deriveCapabilities({ platform: "qq", accountId: "a", userId: "guest", trust: "GUEST", conversationId: "conv" }, conversation, { platform: "qq", accountId: "a", userId: "owner" }, "conv");
-  const owner = deriveCapabilities({ platform: "qq", accountId: "a", userId: "owner", trust: "OWNER", conversationId: "conv" }, conversation, { platform: "qq", accountId: "a", userId: "owner" }, "conv");
-  assert.deepEqual(guest.memory.allowedScopes, ["user:guest", "workspace:conv"]);
-  assert.ok(owner.memory.allowedScopes.includes("owner_private"));
-  assert.ok(!guest.memory.allowedScopes.some((scope) => scope.startsWith("group:")));
+  const privateCaps = deriveCapabilities({ platform: "qq", accountId: "a", userId: "guest", conversationId: "conv" }, conversation, "conv");
+  const groupCaps = deriveCapabilities({ platform: "qq", accountId: "a", userId: "guest", conversationId: "group-conv" }, { ...conversation, kind: "group" }, "group-conv");
+  assert.deepEqual(privateCaps.memory.allowedScopes, ["user:guest", "workspace:conv"]);
+  assert.deepEqual(groupCaps.memory.allowedScopes, ["user:guest", "workspace:group-conv"]);
 });
 
 test("private Memory scope follows explicit Principal identity", () => {
   const conversation = { platform: "qq", accountId: "a", kind: "private" as const, platformConversationId: "qq-user", threadId: null };
-  const owner = { platform: "qq", accountId: "a", userId: "owner" };
-  const first = deriveCapabilities({ platform: "qq", accountId: "a", userId: "qq-user", principalId: "principal:shared", trust: "GUEST", conversationId: "conv-1" }, conversation, owner, "conv-1");
-  const second = deriveCapabilities({ platform: "telegram", accountId: "b", userId: "tg-user", principalId: "principal:shared", trust: "GUEST", conversationId: "conv-2" }, { ...conversation, platform: "telegram", accountId: "b", platformConversationId: "tg-user" }, owner, "conv-2");
-  const unbound = deriveCapabilities({ platform: "telegram", accountId: "b", userId: "tg-user", trust: "GUEST", conversationId: "conv-3" }, { ...conversation, platform: "telegram", accountId: "b", platformConversationId: "tg-user" }, owner, "conv-3");
+  const first = deriveCapabilities({ platform: "qq", accountId: "a", userId: "qq-user", principalId: "principal:shared", conversationId: "conv-1" }, conversation, "conv-1");
+  const second = deriveCapabilities({ platform: "telegram", accountId: "b", userId: "tg-user", principalId: "principal:shared", conversationId: "conv-2" }, { ...conversation, platform: "telegram", accountId: "b", platformConversationId: "tg-user" }, "conv-2");
+  const unbound = deriveCapabilities({ platform: "telegram", accountId: "b", userId: "tg-user", conversationId: "conv-3" }, { ...conversation, platform: "telegram", accountId: "b", platformConversationId: "tg-user" }, "conv-3");
   assert.deepEqual(first.memory.allowedScopes, ["user:principal:shared", "workspace:conv-1"]);
   assert.deepEqual(second.memory.allowedScopes, ["user:principal:shared", "workspace:conv-2"]);
   assert.deepEqual(unbound.memory.allowedScopes, ["user:tg-user", "workspace:conv-3"]);
@@ -120,17 +114,17 @@ test("MemoryService shares explicitly bound user scope but isolates unbound iden
   const db = new SqliteStore(":memory:");
   migrate(db, runtimeMigrations);
   const memory = new MemoryService(db);
-  const shared = { trust: "GUEST" as const, allowedScopes: ["user:principal:shared"] as const };
+  const shared = { allowedScopes: ["user:principal:shared"] as const };
   memory.remember({ access: { ...shared, requesterId: "qq-user", principalId: "principal:shared" }, scope: "user:principal:shared", content: "shared preference" });
   assert.equal(memory.retrieve({ text: "shared", access: { ...shared, requesterId: "tg-user", principalId: "principal:shared" } }).items.length, 1);
-  assert.equal(memory.retrieve({ text: "shared", access: { requesterId: "tg-user", trust: "GUEST", allowedScopes: ["user:tg-user"] } }).items.length, 0);
+  assert.equal(memory.retrieve({ text: "shared", access: { requesterId: "tg-user", allowedScopes: ["user:tg-user"] } }).items.length, 0);
   db.close();
 });
 
 test("Principal-scoped Memory survives reopening the canonical database", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-principal-memory-"));
   const databasePath = join(root, "memory.sqlite");
-  const access = { requesterId: "qq-user", principalId: "principal:shared", trust: "GUEST" as const, allowedScopes: ["user:principal:shared"] as const };
+  const access = { requesterId: "qq-user", principalId: "principal:shared", allowedScopes: ["user:principal:shared"] as const };
   const firstDb = new SqliteStore(databasePath);
   migrate(firstDb, runtimeMigrations);
   new MemoryService(firstDb).remember({ access, scope: "user:principal:shared", content: "persistent preference" });
@@ -139,59 +133,31 @@ test("Principal-scoped Memory survives reopening the canonical database", async 
   migrate(secondDb, runtimeMigrations);
   const memory = new MemoryService(secondDb);
   assert.equal(memory.retrieve({ text: "persistent", access: { ...access, requesterId: "tg-user" } }).items.length, 1);
-  assert.equal(memory.retrieve({ text: "persistent", access: { requesterId: "tg-user", trust: "GUEST", allowedScopes: ["user:tg-user"] } }).items.length, 0);
+  assert.equal(memory.retrieve({ text: "persistent", access: { requesterId: "tg-user", allowedScopes: ["user:tg-user"] } }).items.length, 0);
   secondDb.close();
   await rm(root, { recursive: true, force: true });
 });
 
-test("legacy shared Guest Memory is moved to its Principal or quarantined", () => {
+test("Principal and Workspace remain the only Memory scope boundaries", () => {
   const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
-  const principals = new PrincipalService(db, "/tmp/principal-memory-migration");
-  principals.ensureOwnerPrincipal();
-  const guest = principals.resolveIdentity("qq", "account-a", "guest-1");
-  principals.resolveIdentity("qq", "account-a", "guest-2");
-  const timestamp = new Date().toISOString();
-  const envelope = { protocolVersion: 1, eventId: "guest-event", instanceId: "migrate", type: "chat.message", occurredAt: timestamp, source: { platform: "qq", accountId: "account-a", adapter: "test" }, trustedIdentity: { userId: "guest-1" }, payload: {} };
-  db.run("INSERT INTO ingress_events(event_id,event_type,envelope_json,status,attempts,received_at,updated_at) VALUES (?,?,?,?,?,?,?)", "guest-event", "chat.message", JSON.stringify(envelope), "DONE", 1, timestamp, timestamp);
-  db.run("INSERT INTO memory_episodes(id,scope,source_json,actor_json,content,occurred_at,ingested_at,trust,metadata_json) VALUES (?,?,?,?,?,?,?,?,?)", "guest-episode", "global_agent", JSON.stringify({ type: "chat.message", platform: "qq", sourceId: "guest-event" }), JSON.stringify({ type: "user", id: "guest-1" }), "private guest fact", timestamp, timestamp, "guest", null);
-  db.run("INSERT INTO memory_facts(id,scope,subject,predicate,object_json,confidence,status,provenance_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)", "guest-fact", "global_agent", "guest", "preference", JSON.stringify("tea"), 0.9, "active", JSON.stringify(["guest-episode"]), timestamp, timestamp);
-  db.run("INSERT INTO memory_explicit(id,scope,content,provenance_json,created_at,updated_at) VALUES (?,?,?,?,?,?)", "unattributed-shared", "global_agent", "ambiguous legacy data", "[]", timestamp, timestamp);
-  try {
-    const memory = new MemoryService(db, { platform: "qq", accountId: "account-a", userId: "owner" });
-    assert.deepEqual(memory.isolateLegacyPrincipalScopes(), { moved: 2, quarantined: 1 });
-    assert.equal(db.get<{ scope: string }>("SELECT scope FROM memory_episodes WHERE id=?", "guest-episode")?.scope, `user:${guest.principalId}`);
-    assert.equal(db.get<{ scope: string }>("SELECT scope FROM memory_facts WHERE id=?", "guest-fact")?.scope, `user:${guest.principalId}`);
-    assert.equal(db.get<{ scope: string }>("SELECT scope FROM memory_explicit WHERE id=?", "unattributed-shared")?.scope, "legacy_quarantine:unattributed-shared");
-    const own = memory.retrieve({ text: "private guest fact", access: { requesterId: "guest-1", principalId: guest.principalId, trust: "GUEST", allowedScopes: [`user:${guest.principalId}`] } });
-    const other = memory.retrieve({ text: "private guest fact", access: { requesterId: "guest-2", trust: "GUEST", allowedScopes: ["user:other"] } });
-    assert.ok(own.items.some((item) => item.id === "guest-episode"));
-    assert.equal(other.items.some((item) => item.id === "guest-episode"), false);
-    assert.equal(memory.retrieve({ text: "ambiguous legacy data", access: { requesterId: "owner", trust: "OWNER", allowedScopes: ["global_agent"] } }).items.some((item) => item.id === "unattributed-shared"), false);
-  } finally { db.close(); }
-});
-
-test("Guest Task execution can be enabled without sharing Principal Memory", () => {
-  const group = { platform: "qq", accountId: "a", kind: "group" as const, platformConversationId: "g", threadId: null };
-  const owner = deriveCapabilities({ platform: "qq", accountId: "a", userId: "owner", trust: "OWNER", conversationId: "group-conv" }, group, { platform: "qq", accountId: "a", userId: "owner" }, "group-conv");
-  const guest = deriveCapabilities({ platform: "qq", accountId: "a", userId: "guest", trust: "GUEST", conversationId: "group-conv" }, group, { platform: "qq", accountId: "a", userId: "owner" }, "group-conv", { guestTaskExecutionEnabled: true });
-  const privateOwner = deriveCapabilities({ platform: "qq", accountId: "a", userId: "owner", trust: "OWNER", conversationId: "private-conv" }, { ...group, kind: "private", platformConversationId: "owner" }, { platform: "qq", accountId: "a", userId: "owner" }, "private-conv");
-  assert.deepEqual(owner.projects, [{ projectId: "*", access: "WRITE" }]);
-  assert.equal(owner.tasks.canCreate, true);
-  assert.equal(owner.memory.allowedScopes.includes("owner_private"), false);
-  assert.equal(guest.tasks.canCreate, true);
-  assert.equal(guest.tasks.canCancel, true);
-  assert.deepEqual(guest.projects, [{ projectId: "*", access: "WRITE" }]);
-  assert.deepEqual(guest.memory.allowedScopes, ["user:guest", "workspace:group-conv"]);
-  assert.deepEqual(privateOwner.projects, owner.projects);
-  assert.equal(privateOwner.tasks.canCreate, true);
+  const memory = new MemoryService(db);
+  const privateScope = { requesterId: "alice", principalId: "principal-a", allowedScopes: ["user:principal-a", "workspace:conversation-a"] as import("../src/shared/types.js").MemoryScope[], conversationId: "conversation-a" };
+  const groupScope = { requesterId: "bob", principalId: "principal-b", allowedScopes: ["user:principal-b", "workspace:conversation-b"] as import("../src/shared/types.js").MemoryScope[], conversationId: "conversation-b" };
+  memory.remember({ access: privateScope, scope: "user:principal-a", content: "Alice preference" });
+  memory.remember({ access: groupScope, scope: "workspace:conversation-b", content: "Shared group decision" });
+  assert.equal(memory.retrieve({ text: "Alice preference", access: privateScope }).items.length, 1);
+  assert.equal(memory.retrieve({ text: "Alice preference", access: groupScope }).items.length, 0);
+  assert.equal(memory.retrieve({ text: "Shared group decision", access: groupScope }).items.length, 1);
+  assert.throws(() => memory.remember({ access: privateScope, scope: "workspace:conversation-b", content: "cross-workspace" }), /MEMORY_SCOPE_DENIED/);
+  db.close();
 });
 
 test("Workspace memory follows the conversation for different Principals", () => {
   const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
   const memory = new MemoryService(db);
-  const writer = { requesterId: "alice", principalId: "principal-a", trust: "GUEST" as const, allowedScopes: ["user:principal-a", "workspace:conversation-x"] as import("../src/shared/types.js").MemoryScope[], conversationId: "conversation-x" };
-  const teammate = { requesterId: "bob", principalId: "principal-b", trust: "GUEST" as const, allowedScopes: ["user:principal-b", "workspace:conversation-x"] as import("../src/shared/types.js").MemoryScope[], conversationId: "conversation-x" };
-  const otherConversation = { requesterId: "alice", principalId: "principal-a", trust: "GUEST" as const, allowedScopes: ["user:principal-a", "workspace:conversation-y"] as import("../src/shared/types.js").MemoryScope[], conversationId: "conversation-y" };
+  const writer = { requesterId: "alice", principalId: "principal-a", allowedScopes: ["user:principal-a", "workspace:conversation-x"] as import("../src/shared/types.js").MemoryScope[], conversationId: "conversation-x" };
+  const teammate = { requesterId: "bob", principalId: "principal-b", allowedScopes: ["user:principal-b", "workspace:conversation-x"] as import("../src/shared/types.js").MemoryScope[], conversationId: "conversation-x" };
+  const otherConversation = { requesterId: "alice", principalId: "principal-a", allowedScopes: ["user:principal-a", "workspace:conversation-y"] as import("../src/shared/types.js").MemoryScope[], conversationId: "conversation-y" };
   memory.remember({ access: writer, scope: "workspace:conversation-x", content: "shared decision" });
   assert.equal(memory.retrieve({ text: "shared decision", access: teammate }).items.some((item) => item.content === "shared decision"), true);
   assert.equal(memory.retrieve({ text: "shared decision", access: otherConversation }).items.some((item) => item.content === "shared decision"), false);
@@ -201,9 +167,9 @@ test("Workspace memory follows the conversation for different Principals", () =>
 test("memory facts preserve temporal supersession and portable export", () => {
   const firstDb = new SqliteStore(":memory:"); migrate(firstDb, runtimeMigrations);
   const first = new MemoryService(firstDb);
-  const access = { requesterId: "owner", trust: "OWNER" as const, allowedScopes: ["global_agent"] as const };
-  const oldFact = first.rememberFact({ access, scope: "global_agent", subject: "user", predicate: "language", object: "en", confidence: 0.8, validFrom: "2026-01-01T00:00:00.000Z", provenance: ["source-old"] });
-  const newFact = first.rememberFact({ access, scope: "global_agent", subject: "user", predicate: "language", object: "zh-CN", confidence: 0.99, validFrom: "2026-02-01T00:00:00.000Z", provenance: ["source-new"] });
+  const access = { requesterId: "owner", allowedScopes: ["user:owner"] as const };
+  const oldFact = first.rememberFact({ access, scope: "user:owner", subject: "user", predicate: "language", object: "en", confidence: 0.8, validFrom: "2026-01-01T00:00:00.000Z", provenance: ["source-old"] });
+  const newFact = first.rememberFact({ access, scope: "user:owner", subject: "user", predicate: "language", object: "zh-CN", confidence: 0.99, validFrom: "2026-02-01T00:00:00.000Z", provenance: ["source-new"] });
   assert.equal(firstDb.get<{ status: string; valid_to: string }>("SELECT status,valid_to FROM memory_facts WHERE id=?", oldFact.id)?.status, "superseded");
   assert.equal(first.getMemory(newFact.id, access)?.type, "fact");
   const exported = first.exportMemory(access);
@@ -224,29 +190,28 @@ test("memory facts preserve temporal supersession and portable export", () => {
 test("Memory hide is non-destructive but removes the record from reads and rejects malformed imports", () => {
   const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
   const memory = new MemoryService(db);
-  const access = { requesterId: "owner", trust: "OWNER" as const, allowedScopes: ["global_agent"] as const };
-  const record = memory.remember({ access, scope: "global_agent", content: "temporary context" });
+  const access = { requesterId: "owner", allowedScopes: ["user:owner"] as const };
+  const record = memory.remember({ access, scope: "user:owner", content: "temporary context" });
   assert.equal(memory.forget({ id: record.id, access, mode: "hide" }).mode, "hide");
   assert.equal(memory.getMemory(record.id, access), null);
   assert.ok(db.get("SELECT 1 FROM memory_explicit WHERE id=?", record.id));
   assert.equal(memory.retrieve({ text: "temporary", access }).items.length, 0);
-  assert.throws(() => memory.importMemory({ manifest: { format: "agent-memory", version: 1, exportedAt: new Date().toISOString(), counts: { episodes: 0, facts: 1, episodic: 0, explicit: 0, profile: 0 } }, episodes: [], facts: [{ id: "fact-bad", scope: "global_agent", subject: "x", predicate: "y", object: true, confidence: 2, status: "active", provenance: [] }], episodic: [], explicit: [], profile: [] }, access), /MEMORY_IMPORT_FACT_INVALID/);
+  assert.throws(() => memory.importMemory({ manifest: { format: "agent-memory", version: 1, exportedAt: new Date().toISOString(), counts: { episodes: 0, facts: 1, episodic: 0, explicit: 0, profile: 0 } }, episodes: [], facts: [{ id: "fact-bad", scope: "user:owner", subject: "x", predicate: "y", object: true, confidence: 2, status: "active", provenance: [] }], episodic: [], explicit: [], profile: [] }, access), /MEMORY_IMPORT_FACT_INVALID/);
   db.close();
 });
 
 test("memory episodes consolidate into provenance-linked facts, episodic records, FTS, and profiles", () => {
   const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
   const memory = new MemoryService(db);
-  const access = { requesterId: "owner", trust: "OWNER" as const, allowedScopes: ["global_agent"] as const };
+  const access = { requesterId: "owner", allowedScopes: ["user:owner"] as const };
   const episode = memory.ingestEpisode({
     access,
     episode: {
-      scope: "global_agent",
+      scope: "user:owner",
       source: { type: "chat.message", platform: "qq", sourceId: "evt-1" },
       actor: { type: "user", id: "owner" },
       content: "The deployment uses staging.",
       occurredAt: "2026-09-20T00:00:00.000Z",
-      trust: "owner",
       metadata: { facts: [{ subject: "deployment", predicate: "environment", object: "staging", confidence: 0.9 }], episodic: [{ situation: "deployment discussion", lesson: "use staging" }] },
     },
   });
@@ -256,7 +221,7 @@ test("memory episodes consolidate into provenance-linked facts, episodic records
   assert.equal(db.get<{ count: number }>("SELECT count(*) AS count FROM memory_episodic")?.count, 1);
   assert.ok(db.get("SELECT 1 FROM memory_facts WHERE provenance_json LIKE ?", `%${episode.id}%`));
   assert.ok(db.get("SELECT 1 FROM memory_fts WHERE record_type='episodic'"));
-  assert.ok(db.get("SELECT 1 FROM memory_profiles WHERE scope='global_agent'"));
+  assert.ok(db.get("SELECT 1 FROM memory_profiles WHERE scope='user:owner'"));
   const result = memory.retrieve({ text: "staging", access, types: ["fact", "episodic"] });
   assert.equal(result.items.length, 2);
   assert.equal(memory.retrieve({ text: "staging deployment", access, types: ["fact"] }).items.length, 1);
@@ -264,7 +229,7 @@ test("memory episodes consolidate into provenance-linked facts, episodic records
   assert.equal(memory.getMemory(episodic!.id, access)?.type, "episodic");
   assert.deepEqual(memory.forget({ id: episodic!.id, access, purge: true }), { deleted: true });
   assert.equal(memory.getMemory(episodic!.id, access), null);
-  assert.throws(() => memory.ingestEpisode({ access: { requesterId: "guest", trust: "GUEST", allowedScopes: ["global_agent"] }, episode: { scope: "owner_private", source: { type: "chat.message" }, content: "private", occurredAt: new Date().toISOString(), trust: "guest" } }), /MEMORY_SCOPE_DENIED/);
+  assert.throws(() => memory.ingestEpisode({ access: { requesterId: "guest", allowedScopes: ["user:owner"] }, episode: { scope: "user:owner", source: { type: "chat.message" }, content: "private", occurredAt: new Date().toISOString() } }), /MEMORY_SCOPE_DENIED/);
   const exported = memory.exportMemory(access);
   const importedDb = new SqliteStore(":memory:"); migrate(importedDb, runtimeMigrations);
   const imported = new MemoryService(importedDb).importMemory(exported, access);
@@ -276,8 +241,8 @@ test("memory episodes consolidate into provenance-linked facts, episodic records
 test("memory inbox and derived index recover without blocking canonical ingest", () => {
   const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
   const memory = new MemoryService(db);
-  const access = { requesterId: "owner", trust: "OWNER" as const, allowedScopes: ["global_agent"] as const };
-  const episode = memory.ingestEpisode({ access, episode: { scope: "global_agent", source: { type: "test" }, content: "queued episode", occurredAt: new Date().toISOString(), trust: "owner" } });
+  const access = { requesterId: "owner", allowedScopes: ["user:owner"] as const };
+  const episode = memory.ingestEpisode({ access, episode: { scope: "user:owner", source: { type: "test" }, content: "queued episode", occurredAt: new Date().toISOString() } });
   assert.equal(db.get<{ status: string }>("SELECT status FROM memory_inbox WHERE episode_id=?", episode.id)?.status, "pending");
   assert.equal(db.get("SELECT 1 FROM memory_fts WHERE record_id=?", episode.id), undefined);
   assert.ok(db.get("SELECT 1 FROM memory_index_queue WHERE record_id=? AND status='pending'", episode.id));
@@ -297,28 +262,28 @@ test("memory inbox and derived index recover without blocking canonical ingest",
 test("memory episode adapters preserve source types and task-event idempotency", () => {
   const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
   const memory = new MemoryService(db);
-  const owner = { requesterId: "owner", trust: "OWNER" as const, allowedScopes: ["global_agent"] as const };
-  const task = memory.ingestTaskEpisode({ access: owner, scope: "global_agent", taskId: "task-1", sourceId: "task-event-1", content: "task completed", occurredAt: new Date().toISOString() });
-  const duplicate = memory.ingestTaskEpisode({ access: owner, scope: "global_agent", taskId: "task-1", sourceId: "task-event-1", content: "different retry text", occurredAt: new Date().toISOString() });
+  const principal = { requesterId: "owner", allowedScopes: ["user:owner"] as const };
+  const task = memory.ingestTaskEpisode({ access: principal, scope: "user:owner", taskId: "task-1", sourceId: "task-event-1", content: "task completed", occurredAt: new Date().toISOString() });
+  const duplicate = memory.ingestTaskEpisode({ access: principal, scope: "user:owner", taskId: "task-1", sourceId: "task-event-1", content: "different retry text", occurredAt: new Date().toISOString() });
   assert.equal(duplicate.id, task.id);
   assert.equal(db.get<{ count: number }>("SELECT count(*) AS count FROM memory_episodes WHERE source_json LIKE '%task-event-1%'")?.count, 1);
-  const document = memory.ingestDocumentEpisode({ access: owner, scope: "global_agent", documentId: "doc-1", content: "document content", occurredAt: new Date().toISOString() });
-  const manual = memory.ingestManualEpisode({ access: owner, scope: "global_agent", sourceId: "manual-1", content: "manual note", occurredAt: new Date().toISOString() });
-  const system = memory.ingestSystemEpisode({ access: { requesterId: "system", trust: "OWNER", allowedScopes: ["global_agent"] }, scope: "global_agent", sourceId: "system-1", content: "system event", occurredAt: new Date().toISOString() });
+  const document = memory.ingestDocumentEpisode({ access: principal, scope: "user:owner", documentId: "doc-1", content: "document content", occurredAt: new Date().toISOString() });
+  const manual = memory.ingestManualEpisode({ access: principal, scope: "user:owner", sourceId: "manual-1", content: "manual note", occurredAt: new Date().toISOString() });
+  const system = memory.ingestSystemEpisode({ access: { requesterId: "system", allowedScopes: ["user:owner"] }, scope: "user:owner", sourceId: "system-1", content: "system event", occurredAt: new Date().toISOString() });
   assert.deepEqual([task, document, manual, system].map((episode) => episode.source.type), ["task", "document", "manual", "system_event"]);
-  assert.throws(() => memory.ingestSystemEpisode({ access: owner, scope: "global_agent", sourceId: "forged", content: "forged", occurredAt: new Date().toISOString() }), /MEMORY_SYSTEM_INGEST_DENIED/);
+  assert.throws(() => memory.ingestSystemEpisode({ access: principal, scope: "user:owner", sourceId: "forged", content: "forged", occurredAt: new Date().toISOString() }), /MEMORY_SYSTEM_INGEST_DENIED/);
   db.close();
 });
 
 test("memory retention removes old raw episodes but preserves fact provenance and explicit memories", () => {
   const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
-  const memory = new MemoryService(db, undefined, { rawEpisodeDays: 30, keepExplicitForever: true });
-  const access = { requesterId: "owner", trust: "OWNER" as const, allowedScopes: ["global_agent"] as const };
-  const protectedEpisode = memory.ingestEpisode({ access, episode: { scope: "global_agent", source: { type: "test", sourceId: "protected" }, content: "protected raw", occurredAt: "2026-01-01T00:00:00.000Z", trust: "owner" } });
-  const removableEpisode = memory.ingestEpisode({ access, episode: { scope: "global_agent", source: { type: "test", sourceId: "removable" }, content: "removable raw", occurredAt: "2026-01-01T00:00:00.000Z", trust: "owner" } });
+  const memory = new MemoryService(db, { rawEpisodeDays: 30, keepExplicitForever: true });
+  const access = { requesterId: "owner", allowedScopes: ["user:owner"] as const };
+  const protectedEpisode = memory.ingestEpisode({ access, episode: { scope: "user:owner", source: { type: "test", sourceId: "protected" }, content: "protected raw", occurredAt: "2026-01-01T00:00:00.000Z" } });
+  const removableEpisode = memory.ingestEpisode({ access, episode: { scope: "user:owner", source: { type: "test", sourceId: "removable" }, content: "removable raw", occurredAt: "2026-01-01T00:00:00.000Z" } });
   db.run("UPDATE memory_inbox SET status='done' WHERE episode_id IN (?,?)", protectedEpisode.id, removableEpisode.id);
-  memory.rememberFact({ access, scope: "global_agent", subject: "deployment", predicate: "environment", object: "staging", provenance: [protectedEpisode.id] });
-  const explicit = memory.remember({ access, scope: "global_agent", content: "keep this explicit memory", provenance: [protectedEpisode.id] });
+  memory.rememberFact({ access, scope: "user:owner", subject: "deployment", predicate: "environment", object: "staging", provenance: [protectedEpisode.id] });
+  const explicit = memory.remember({ access, scope: "user:owner", content: "keep this explicit memory", provenance: [protectedEpisode.id] });
   assert.equal(memory.cleanupRetention(new Date("2026-03-01T00:00:00.000Z")), 1);
   assert.ok(db.get("SELECT 1 FROM memory_episodes WHERE id=?", protectedEpisode.id));
   assert.equal(db.get("SELECT 1 FROM memory_episodes WHERE id=?", removableEpisode.id), undefined);
@@ -329,7 +294,7 @@ test("memory retention removes old raw episodes but preserves fact provenance an
 test("memory prompt context enforces a UTF-8 byte budget", () => {
   const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
   const memory = new MemoryService(db);
-  const context = memory.promptContext({ core: ["核心记忆内容"], items: [{ id: "item", type: "episode", scope: "global_agent", content: "additional memory" }] }, 12);
+  const context = memory.promptContext({ core: ["核心记忆内容"], items: [{ id: "item", type: "episode", scope: "user:owner", content: "additional memory" }] }, 12);
   const bytes = Buffer.byteLength([...context.core, ...context.items.map((item) => item.content)].join(""), "utf8");
   assert.ok(bytes <= 12);
   db.close();

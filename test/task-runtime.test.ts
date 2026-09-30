@@ -97,12 +97,18 @@ class DelayedCreatePi extends TestPi {
 const logger = { child: () => logger, info() {}, warn() {}, error() {}, debug() {} } as unknown as Logger;
 type TestTaskServiceOptions = Omit<TaskServiceOptions, "principals"> & { principals?: PrincipalService };
 
+function rolelessTestCapabilities(capabilities: CapabilitySet, fallbackScope: string): CapabilitySet {
+  const allowedScopes = capabilities.memory.allowedScopes.filter((scope) => /^(user|workspace):[^\s]+$/.test(scope));
+  return { ...capabilities, memory: { allowedScopes: allowedScopes.length ? allowedScopes : [`workspace:${fallbackScope}`] } };
+}
+
 class TaskService extends RuntimeTaskService {
   private readonly testPrincipals: PrincipalService;
 
   constructor(db: SqliteStore, pi: PiHarness, artifacts: ArtifactService, config: AppConfig, options: TestTaskServiceOptions, log: Logger) {
     const principals = options.principals ?? createTaskTestPrincipals(options.workerRoot);
-    super(db, pi, artifacts, config, {
+    const principalExecution = { maxWorkersPerPrincipal: 4, taskTimeoutMs: 1_800_000, commandTimeoutMs: 600_000, cpuSeconds: 600, memoryBytes: 16 * 1024 * 1024 * 1024, pids: 128, maxFileBytes: 512 * 1024 * 1024, workspaceQuotaBytes: 2 * 1024 * 1024 * 1024, cacheQuotaBytes: 1024 * 1024 * 1024, artifactQuotaBytes: 512 * 1024 * 1024, ...config.principalExecution };
+    super(db, pi, artifacts, { ...config, principalExecution }, {
       ...options,
       principals,
       modelRuntimeUid: options.modelRuntimeUid ?? process.getuid?.(),
@@ -113,7 +119,14 @@ class TaskService extends RuntimeTaskService {
   }
 
   override getTask(taskId: string) {
-    const row = this.db.get<{ principal_id: string | null; requester_json: string; trust: "OWNER" | "GUEST" }>("SELECT principal_id,requester_json,trust FROM tasks WHERE id=?", taskId);
+    const row = this.db.get<{ principal_id: string | null; requester_json: string; origin_conversation_id: string; capabilities_json: string }>("SELECT principal_id,requester_json,origin_conversation_id,capabilities_json FROM tasks WHERE id=?", taskId);
+    if (row) {
+      try {
+        const capabilities = JSON.parse(row.capabilities_json) as CapabilitySet;
+        const normalized = rolelessTestCapabilities(capabilities, row.origin_conversation_id);
+        if (JSON.stringify(normalized) !== JSON.stringify(capabilities)) this.db.run("UPDATE tasks SET capabilities_json=? WHERE id=?", JSON.stringify(normalized), taskId);
+      } catch { /* Preserve malformed snapshots for recovery rejection tests. */ }
+    }
     if (row && !row.principal_id) {
       let requester: Record<string, unknown>;
       try { requester = JSON.parse(row.requester_json) as Record<string, unknown>; } catch { requester = {}; }
@@ -136,7 +149,7 @@ class TaskService extends RuntimeTaskService {
       const workspaceId = row.workspace_id ?? "default";
       const workspaceAccess = row.workspace_access ?? "WRITE";
       const capabilities = row.capabilities_json !== null
-        ? row.capabilities_json
+        ? JSON.stringify(rolelessTestCapabilities(JSON.parse(row.capabilities_json) as CapabilitySet, task.originConversationId))
         : JSON.stringify({ ...task.capabilities, projects: [{ projectId: workspaceId, access: workspaceAccess }] });
       this.db.run("UPDATE worker_executions SET principal_id=?,runtime_uid=?,runtime_gid=?,workspace_gid=?,workspace_id=?,workspace_access=?,process_mode='PRINCIPAL_BROKERED',capabilities_json=? WHERE id=?", principalId, principal.runtimeUid, principal.runtimeGid, row.workspace_gid ?? taskTestWorkspaceGid(task.originConversationId), workspaceId, workspaceAccess, capabilities, workerId);
     }
@@ -150,15 +163,15 @@ class TaskService extends RuntimeTaskService {
   }
 
   override createTask(input: Parameters<RuntimeTaskService["createTask"]>[0]) {
-    const parentCapabilities = input.parentCapabilities.projects.length
-      ? input.parentCapabilities
-      : { ...input.parentCapabilities, projects: [{ projectId: "*", access: "WRITE" as const }] };
+    const canonicalCapabilities = rolelessTestCapabilities(input.parentCapabilities, input.originConversationId);
+    const parentCapabilities = { ...canonicalCapabilities, projects: canonicalCapabilities.projects.length ? canonicalCapabilities.projects : [{ projectId: "*", access: "WRITE" as const }] };
     return super.createTask({ ...input, parentCapabilities });
   }
 
   override createWorker(input: Parameters<RuntimeTaskService["createWorker"]>[0]) {
     const principalId = input.actorPrincipalId ?? this.getTask(input.taskId).requester.principalId;
-    return super.createWorker({ ...input, ...(principalId ? { actorPrincipalId: principalId } : {}) });
+    const actor = rolelessTestCapabilities(input.actor, this.getTask(input.taskId).originConversationId);
+    return super.createWorker({ ...input, actor, ...(principalId ? { actorPrincipalId: principalId } : {}) });
   }
 }
 
@@ -177,10 +190,10 @@ test("question and answer are durable before worker steer", async () => {
   const artifacts = new ArtifactService(db, root);
   const events: string[] = [];
   const tasks = new TaskService(db, pi, artifacts, config, { workerRoot: root, onEvent: async (event) => { events.push(event.type); } }, logger);
-  const caps = { memory: { allowedScopes: ["global_agent"] }, projects: [{ projectId: "*", access: "WRITE" as const }], qq: { readConversations: ["c"], sendConversations: ["c"] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: ["agent-home"], publishTaskIds: ["*"], allowedDestinations: ["c"] }, tasks: { canCreate: true, visibleTaskIds: [], canCancel: true, canFollowUp: true } };
+  const caps = { memory: { allowedScopes: ["workspace:c"] }, projects: [{ projectId: "*", access: "WRITE" as const }], qq: { readConversations: ["c"], sendConversations: ["c"] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: ["agent-home"], publishTaskIds: ["*"], allowedDestinations: ["c"] }, tasks: { canCreate: true, visibleTaskIds: [], canCancel: true, canFollowUp: true } };
   const task = tasks.createTask({ title: "test", goal: "ask", requester: { platform: "qq", accountId: "a", userId: "u" }, trust: "OWNER", originConversationId: "c", notificationConversationId: "c", parentCapabilities: caps });
   const worker = await tasks.createWorker({ taskId: task.id, objective: "ask", workspaceId: "project", workspaceAccess: "READ", actor: caps });
-  assert.deepEqual(worker.capabilities?.memory.allowedScopes, ["global_agent"]);
+   assert.deepEqual(worker.capabilities?.memory.allowedScopes, ["workspace:c"]);
   assert.equal(db.get<{ capabilities_json: string }>("SELECT capabilities_json FROM worker_executions WHERE id=?", worker.id)?.capabilities_json !== undefined, true);
   await new Promise((resolve) => setTimeout(resolve, 20));
   const question = db.get<{ id: string; status: string }>("SELECT id,status FROM pending_questions WHERE worker_id=?", worker.id);
@@ -334,7 +347,7 @@ test("follow-up after the last Worker completed starts a new Worker instead of o
   const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
   const config = { runtime: { maxWorkers: 2, maxArtifactBytes: 100000, piCommand: "pi", piTimeoutMs: 1000 } } as AppConfig;
   const tasks = new TaskService(db, new CompletingPi(), new ArtifactService(db, root), config, { workerRoot: root }, logger);
-  const caps = { memory: { allowedScopes: ["global_agent"] }, projects: [{ projectId: "*", access: "WRITE" as const }], qq: { readConversations: ["c"], sendConversations: ["c"] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: ["agent-home"], publishTaskIds: ["*"], allowedDestinations: ["c"] }, tasks: { canCreate: true, visibleTaskIds: [], canCancel: true, canFollowUp: true } };
+  const caps = { memory: { allowedScopes: ["workspace:c"] }, projects: [{ projectId: "*", access: "WRITE" as const }], qq: { readConversations: ["c"], sendConversations: ["c"] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: ["agent-home"], publishTaskIds: ["*"], allowedDestinations: ["c"] }, tasks: { canCreate: true, visibleTaskIds: [], canCancel: true, canFollowUp: true } };
   const requester = { platform: "qq", accountId: "a", userId: "owner" };
   const task = tasks.createTask({ title: "artifact output", goal: "produce a result", requester, trust: "OWNER", originConversationId: "c", notificationConversationId: "c", parentCapabilities: caps });
   try {
@@ -395,7 +408,7 @@ test("Worker control JSON followed by harness summary text still completes the W
 test("runtime recovery does not leave phantom RUNNING workers", async () => {
   const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
   const timestamp = new Date().toISOString();
-  db.run("INSERT INTO tasks(id,title,goal,status,requester_json,trust,origin_conversation_id,notification_conversation_id,capabilities_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", "t", "x", "x", "RUNNING", JSON.stringify({}), "OWNER", "c", "c", JSON.stringify({ memory: { allowedScopes: [] }, projects: [{ projectId: "*", access: "WRITE" }], qq: { readConversations: ["c"], sendConversations: ["c"] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: [], publishTaskIds: [], allowedDestinations: ["c"] }, tasks: { canCreate: true, visibleTaskIds: [], canCancel: true, canFollowUp: true } }), timestamp, timestamp);
+  db.run("INSERT INTO tasks(id,title,goal,status,requester_json,origin_conversation_id,notification_conversation_id,capabilities_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)", "t", "x", "x", "RUNNING", JSON.stringify({}), "c", "c", JSON.stringify({ memory: { allowedScopes: [] }, projects: [{ projectId: "*", access: "WRITE" }], qq: { readConversations: ["c"], sendConversations: ["c"] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: [], publishTaskIds: [], allowedDestinations: ["c"] }, tasks: { canCreate: true, visibleTaskIds: [], canCancel: true, canFollowUp: true } }), timestamp, timestamp);
   db.run("INSERT INTO worker_executions(id,task_id,objective,status,harness,updated_at) VALUES (?,?,?,?,?,?)", "w", "t", "x", "RUNNING", "pi", timestamp);
   const config = { runtime: { maxWorkers: 2, maxArtifactBytes: 100000, piCommand: "pi", piTimeoutMs: 1000 } } as AppConfig;
   const tasks = new TaskService(db, new TestPi(), new ArtifactService(db, "/tmp"), config, { workerRoot: "/tmp", onEvent: async () => {} }, logger);
@@ -480,31 +493,30 @@ test("Main Task finalization does not enqueue a duplicate Task result turn", asy
   db.close();
 });
 
-test("Owner and Guest Workers persist the same Principal-brokered execution mode", async () => {
+test("Workers from different Principals persist the same brokered execution mode", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-principal-worker-mode-"));
   const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
   const caps = { memory: { allowedScopes: ["user:principal"] }, projects: [{ projectId: "*", access: "WRITE" as const }], qq: { readConversations: ["c"], sendConversations: ["c"] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: ["agent-home"], publishTaskIds: ["*"], allowedDestinations: ["c"] }, tasks: { canCreate: true, visibleTaskIds: [], canCancel: true, canFollowUp: true } };
   const principals = {
-    get(principalId: string) { return { principalId, runtimeUid: principalId === "principal:owner" ? 10001 : 20001, runtimeGid: principalId === "principal:owner" ? 10001 : 20001, role: principalId === "principal:owner" ? "OWNER" as const : "GUEST" as const }; },
+    get(principalId: string) { const runtimeUid = principalId === "principal:first" ? 20001 : 20002; return { principalId, runtimeUid, runtimeGid: runtimeUid }; },
     async ensurePrincipalDirectories(principalId: string) { const base = join(root, "principals", principalId); return { root: base, home: join(base, "home"), projects: join(base, "projects"), cache: join(base, "cache"), artifacts: join(base, "artifacts"), agent: join(base, "agent") }; },
     async workspacePath(principalId: string, workspaceId: string) { return join(root, "principals", principalId, "projects", workspaceId); },
     async ensureConversationWorkspace(conversationId: string) { const base = join(root, "conversation-workspaces", conversationId); return { root: base, home: join(base, "home"), projects: join(base, "projects"), cache: join(base, "cache"), uid: 30001, gid: 30001 }; },
     async ensureConversationWorkspacePath(conversationId: string, workspaceId: string) { return join(root, "conversation-workspaces", conversationId, "projects", workspaceId); },
     conversationWorkspacePath(conversationId: string, workspaceId: string) { return join(root, "conversation-workspaces", conversationId, "projects", workspaceId); },
   } as unknown as PrincipalService;
-  const config = { owners: [{ platform: "qq", accountId: "a", userId: "owner" }], systemAdmins: [{ platform: "qq", accountId: "a", userId: "owner" }], guest: { enabled: true, maxWorkersPerPrincipal: 1, taskTimeoutMs: 30_000, commandTimeoutMs: 5000, cpuSeconds: 60, memoryBytes: 100_000_000, pids: 20, maxFileBytes: 10_000_000, workspaceQuotaBytes: 10_000_000, cacheQuotaBytes: 10_000_000, artifactQuotaBytes: 10_000_000 }, runtime: { maxWorkers: 2, maxArtifactBytes: 100_000, piCommand: "pi", piTimeoutMs: 1000 } } as AppConfig;
+  const config = { principalExecution: { maxWorkersPerPrincipal: 1, taskTimeoutMs: 30_000, commandTimeoutMs: 5000, cpuSeconds: 60, memoryBytes: 16 * 1024 * 1024 * 1024, pids: 20, maxFileBytes: 10_000_000, workspaceQuotaBytes: 10_000_000, cacheQuotaBytes: 10_000_000, artifactQuotaBytes: 10_000_000 }, runtime: { maxWorkers: 2, maxArtifactBytes: 100_000, piCommand: "pi", piTimeoutMs: 1000 } } as AppConfig;
   const service = new TaskService(db, new TestPi(), new ArtifactService(db, root), config, { workerRoot: root, principals }, logger);
   try {
     const modes: string[] = [];
     const workspacePaths: string[] = [];
-    for (const principalId of ["principal:owner", "principal:guest"]) {
-      const trust = principalId === "principal:owner" ? "OWNER" : "GUEST";
-      const task = service.createTask({ title: trust, goal: trust, requester: { platform: "qq", accountId: "a", userId: principalId, principalId }, trust, originConversationId: "c", notificationConversationId: "c", parentCapabilities: caps });
+    for (const principalId of ["principal:first", "principal:second"]) {
+      const task = service.createTask({ title: principalId, goal: principalId, requester: { platform: "qq", accountId: "a", userId: principalId, principalId }, originConversationId: "c", notificationConversationId: "c", parentCapabilities: caps });
       const worker = await service.createWorker({ taskId: task.id, objective: "verify execution plane", actor: caps, actorPrincipalId: principalId });
       const durable = db.get<{ process_mode: string; runtime_uid: number; runtime_gid: number; workspace_gid: number; workspace_id: string; workspace_access: string }>("SELECT process_mode,runtime_uid,runtime_gid,workspace_gid,workspace_id,workspace_access FROM worker_executions WHERE id=?", worker.id);
       modes.push(durable?.process_mode ?? "missing");
-      assert.equal(durable?.runtime_uid, principalId === "principal:owner" ? 10001 : 20001);
-      assert.equal(durable?.runtime_gid, principalId === "principal:owner" ? 10001 : 20001);
+      assert.equal(durable?.runtime_uid, principalId === "principal:first" ? 20001 : 20002);
+      assert.equal(durable?.runtime_gid, principalId === "principal:first" ? 20001 : 20002);
       assert.equal(durable?.workspace_gid, 30001);
       assert.notEqual(durable?.runtime_uid, durable?.workspace_gid);
       assert.equal(durable?.workspace_id, "default");
@@ -514,8 +526,8 @@ test("Owner and Guest Workers persist the same Principal-brokered execution mode
       assert.equal(execution.taskId, task.id);
       assert.equal(execution.workerId, worker.id);
       assert.equal(execution.principalId, principalId);
-      assert.equal(execution.uid, principalId === "principal:owner" ? 10001 : 20001);
-      assert.equal(execution.gid, principalId === "principal:owner" ? 10001 : 20001);
+       assert.equal(execution.uid, principalId === "principal:first" ? 20001 : 20002);
+       assert.equal(execution.gid, principalId === "principal:first" ? 20001 : 20002);
       assert.equal(execution.workspaceGid, 30001);
       assert.equal(execution.workspaceId, "default");
       assert.equal(execution.workspaceScopeId, "conversation:c:default");
@@ -525,8 +537,8 @@ test("Owner and Guest Workers persist the same Principal-brokered execution mode
       assert.equal(execution.contextSource, "durable-worker-record");
     }
     const readonlyCaps = { ...caps, projects: [{ projectId: "*", access: "READ" as const }] };
-    const readonlyTask = service.createTask({ title: "readonly", goal: "readonly", requester: { platform: "qq", accountId: "a", userId: "principal:guest-readonly", principalId: "principal:guest-readonly" }, trust: "GUEST", originConversationId: "c", notificationConversationId: "c", parentCapabilities: readonlyCaps });
-    const readonlyWorker = await service.createWorker({ taskId: readonlyTask.id, objective: "read only", actor: readonlyCaps, actorPrincipalId: "principal:guest-readonly" });
+    const readonlyTask = service.createTask({ title: "readonly", goal: "readonly", requester: { platform: "qq", accountId: "a", userId: "principal:readonly", principalId: "principal:readonly" }, originConversationId: "c", notificationConversationId: "c", parentCapabilities: readonlyCaps });
+     const readonlyWorker = await service.createWorker({ taskId: readonlyTask.id, objective: "read only", actor: readonlyCaps, actorPrincipalId: "principal:readonly" });
     assert.equal(readonlyWorker.workspaceAccess, "READ");
     assert.equal(readonlyWorker.workspaceScopeId, "conversation:c:default");
     assert.deepEqual(readonlyWorker.capabilities?.projects, [{ projectId: "default", access: "READ" }]);
@@ -544,7 +556,7 @@ test("recovery verifies process ownership before termination and preserves unkno
   const timestamp = new Date().toISOString();
   const caps = { memory: { allowedScopes: ["global_agent"] }, projects: [{ projectId: "project", access: "WRITE" as const }], qq: { readConversations: [], sendConversations: [] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: [], publishTaskIds: [], allowedDestinations: [] }, tasks: { canCreate: false, visibleTaskIds: [], canCancel: true, canFollowUp: true } };
   const insert = (taskId: string, workerId: string, pid: number, status: string, projectId: string) => {
-    db.run("INSERT INTO tasks(id,title,goal,status,requester_json,trust,origin_conversation_id,notification_conversation_id,capabilities_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", taskId, taskId, taskId, "RUNNING", JSON.stringify({ platform: "qq", accountId: "a", userId: "u" }), "OWNER", "c", "c", JSON.stringify(caps), timestamp, timestamp);
+    db.run("INSERT INTO tasks(id,title,goal,status,requester_json,origin_conversation_id,notification_conversation_id,capabilities_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)", taskId, taskId, taskId, "RUNNING", JSON.stringify({ platform: "qq", accountId: "a", userId: "u" }), "c", "c", JSON.stringify(caps), timestamp, timestamp);
     db.run("INSERT INTO worker_executions(id,task_id,objective,status,harness,harness_session_id,workspace_id,workspace_access,process_id,capabilities_json,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", workerId, taskId, "recover", status, "pi", `pi-${workerId}`, projectId, "WRITE", pid, JSON.stringify(caps), timestamp);
     db.run("INSERT INTO owned_processes(id,task_id,worker_id,pid,process_group_id,command_summary,started_at,pid_start_time) VALUES (?,?,?,?,?,?,?,?)", `process-${workerId}`, taskId, workerId, pid, pid, "pi --mode rpc --session", timestamp, "boot");
     db.run("INSERT INTO project_locks(project_id,mode,owner_worker_id,acquired_at) VALUES (?,?,?,?)", `conversation:c:${projectId}`, "WRITE", workerId, timestamp);
@@ -575,7 +587,7 @@ test("recovery interrupts an orphaned Worker when restoring its MCP binding fail
   const tasks = new TaskService(db, pi, new ArtifactService(db, root), config, { workerRoot: root, mcpControl, mcpEndpoint: "http://gateway.test/mcp", workerToolExtensionPath: "/state/worker-tools.js", onEvent: async () => {} }, logger);
   const timestamp = new Date().toISOString();
   const caps = { memory: { allowedScopes: ["global_agent"] }, projects: [{ projectId: "project", access: "WRITE" as const }], qq: { readConversations: [], sendConversations: [] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: [], publishTaskIds: [], allowedDestinations: [] }, tasks: { canCreate: false, visibleTaskIds: [], canCancel: true, canFollowUp: true } };
-  db.run("INSERT INTO tasks(id,title,goal,status,requester_json,trust,origin_conversation_id,notification_conversation_id,capabilities_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", "task-binding-recovery", "binding recovery", "binding recovery", "RUNNING", JSON.stringify({ platform: "qq", accountId: "a", userId: "u" }), "OWNER", "c", "c", JSON.stringify(caps), timestamp, timestamp);
+  db.run("INSERT INTO tasks(id,title,goal,status,requester_json,origin_conversation_id,notification_conversation_id,capabilities_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)", "task-binding-recovery", "binding recovery", "binding recovery", "RUNNING", JSON.stringify({ platform: "qq", accountId: "a", userId: "u" }), "c", "c", JSON.stringify(caps), timestamp, timestamp);
   db.run("INSERT INTO worker_executions(id,task_id,objective,status,harness,harness_session_id,workspace_id,workspace_access,process_id,capabilities_json,mcp_binding_token,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", "worker-binding-recovery", "task-binding-recovery", "recover", "RUNNING", "pi", "pi-worker-owned", "project", "WRITE", 909, JSON.stringify(caps), "persisted-binding", timestamp);
   db.run("INSERT INTO owned_processes(id,task_id,worker_id,pid,process_group_id,command_summary,started_at,pid_start_time) VALUES (?,?,?,?,?,?,?,?)", "process-binding-recovery", "task-binding-recovery", "worker-binding-recovery", 909, 909, "pi --mode rpc --session", timestamp, "gone");
   db.run("INSERT INTO project_locks(project_id,mode,owner_worker_id,acquired_at) VALUES (?,?,?,?)", "conversation:c:project", "WRITE", "worker-binding-recovery", timestamp);
@@ -603,7 +615,7 @@ test("recovery finalizes a persisted finish frame instead of restoring an idle W
   const sessionPath = join(root, "model", "sessions", "workers", workerId, "session.jsonl");
   await mkdir(join(root, "model", "sessions", "workers", workerId), { recursive: true });
   await writeFile(sessionPath, `${JSON.stringify({ type: "message", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: `${WORKER_CONTROL_PREFIX}{"type":"finish","outcome":"PARTIAL","summary":"Chromium is missing system libraries; installation timed out."}` }] } })}\n`);
-  db.run("INSERT INTO tasks(id,title,goal,status,requester_json,trust,origin_conversation_id,notification_conversation_id,capabilities_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", taskId, "finished session", "finished session", "RUNNING", JSON.stringify({ platform: "qq", accountId: "a", userId: "u" }), "OWNER", "c", "c", JSON.stringify(caps), timestamp, timestamp);
+  db.run("INSERT INTO tasks(id,title,goal,status,requester_json,origin_conversation_id,notification_conversation_id,capabilities_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)", taskId, "finished session", "finished session", "RUNNING", JSON.stringify({ platform: "qq", accountId: "a", userId: "u" }), "c", "c", JSON.stringify(caps), timestamp, timestamp);
   db.run("INSERT INTO worker_executions(id,task_id,objective,status,harness,harness_session_id,harness_session_path,workspace_id,workspace_access,process_id,capabilities_json,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", workerId, taskId, "recover result", "RUNNING", "pi", "pi-worker-finished", sessionPath, "project", "WRITE", 919, JSON.stringify(caps), timestamp);
   db.run("INSERT INTO owned_processes(id,task_id,worker_id,pid,process_group_id,command_summary,started_at,pid_start_time) VALUES (?,?,?,?,?,?,?,?)", "process-finished-session", taskId, workerId, 919, 919, "pi --mode rpc --session", timestamp, "gone");
   db.run("INSERT INTO project_locks(project_id,mode,owner_worker_id,acquired_at) VALUES (?,?,?,?)", "project", "WRITE", workerId, timestamp);
@@ -627,7 +639,7 @@ test("recovery resumes a question session and replays its pending mailbox", asyn
   const tasks = new TaskService(db, pi, new ArtifactService(db, root), config, { workerRoot: root, onEvent: async () => {} }, logger);
   const timestamp = new Date().toISOString();
   const caps = { memory: { allowedScopes: ["global_agent"] }, projects: [], qq: { readConversations: [], sendConversations: [] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: [], publishTaskIds: [], allowedDestinations: [] }, tasks: { canCreate: false, visibleTaskIds: [], canCancel: true, canFollowUp: true } };
-  db.run("INSERT INTO tasks(id,title,goal,status,requester_json,trust,origin_conversation_id,notification_conversation_id,capabilities_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", "task-mail", "mail", "mail", "WAITING_USER", JSON.stringify({}), "OWNER", "c", "c", JSON.stringify(caps), timestamp, timestamp);
+  db.run("INSERT INTO tasks(id,title,goal,status,requester_json,origin_conversation_id,notification_conversation_id,capabilities_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)", "task-mail", "mail", "mail", "WAITING_USER", JSON.stringify({}), "c", "c", JSON.stringify(caps), timestamp, timestamp);
   db.run("INSERT INTO worker_executions(id,task_id,objective,status,harness,harness_session_id,updated_at,capabilities_json) VALUES (?,?,?,?,?,?,?,?)", "worker-mail", "task-mail", "mail", "WAITING_USER", "pi", "pi-mail", timestamp, JSON.stringify(caps));
   db.run("INSERT INTO pending_questions(id,task_id,worker_id,question,status,answer,created_at,answered_at) VALUES (?,?,?,?,?,?,?,?)", "question-mail", "task-mail", "worker-mail", "Which environment?", "ANSWERED", "staging", timestamp, timestamp);
   db.run("INSERT INTO task_mailbox(id,task_id,type,source_conversation_id,source_message_key,content,status,created_at,worker_id,question_id) VALUES (?,?,?,?,?,?,?,?,?,?)", "mail-1", "task-mail", "FOLLOW_UP", "c", "message", "staging", "PENDING", timestamp, "worker-mail", "question-mail");
@@ -716,11 +728,11 @@ test("terminal Tasks reject Worker creation, follow-up, and cancellation", async
 test("TaskService rejects forged Owner group capability and malformed durable capability JSON", () => {
   const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
   const timestamp = new Date().toISOString();
-  db.run("INSERT INTO conversations(conversation_id,platform,account_id,kind,platform_conversation_id,thread_id_json,trust,memory_scopes_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)", "group-conv", "qq", "a", "group", "g", "null", "GUEST", JSON.stringify(["global_agent", "group:group-conv"]), timestamp, timestamp);
-  db.run("INSERT INTO tasks(id,title,goal,status,requester_json,trust,origin_conversation_id,notification_conversation_id,capabilities_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", "bad-task", "bad", "bad", "CREATED", JSON.stringify({}), "OWNER", "group-conv", "group-conv", "{}", timestamp, timestamp);
+  db.run("INSERT INTO conversations(conversation_id,platform,account_id,kind,platform_conversation_id,thread_id_json,memory_scopes_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)", "group-conv", "qq", "a", "group", "g", "null", JSON.stringify(["workspace:group-conv"]), timestamp, timestamp);
+  db.run("INSERT INTO tasks(id,title,goal,status,requester_json,origin_conversation_id,notification_conversation_id,capabilities_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)", "bad-task", "bad", "bad", "CREATED", JSON.stringify({}), "group-conv", "group-conv", "{}", timestamp, timestamp);
   const config = { owners: [{ platform: "qq", accountId: "a", userId: "owner" }], systemAdmins: [{ platform: "qq", accountId: "a", userId: "owner" }], runtime: { maxWorkers: 1, maxArtifactBytes: 100000, piCommand: "pi", piTimeoutMs: 1000 } } as AppConfig;
   const tasks = new TaskService(db, new TestPi(), new ArtifactService(db, "/tmp"), config, { workerRoot: "/tmp", onEvent: async () => {} }, logger);
-  const forged = { memory: { allowedScopes: ["global_agent", "group:group-conv"] }, projects: [{ projectId: "*", access: "WRITE" as const }], qq: { readConversations: ["group-conv"], sendConversations: ["group-conv"] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: ["agent-home"], publishTaskIds: [], allowedDestinations: ["group-conv"] }, tasks: { canCreate: true, visibleTaskIds: [], canCancel: true, canFollowUp: true } };
+  const forged = { memory: { allowedScopes: ["user:guest", "workspace:other"] }, projects: [{ projectId: "*", access: "WRITE" as const }], qq: { readConversations: ["group-conv"], sendConversations: ["group-conv"] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: ["agent-home"], publishTaskIds: [], allowedDestinations: ["group-conv"] }, tasks: { canCreate: true, visibleTaskIds: [], canCancel: true, canFollowUp: true } };
   assert.throws(() => tasks.createTask({ title: "forged", goal: "forged", requester: { platform: "qq", accountId: "a", userId: "guest" }, trust: "OWNER", originConversationId: "group-conv", notificationConversationId: "group-conv", parentCapabilities: forged }), /CAPABILITY_CONTEXT_INVALID/);
   assert.throws(() => tasks.getTask("bad-task"), /CAPABILITY_SNAPSHOT_INVALID/);
   db.close();

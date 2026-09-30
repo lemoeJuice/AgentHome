@@ -11,12 +11,11 @@ import registerWorkerTools from "../src/runtime/worker-tools.ts";
 
 const context: RuntimeToolContext = {
   conversationId: "conversation-1",
-  requesterId: "owner",
-  requester: { platform: "qq", accountId: "default", userId: "owner" },
-  trust: "OWNER",
+  requesterId: "principal-user",
+  requester: { platform: "qq", accountId: "default", userId: "principal-user", principalId: "principal:user" },
   address: { platform: "qq", accountId: "default", kind: "private", platformConversationId: "owner", threadId: null },
   capabilities: {
-    memory: { allowedScopes: ["global_agent"] },
+    memory: { allowedScopes: ["workspace:conversation-1"] },
     projects: [],
     qq: { readConversations: ["conversation-1"], sendConversations: ["conversation-1"] },
     plugins: { allowedActions: [] },
@@ -189,10 +188,9 @@ test("Worker Gateway actions return through the authenticated Runtime tool socke
 function contextBase(): RuntimeToolContext {
   return {
     conversationId: "conversation-1",
-    requesterId: "owner",
-    requester: { platform: "qq", accountId: "default", userId: "owner", principalId: "principal:owner" },
-    trust: "OWNER",
+    requesterId: "principal-user",
+    requester: { platform: "qq", accountId: "default", userId: "principal-user", principalId: "principal:user" },
     address: { platform: "qq", accountId: "default", kind: "private", platformConversationId: "owner", threadId: null },
-    capabilities: { memory: { allowedScopes: ["global_agent"] }, projects: [{ projectId: "*", access: "WRITE" }], qq: { readConversations: ["conversation-1"], sendConversations: ["conversation-1"] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: ["agent-home"], publishTaskIds: [], allowedDestinations: ["conversation-1"] }, tasks: { canCreate: true, visibleTaskIds: [], canCancel: true, canFollowUp: true } },
+    capabilities: { memory: { allowedScopes: ["workspace:conversation-1"] }, projects: [{ projectId: "*", access: "WRITE" }], qq: { readConversations: ["conversation-1"], sendConversations: ["conversation-1"] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: ["agent-home"], publishTaskIds: [], allowedDestinations: ["conversation-1"] }, tasks: { canCreate: true, visibleTaskIds: [], canCancel: true, canFollowUp: true } },
   };
 }

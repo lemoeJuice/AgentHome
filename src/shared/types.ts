@@ -118,15 +118,13 @@ export interface ControlAck {
   errorCode?: string;
 }
 
-export type Trust = "OWNER" | "GUEST";
-export type MemoryScope = "owner_private" | "global_agent" | `user:${string}` | `group:${string}` | `workspace:${string}` | `project:${string}`;
+export type MemoryScope = `user:${string}` | `workspace:${string}`;
 
 export interface RequesterContext {
   platform: string;
   accountId: string;
   userId: string;
   principalId?: string;
-  trust: Trust;
   conversationId: string;
 }
 
@@ -143,7 +141,6 @@ export interface ConversationRecord {
   conversationId: string;
   address: ConversationAddress;
   principalId?: string;
-  trust: Trust;
   memoryScopes: MemoryScope[];
   mainSessionId?: string;
   mainSessionPath?: string;
@@ -167,7 +164,6 @@ export interface TaskRecord {
   goal: string;
   status: TaskStatus;
   requester: TaskRequester;
-  trust: Trust;
   originConversationId: string;
   notificationConversationId: string;
   parentTaskId?: string;

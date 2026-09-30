@@ -315,6 +315,103 @@ export const runtimeMigrations = [
       UPDATE worker_executions SET runtime_uid=(SELECT runtime_uid FROM principals WHERE principal_id=worker_executions.principal_id), runtime_gid=(SELECT runtime_gid FROM principals WHERE principal_id=worker_executions.principal_id) WHERE principal_id IS NOT NULL;
     `,
   },
+  {
+    version: 24,
+    sql: `
+      CREATE TEMP TABLE principal_rekey AS
+        SELECT principal_id AS old_id, 'principal_' || lower(hex(randomblob(12))) AS new_id,
+          runtime_uid, runtime_gid, created_at
+        FROM principals WHERE principal_id='principal:owner';
+      INSERT INTO principals(principal_id,trust,created_at)
+        SELECT new_id,'GUEST',created_at FROM principal_rekey;
+      UPDATE platform_identities SET principal_id=(SELECT new_id FROM principal_rekey)
+        WHERE principal_id='principal:owner';
+      UPDATE tasks SET principal_id=(SELECT new_id FROM principal_rekey),
+        requester_json=replace(requester_json,'principal:owner',(SELECT new_id FROM principal_rekey))
+        WHERE principal_id='principal:owner' OR requester_json LIKE '%principal:owner%';
+      UPDATE worker_executions SET principal_id=(SELECT new_id FROM principal_rekey)
+        WHERE principal_id='principal:owner';
+      UPDATE artifacts SET source_principal_id=(SELECT new_id FROM principal_rekey)
+        WHERE source_principal_id='principal:owner';
+      DELETE FROM principals WHERE principal_id='principal:owner';
+      UPDATE principals SET runtime_uid=(SELECT runtime_uid FROM principal_rekey),
+        runtime_gid=(SELECT runtime_gid FROM principal_rekey)
+        WHERE principal_id=(SELECT new_id FROM principal_rekey);
+
+      UPDATE memory_episodes SET scope=CASE
+        WHEN scope IN ('global_agent','owner_private') THEN 'user:' || COALESCE((SELECT new_id FROM principal_rekey),'legacy_unassigned')
+        WHEN scope LIKE 'user:principal:owner' THEN 'user:' || COALESCE((SELECT new_id FROM principal_rekey),'legacy_unassigned')
+        WHEN scope LIKE 'group:%' THEN 'workspace:' || substr(scope,7)
+        WHEN scope LIKE 'project:%' THEN 'user:legacy_unassigned'
+        WHEN scope LIKE 'user:%' OR scope LIKE 'workspace:%' THEN scope
+        ELSE 'user:legacy_unassigned' END;
+      UPDATE memory_facts SET scope=CASE
+        WHEN scope IN ('global_agent','owner_private') OR scope='user:principal:owner' THEN 'user:' || COALESCE((SELECT new_id FROM principal_rekey),'legacy_unassigned')
+        WHEN scope LIKE 'group:%' THEN 'workspace:' || substr(scope,7)
+        WHEN scope LIKE 'project:%' THEN 'user:legacy_unassigned'
+        WHEN scope LIKE 'user:%' OR scope LIKE 'workspace:%' THEN scope
+        ELSE 'user:legacy_unassigned' END;
+      UPDATE memory_episodic SET scope=CASE
+        WHEN scope IN ('global_agent','owner_private') OR scope='user:principal:owner' THEN 'user:' || COALESCE((SELECT new_id FROM principal_rekey),'legacy_unassigned')
+        WHEN scope LIKE 'group:%' THEN 'workspace:' || substr(scope,7)
+        WHEN scope LIKE 'project:%' THEN 'user:legacy_unassigned'
+        WHEN scope LIKE 'user:%' OR scope LIKE 'workspace:%' THEN scope
+        ELSE 'user:legacy_unassigned' END;
+      UPDATE memory_explicit SET scope=CASE
+        WHEN scope IN ('global_agent','owner_private') OR scope='user:principal:owner' THEN 'user:' || COALESCE((SELECT new_id FROM principal_rekey),'legacy_unassigned')
+        WHEN scope LIKE 'group:%' THEN 'workspace:' || substr(scope,7)
+        WHEN scope LIKE 'project:%' THEN 'user:legacy_unassigned'
+        WHEN scope LIKE 'user:%' OR scope LIKE 'workspace:%' THEN scope
+        ELSE 'user:legacy_unassigned' END;
+      UPDATE memory_profiles SET scope=CASE
+        WHEN scope IN ('global_agent','owner_private') OR scope='user:principal:owner' THEN 'user:' || COALESCE((SELECT new_id FROM principal_rekey),'legacy_unassigned')
+        WHEN scope LIKE 'group:%' THEN 'workspace:' || substr(scope,7)
+        WHEN scope LIKE 'project:%' THEN 'user:legacy_unassigned'
+        WHEN scope LIKE 'user:%' OR scope LIKE 'workspace:%' THEN scope
+        ELSE 'user:legacy_unassigned' END;
+      UPDATE memory_tombstones SET scope=CASE
+        WHEN scope IN ('global_agent','owner_private') OR scope='user:principal:owner' THEN 'user:' || COALESCE((SELECT new_id FROM principal_rekey),'legacy_unassigned')
+        WHEN scope LIKE 'group:%' THEN 'workspace:' || substr(scope,7)
+        WHEN scope LIKE 'project:%' THEN 'user:legacy_unassigned'
+        WHEN scope LIKE 'user:%' OR scope LIKE 'workspace:%' THEN scope
+        ELSE 'user:legacy_unassigned' END;
+      UPDATE memory_index_queue SET scope=CASE
+        WHEN scope IN ('global_agent','owner_private') OR scope='user:principal:owner' THEN 'user:' || COALESCE((SELECT new_id FROM principal_rekey),'legacy_unassigned')
+        WHEN scope LIKE 'group:%' THEN 'workspace:' || substr(scope,7)
+        WHEN scope LIKE 'project:%' THEN 'user:legacy_unassigned'
+        WHEN scope LIKE 'user:%' OR scope LIKE 'workspace:%' THEN scope
+        ELSE 'user:legacy_unassigned' END;
+      UPDATE memory_fts SET scope=CASE
+        WHEN scope IN ('global_agent','owner_private') OR scope='user:principal:owner' THEN 'user:' || COALESCE((SELECT new_id FROM principal_rekey),'legacy_unassigned')
+        WHEN scope LIKE 'group:%' THEN 'workspace:' || substr(scope,7)
+        WHEN scope LIKE 'project:%' THEN 'user:legacy_unassigned'
+        WHEN scope LIKE 'user:%' OR scope LIKE 'workspace:%' THEN scope
+        ELSE 'user:legacy_unassigned' END;
+      UPDATE conversations SET memory_scopes_json=json_array('workspace:' || conversation_id);
+      UPDATE tasks SET capabilities_json=json_set(capabilities_json,'$.memory.allowedScopes',
+        COALESCE((SELECT json_group_array(scope) FROM (SELECT DISTINCT CASE
+          WHEN value IN ('global_agent','owner_private') OR value='user:principal:owner' THEN 'user:' || COALESCE((SELECT new_id FROM principal_rekey),'legacy_unassigned')
+          WHEN value LIKE 'group:%' THEN 'workspace:' || substr(value,7)
+          WHEN value LIKE 'project:%' THEN 'user:legacy_unassigned'
+          ELSE value END AS scope FROM json_each(tasks.capabilities_json,'$.memory.allowedScopes')
+          WHERE value LIKE 'user:%' OR value LIKE 'workspace:%' OR value IN ('global_agent','owner_private') OR value LIKE 'group:%' OR value LIKE 'project:%')), json('[]')));
+      UPDATE worker_executions SET capabilities_json=json_set(capabilities_json,'$.memory.allowedScopes',
+        COALESCE((SELECT json_group_array(scope) FROM (SELECT DISTINCT CASE
+          WHEN value IN ('global_agent','owner_private') OR value='user:principal:owner' THEN 'user:' || COALESCE((SELECT new_id FROM principal_rekey),'legacy_unassigned')
+          WHEN value LIKE 'group:%' THEN 'workspace:' || substr(value,7)
+          WHEN value LIKE 'project:%' THEN 'user:legacy_unassigned'
+          ELSE value END AS scope FROM json_each(worker_executions.capabilities_json,'$.memory.allowedScopes')
+          WHERE value LIKE 'user:%' OR value LIKE 'workspace:%' OR value IN ('global_agent','owner_private') OR value LIKE 'group:%' OR value LIKE 'project:%')), json('[]')))
+        WHERE capabilities_json IS NOT NULL;
+
+      ALTER TABLE principals DROP COLUMN trust;
+      ALTER TABLE conversations DROP COLUMN principal_id;
+      ALTER TABLE conversations DROP COLUMN trust;
+      ALTER TABLE tasks DROP COLUMN trust;
+      ALTER TABLE memory_episodes DROP COLUMN trust;
+      DROP TABLE principal_rekey;
+    `,
+  },
 ];
 
 export function ensureRuntimeSchema(store: SqliteStore): void {

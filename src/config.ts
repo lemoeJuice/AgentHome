@@ -5,7 +5,6 @@ import type { LogLevel } from "./shared/logger.js";
 
 export interface AppConfig {
   instanceId: string;
-  owners?: Array<{ platform: string; accountId: string; userId: string }>;
   systemAdmins?: Array<{ platform: string; accountId: string; userId: string }>;
   gateway: { mcpPort: number; mcpHost?: string; mcpActionTimeoutMs: number };
   network: {
@@ -39,9 +38,9 @@ export interface AppConfig {
   };
   agent: { persona: string };
   runtime: { maxInFlight: number; maxWorkers: number; maxWorkersTotal: number; maxWorkersPerProject: number; maxWorkersPerRequester: number; maxTasks: number; maxTasksPerRequester: number; maxTasksPerPrincipal: number; maxArtifactBytes: number; piCommand: string; piTimeoutMs: number; workerSandboxCommand: string; piAgentDir: string };
-  guest: { enabled: boolean; maxWorkersPerPrincipal: number; taskTimeoutMs: number; commandTimeoutMs: number; cpuSeconds: number; memoryBytes: number; pids: number; maxFileBytes: number; workspaceQuotaBytes: number; cacheQuotaBytes: number; artifactQuotaBytes: number };
+  principalExecution: { maxWorkersPerPrincipal: number; taskTimeoutMs: number; commandTimeoutMs: number; cpuSeconds: number; memoryBytes: number; pids: number; maxFileBytes: number; workspaceQuotaBytes: number; cacheQuotaBytes: number; artifactQuotaBytes: number };
   memory: { rawEpisodeDays: number | null; keepExplicitForever: boolean; keepProvenanceForActiveFacts: boolean; maxPromptBytes: number };
-  plugins: { enabled: string[]; allowedActions?: string[]; allowedPermissions?: string[]; guestAllowedActions?: string[]; guestAllowedPermissions?: string[] };
+  plugins: { enabled: string[]; allowedActions?: string[]; allowedPermissions?: string[] };
   logging: { level: LogLevel };
 }
 
@@ -82,9 +81,9 @@ const defaults: AppConfig = {
   },
   agent: { persona: "" },
   runtime: { maxInFlight: 16, maxWorkers: 2, maxWorkersTotal: 8, maxWorkersPerProject: 2, maxWorkersPerRequester: 4, maxTasks: 32, maxTasksPerRequester: 8, maxTasksPerPrincipal: 8, maxArtifactBytes: 50 * 1024 * 1024, piCommand: "pi", piTimeoutMs: 60 * 60 * 1000, workerSandboxCommand: "bwrap", piAgentDir: "/state/model/pi/agent" },
-  guest: { enabled: false, maxWorkersPerPrincipal: 1, taskTimeoutMs: 30 * 60 * 1000, commandTimeoutMs: 10 * 60 * 1000, cpuSeconds: 600, memoryBytes: 16 * 1024 * 1024 * 1024, pids: 128, maxFileBytes: 512 * 1024 * 1024, workspaceQuotaBytes: 2 * 1024 * 1024 * 1024, cacheQuotaBytes: 1024 * 1024 * 1024, artifactQuotaBytes: 512 * 1024 * 1024 },
+  principalExecution: { maxWorkersPerPrincipal: 1, taskTimeoutMs: 30 * 60 * 1000, commandTimeoutMs: 10 * 60 * 1000, cpuSeconds: 600, memoryBytes: 16 * 1024 * 1024 * 1024, pids: 128, maxFileBytes: 512 * 1024 * 1024, workspaceQuotaBytes: 2 * 1024 * 1024 * 1024, cacheQuotaBytes: 1024 * 1024 * 1024, artifactQuotaBytes: 512 * 1024 * 1024 },
   memory: { rawEpisodeDays: 30, keepExplicitForever: true, keepProvenanceForActiveFacts: true, maxPromptBytes: 24 * 1024 },
-  plugins: { enabled: [], allowedActions: [], allowedPermissions: [], guestAllowedActions: [], guestAllowedPermissions: [] },
+  plugins: { enabled: [], allowedActions: [], allowedPermissions: [] },
   logging: { level: "info" },
 };
 
@@ -93,6 +92,7 @@ function merge<T>(base: T, value: Partial<T>): T {
   if (typeof base !== "object" || base === null || typeof value !== "object" || value === null) return (value ?? base) as T;
   const output = { ...(base as Record<string, unknown>) };
   for (const [key, incoming] of Object.entries(value as Record<string, unknown>)) {
+    if (key === "owner" || key === "owners" || key === "guest" || key.startsWith("guestAllowed")) continue;
     const current = output[key];
     output[key] = typeof current === "object" && current !== null && typeof incoming === "object" && incoming !== null
       ? merge(current, incoming as never)
@@ -115,14 +115,9 @@ export async function loadConfig(path = process.env.AGENT_HOME_CONFIG ?? "./conf
       fileConfig = { ...bootstrap, paths: { ...defaults.paths, stateRoot } };
     } catch { /* doctor will report the missing configuration below */ }
   }
-  if (Object.hasOwn(fileConfig, "owner")) throw new Error("CONFIG_UNSUPPORTED: owner; migrate to owners and systemAdmins");
-  const configuredOwners = fileConfig.owners ?? [];
-  if (!Array.isArray(configuredOwners) || configuredOwners.some((owner) => !owner || typeof owner.platform !== "string" || typeof owner.accountId !== "string" || typeof owner.userId !== "string")) throw new Error("CONFIG_INVALID: owners");
-  const owners = configuredOwners.filter((owner) => owner.platform && owner.accountId && owner.userId && !owner.userId.startsWith("REPLACE_"));
   if (fileConfig.systemAdmins !== undefined && (!Array.isArray(fileConfig.systemAdmins) || fileConfig.systemAdmins.some((admin) => !admin || typeof admin.platform !== "string" || typeof admin.accountId !== "string" || typeof admin.userId !== "string"))) throw new Error("CONFIG_INVALID: systemAdmins");
   const systemAdmins = fileConfig.systemAdmins?.filter((admin) => admin.platform && admin.accountId && admin.userId && !admin.userId.startsWith("REPLACE_"));
-  fileConfig = { ...fileConfig, ...(fileConfig.owners !== undefined ? { owners } : {}), ...(systemAdmins ? { systemAdmins } : {}) };
-  if (fileConfig.owners !== undefined) fileConfig.owners = owners;
+  fileConfig = { ...fileConfig, ...(systemAdmins ? { systemAdmins } : {}) };
   const config = merge(defaults, fileConfig);
   const explicitModelProxy = Boolean(fileConfig.network && Object.prototype.hasOwnProperty.call(fileConfig.network, "modelProxyUrl"));
   for (const key of ["gatewayState", "pluginData", "backupDir"] as const) {
@@ -142,18 +137,13 @@ export async function loadConfig(path = process.env.AGENT_HOME_CONFIG ?? "./conf
   return config;
 }
 
-export function configuredOwners(config: Pick<AppConfig, "owners">): NonNullable<AppConfig["owners"]> {
-  return config.owners ?? [];
-}
-
-export function configuredSystemAdmins(config: Pick<AppConfig, "systemAdmins">): NonNullable<AppConfig["owners"]> {
+export function configuredSystemAdmins(config: Pick<AppConfig, "systemAdmins">): NonNullable<AppConfig["systemAdmins"]> {
   return config.systemAdmins ?? [];
 }
 
 export function validateConfig(config: AppConfig): void {
   const required = [config.instanceId, config.snowluma.endpoint, config.snowluma.apiEndpoint];
   if (required.some((value) => !value)) throw new Error("CONFIG_MISSING: instance and SnowLuma endpoints are required");
-  if (config.owners?.some((owner) => !owner.platform || !owner.accountId || !owner.userId)) throw new Error("CONFIG_INVALID: owners");
   if (config.systemAdmins?.some((admin) => !admin.platform || !admin.accountId || !admin.userId)) throw new Error("CONFIG_INVALID: systemAdmins");
   for (const key of ["serviceBindAddress", "uiBindAddress"] as const) if (!/^[A-Za-z0-9.:-]+$/.test(config.snowluma.deployment[key])) throw new Error(`CONFIG_INVALID: snowluma.deployment.${key}`);
   for (const key of ["httpPort", "wsPort", "webuiPort", "novncPort"] as const) if (!Number.isInteger(config.snowluma.deployment[key]) || config.snowluma.deployment[key] < 1 || config.snowluma.deployment[key] > 65535) throw new Error(`CONFIG_INVALID: snowluma.deployment.${key}`);
@@ -166,9 +156,8 @@ export function validateConfig(config: AppConfig): void {
   if (!Number.isInteger(config.runtime.maxInFlight) || config.runtime.maxInFlight < 1) throw new Error("CONFIG_INVALID: runtime.maxInFlight");
   if (!Number.isInteger(config.runtime.maxWorkers) || config.runtime.maxWorkers < 1) throw new Error("CONFIG_INVALID: runtime.maxWorkers");
   for (const key of ["maxWorkersTotal", "maxWorkersPerProject", "maxWorkersPerRequester", "maxTasks", "maxTasksPerRequester", "maxTasksPerPrincipal"] as const) if (!Number.isInteger(config.runtime[key]) || config.runtime[key] < 1) throw new Error(`CONFIG_INVALID: runtime.${key}`);
-  if (typeof config.guest.enabled !== "boolean") throw new Error("CONFIG_INVALID: guest.enabled");
-  for (const key of ["maxWorkersPerPrincipal", "taskTimeoutMs", "commandTimeoutMs", "cpuSeconds", "memoryBytes", "pids", "maxFileBytes", "workspaceQuotaBytes", "cacheQuotaBytes", "artifactQuotaBytes"] as const) if (!Number.isSafeInteger(config.guest[key]) || config.guest[key] < 1) throw new Error(`CONFIG_INVALID: guest.${key}`);
-  if (config.guest.enabled && config.guest.memoryBytes < 16 * 1024 * 1024 * 1024) throw new Error("CONFIG_INVALID: guest.memoryBytes must be at least 16 GiB for Node 22 Pi/npm WebAssembly address space");
+  for (const key of ["maxWorkersPerPrincipal", "taskTimeoutMs", "commandTimeoutMs", "cpuSeconds", "memoryBytes", "pids", "maxFileBytes", "workspaceQuotaBytes", "cacheQuotaBytes", "artifactQuotaBytes"] as const) if (!Number.isSafeInteger(config.principalExecution[key]) || config.principalExecution[key] < 1) throw new Error(`CONFIG_INVALID: principalExecution.${key}`);
+  if (config.principalExecution.memoryBytes < 16 * 1024 * 1024 * 1024) throw new Error("CONFIG_INVALID: principalExecution.memoryBytes must be at least 16 GiB for Node 22 Pi/npm WebAssembly address space");
   if (config.memory.rawEpisodeDays !== null && (!Number.isInteger(config.memory.rawEpisodeDays) || config.memory.rawEpisodeDays < 1)) throw new Error("CONFIG_INVALID: memory.rawEpisodeDays");
   if (typeof config.memory.keepExplicitForever !== "boolean" || typeof config.memory.keepProvenanceForActiveFacts !== "boolean") throw new Error("CONFIG_INVALID: memory.retention");
   if (!Number.isInteger(config.memory.maxPromptBytes) || config.memory.maxPromptBytes < 1024) throw new Error("CONFIG_INVALID: memory.maxPromptBytes");

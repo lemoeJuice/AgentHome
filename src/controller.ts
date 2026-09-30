@@ -244,7 +244,7 @@ export class PodmanController implements AgentEventController {
     const hostConfig = inspected.HostConfig ?? {};
     if (hostConfig.Privileged === true) throw new Error("CONTAINER_PRIVILEGED_FORBIDDEN");
     if (hostConfig.Init !== true) throw new Error("CONTAINER_INIT_REQUIRED");
-    if (!(hostConfig.CapAdd ?? []).some((capability) => capabilityName(capability) === "NET_ADMIN")) throw new Error("CONTAINER_GUEST_EGRESS_FILTER_CAPABILITY_REQUIRED");
+    if (!(hostConfig.CapAdd ?? []).some((capability) => capabilityName(capability) === "NET_ADMIN")) throw new Error("CONTAINER_PRINCIPAL_EGRESS_FILTER_CAPABILITY_REQUIRED");
     if (hostConfig.PidMode === "host") throw new Error("CONTAINER_HOST_PID_FORBIDDEN");
     if (hostConfig.NetworkMode === "host") throw new Error("CONTAINER_HOST_NETWORK_FORBIDDEN");
     const mounts = inspected.Mounts ?? [];

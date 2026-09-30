@@ -6,9 +6,7 @@ import type { JsonValue, MemoryScope } from "../shared/types.js";
 export interface MemoryAccessContext {
   requesterId: string;
   principalId?: string;
-  trust: "OWNER" | "GUEST";
   allowedScopes: MemoryScope[];
-  projectIds?: string[];
   conversationId?: string;
 }
 
@@ -27,7 +25,6 @@ export interface MemoryEpisode {
   content: string;
   occurredAt: string;
   ingestedAt: string;
-  trust: "owner" | "guest" | "system";
   metadata?: Record<string, JsonValue>;
 }
 
@@ -74,11 +71,9 @@ const RETRY_DELAYS_MS = [1_000, 5_000, 30_000, 300_000, 900_000];
 
 export class MemoryService {
   private readonly db: SqliteStore;
-  private readonly owners: Array<{ platform: string; accountId: string; userId: string }>;
   private readonly retention: MemoryRetentionPolicy;
-  constructor(db: SqliteStore, owners?: { platform: string; accountId: string; userId: string } | Array<{ platform: string; accountId: string; userId: string }>, retention?: Partial<MemoryRetentionPolicy>) {
+  constructor(db: SqliteStore, retention?: Partial<MemoryRetentionPolicy>) {
     this.db = db;
-    this.owners = owners ? (Array.isArray(owners) ? owners : [owners]) : [];
     this.retention = { rawEpisodeDays: 30, keepExplicitForever: true, keepProvenanceForActiveFacts: true, maxPromptBytes: 24 * 1024, ...retention };
   }
 
@@ -86,106 +81,6 @@ export class MemoryService {
     const timestamp = nowIso();
     this.db.run("UPDATE memory_inbox SET status='pending',next_attempt_at=NULL,updated_at=? WHERE status='processing'", timestamp);
     this.db.run("UPDATE memory_index_queue SET status='pending',next_attempt_at=NULL,updated_at=? WHERE status='processing'", timestamp);
-  }
-
-  isolateLegacyPrincipalScopes(): { moved: number; quarantined: number } {
-    if (this.db.get("SELECT 1 AS applied FROM runtime_meta WHERE key='principal_memory_isolation_v1'")) return { moved: 0, quarantined: 0 };
-    let moved = 0;
-    let quarantined = 0;
-    const episodePrincipals = new Map<string, string>();
-    const episodeRows = this.db.all<{ id: string; scope: string; source_json: string; actor_json: string | null; trust: string }>("SELECT id,scope,source_json,actor_json,trust FROM memory_episodes WHERE scope='global_agent' OR scope LIKE 'group:%'");
-    this.db.transaction(() => {
-      for (const row of episodeRows) {
-        if (row.trust === "system") continue;
-        const principalId = this.resolveLegacyEpisodePrincipal(row.source_json, row.actor_json);
-        const scope = principalId ? `user:${principalId}` : `legacy_quarantine:${row.id}`;
-        if (principalId) { episodePrincipals.set(row.id, principalId); moved += 1; } else quarantined += 1;
-        this.db.run("UPDATE memory_episodes SET scope=? WHERE id=?", scope, row.id);
-      }
-      for (const table of ["memory_facts", "memory_episodic", "memory_explicit"] as const) {
-        const rows = this.db.all<{ id: string; scope: string; provenance_json: string }>(`SELECT id,scope,provenance_json FROM ${table} WHERE scope='global_agent' OR scope LIKE 'group:%'`);
-        for (const row of rows) {
-          let provenance: string[] = [];
-          try { provenance = JSON.parse(row.provenance_json) as string[]; } catch { /* quarantine malformed history */ }
-          const principals = [...new Set(provenance.map((id) => episodePrincipals.get(id)).filter((id): id is string => Boolean(id)))];
-          const allResolved = provenance.length > 0 && principals.length === 1 && provenance.every((id) => episodePrincipals.has(id));
-          const scope = allResolved ? `user:${principals[0]}` : `legacy_quarantine:${row.id}`;
-          if (allResolved) moved += 1; else quarantined += 1;
-          this.db.run(`UPDATE ${table} SET scope=? WHERE id=?`, scope, row.id);
-        }
-      }
-      for (const row of this.db.all<{ id: string; source_memory_ids_json: string }>("SELECT id,source_memory_ids_json FROM memory_profiles WHERE scope='global_agent' OR scope LIKE 'group:%'")) {
-        let sources: string[] = [];
-        try { sources = JSON.parse(row.source_memory_ids_json) as string[]; } catch { /* quarantine malformed history */ }
-        const scopes = new Set<string>();
-        for (const sourceId of sources) {
-          const source = this.db.get<{ scope: string }>("SELECT scope FROM memory_episodes WHERE id=? UNION ALL SELECT scope FROM memory_facts WHERE id=? UNION ALL SELECT scope FROM memory_episodic WHERE id=? UNION ALL SELECT scope FROM memory_explicit WHERE id=? LIMIT 1", sourceId, sourceId, sourceId, sourceId);
-          if (source) scopes.add(source.scope);
-        }
-        const userScopes = [...scopes].filter((scope) => scope.startsWith("user:"));
-        const safeScope = sources.length > 0 && userScopes.length === 1 && userScopes.length === scopes.size ? (userScopes[0] ?? `legacy_quarantine:${row.id}`) : `legacy_quarantine:${row.id}`;
-        if (safeScope.startsWith("user:")) moved += 1; else quarantined += 1;
-        this.db.run("UPDATE memory_profiles SET scope=? WHERE id=?", safeScope, row.id);
-      }
-      this.db.run("UPDATE memory_tombstones SET scope=? WHERE scope='global_agent' OR scope LIKE 'group:%'", "legacy_quarantine");
-    });
-    this.rebuildDerivedIndexes();
-    this.db.run("INSERT INTO runtime_meta(key,value) VALUES ('principal_memory_isolation_v1','1') ON CONFLICT(key) DO UPDATE SET value='1'");
-    return { moved, quarantined };
-  }
-
-  migrateMergedPrincipalMemory(principalId: string): { moved: number; quarantined: number } {
-    const marker = `principal_memory_split:${principalId}`;
-    if (this.db.get("SELECT 1 AS applied FROM runtime_meta WHERE key=?", marker)) return { moved: 0, quarantined: 0 };
-    const legacyScope = `user:${principalId}`;
-    const episodeScopes = new Map<string, string>();
-    let moved = 0;
-    let quarantined = 0;
-    this.db.transaction(() => {
-      const episodes = this.db.all<{ id: string; source_json: string; actor_json: string | null }>("SELECT id,source_json,actor_json FROM memory_episodes WHERE scope=?", legacyScope);
-      for (const row of episodes) {
-        const owner = this.resolveLegacyEpisodePrincipal(row.source_json, row.actor_json);
-        const scope = owner ? `user:${owner}` : `legacy_quarantine:${row.id}`;
-        episodeScopes.set(row.id, scope);
-        if (owner) moved++; else quarantined++;
-        this.db.run("UPDATE memory_episodes SET scope=? WHERE id=?", scope, row.id);
-        this.db.run("UPDATE memory_fts SET scope=? WHERE record_id=?", scope, row.id);
-        this.db.run("UPDATE memory_index_queue SET scope=?,updated_at=? WHERE record_id=?", scope, nowIso(), row.id);
-      }
-      for (const table of ["memory_facts", "memory_episodic", "memory_explicit"] as const) {
-        for (const row of this.db.all<{ id: string; provenance_json: string }>(`SELECT id,provenance_json FROM ${table} WHERE scope=?`, legacyScope)) {
-          let sources: string[] = [];
-          try { sources = JSON.parse(row.provenance_json) as string[]; } catch { /* quarantine malformed provenance */ }
-          const scopes = [...new Set(sources.map((id) => episodeScopes.get(id)).filter((scope): scope is string => Boolean(scope)))];
-          const resolved = sources.length > 0 && scopes.length === 1 && scopes[0]?.startsWith("user:") && sources.every((id) => episodeScopes.has(id));
-          const scope = resolved ? scopes[0]! : `legacy_quarantine:${row.id}`;
-          if (resolved) moved++; else quarantined++;
-          this.db.run(`UPDATE ${table} SET scope=? WHERE id=?`, scope, row.id);
-          this.db.run("UPDATE memory_fts SET scope=? WHERE record_id=?", scope, row.id);
-          this.db.run("UPDATE memory_index_queue SET scope=?,updated_at=? WHERE record_id=?", scope, nowIso(), row.id);
-        }
-      }
-      for (const row of this.db.all<{ id: string; source_memory_ids_json: string }>("SELECT id,source_memory_ids_json FROM memory_profiles WHERE scope=?", legacyScope)) {
-        let sources: string[] = [];
-        try { sources = JSON.parse(row.source_memory_ids_json) as string[]; } catch { /* quarantine malformed profile provenance */ }
-        const scopes = new Set<string>();
-        for (const id of sources) {
-          const scope = episodeScopes.get(id) ?? this.db.get<{ scope: string }>("SELECT scope FROM memory_facts WHERE id=? UNION ALL SELECT scope FROM memory_episodic WHERE id=? UNION ALL SELECT scope FROM memory_explicit WHERE id=? LIMIT 1", id, id, id)?.scope;
-          if (scope) scopes.add(scope);
-        }
-        const userScopes = [...scopes].filter((scope) => scope.startsWith("user:"));
-        const scope = sources.length > 0 && userScopes.length === 1 && userScopes.length === scopes.size ? userScopes[0]! : `legacy_quarantine:${row.id}`;
-        if (scope.startsWith("user:")) moved++; else quarantined++;
-        this.db.run("UPDATE memory_profiles SET scope=? WHERE id=?", scope, row.id);
-      }
-      for (const row of this.db.all<{ id: string }>("SELECT id FROM memory_tombstones WHERE scope=?", legacyScope)) {
-        const scope = episodeScopes.get(row.id) ?? `legacy_quarantine:${row.id}`;
-        this.db.run("UPDATE memory_tombstones SET scope=? WHERE id=?", scope, row.id);
-      }
-      this.db.run("INSERT INTO runtime_meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", marker, "1");
-    });
-    this.rebuildDerivedIndexes();
-    return { moved, quarantined };
   }
 
   cleanupRetention(reference = new Date()): number {
@@ -223,15 +118,13 @@ export class MemoryService {
 
   ingestEpisode(input: { access: MemoryAccessContext; episode: Omit<MemoryEpisode, "id" | "ingestedAt"> }): MemoryEpisode {
     this.assertScope(input.access, input.episode.scope);
-    const expectedTrust = input.episode.source.type === "system_event" && input.access.requesterId === "system" ? "system" : input.access.trust === "OWNER" ? "owner" : "guest";
-    if (expectedTrust !== input.episode.trust) throw new Error("MEMORY_EPISODE_TRUST_MISMATCH");
     if (input.episode.source.sourceId) {
-      const existing = this.db.get<{ id: string; scope: MemoryScope; source_json: string; actor_json: string | null; content: string; occurred_at: string; ingested_at: string; trust: MemoryEpisode["trust"]; metadata_json: string | null }>("SELECT id,scope,source_json,actor_json,content,occurred_at,ingested_at,trust,metadata_json FROM memory_episodes WHERE scope=? AND source_json=?", input.episode.scope, JSON.stringify(input.episode.source));
-      if (existing) return { id: existing.id, scope: existing.scope, source: JSON.parse(existing.source_json), ...(existing.actor_json ? { actor: JSON.parse(existing.actor_json) } : {}), content: existing.content, occurredAt: existing.occurred_at, ingestedAt: existing.ingested_at, trust: existing.trust, ...(existing.metadata_json ? { metadata: JSON.parse(existing.metadata_json) } : {}) };
+      const existing = this.db.get<{ id: string; scope: MemoryScope; source_json: string; actor_json: string | null; content: string; occurred_at: string; ingested_at: string; metadata_json: string | null }>("SELECT id,scope,source_json,actor_json,content,occurred_at,ingested_at,metadata_json FROM memory_episodes WHERE scope=? AND source_json=?", input.episode.scope, JSON.stringify(input.episode.source));
+      if (existing) return { id: existing.id, scope: existing.scope, source: JSON.parse(existing.source_json), ...(existing.actor_json ? { actor: JSON.parse(existing.actor_json) } : {}), content: existing.content, occurredAt: existing.occurred_at, ingestedAt: existing.ingested_at, ...(existing.metadata_json ? { metadata: JSON.parse(existing.metadata_json) } : {}) };
     }
     const episode: MemoryEpisode = { ...input.episode, id: newId("episode"), ingestedAt: nowIso() };
     this.db.transaction(() => {
-      this.db.run("INSERT INTO memory_episodes(id,scope,source_json,actor_json,content,occurred_at,ingested_at,trust,metadata_json) VALUES (?,?,?,?,?,?,?,?,?)", episode.id, episode.scope, JSON.stringify(episode.source), episode.actor ? JSON.stringify(episode.actor) : null, episode.content, episode.occurredAt, episode.ingestedAt, episode.trust, episode.metadata ? JSON.stringify(episode.metadata) : null);
+      this.db.run("INSERT INTO memory_episodes(id,scope,source_json,actor_json,content,occurred_at,ingested_at,metadata_json) VALUES (?,?,?,?,?,?,?,?)", episode.id, episode.scope, JSON.stringify(episode.source), episode.actor ? JSON.stringify(episode.actor) : null, episode.content, episode.occurredAt, episode.ingestedAt, episode.metadata ? JSON.stringify(episode.metadata) : null);
       this.db.run("INSERT INTO memory_inbox(id,episode_id,status,retries,created_at,updated_at) VALUES (?,?,?,?,?,?)", newId("inbox"), episode.id, "pending", 0, episode.ingestedAt, episode.ingestedAt);
       this.enqueueIndex(episode.id, "episode", episode.scope, episode.content, "UPSERT");
     });
@@ -239,20 +132,20 @@ export class MemoryService {
   }
 
   ingestTaskEpisode(input: { access: MemoryAccessContext; scope: MemoryScope; taskId: string; sourceId: string; content: string; occurredAt: string; workerId?: string; metadata?: Record<string, JsonValue> }): MemoryEpisode {
-    return this.ingestEpisode({ access: input.access, episode: { scope: input.scope, source: { type: "task", sourceId: input.sourceId }, actor: input.workerId ? { type: "worker", id: input.workerId } : { type: "system", id: input.taskId }, content: input.content, occurredAt: input.occurredAt, trust: input.access.trust === "OWNER" ? "owner" : "guest", metadata: { taskId: input.taskId, ...(input.metadata ?? {}) } } });
+    return this.ingestEpisode({ access: input.access, episode: { scope: input.scope, source: { type: "task", sourceId: input.sourceId }, actor: input.workerId ? { type: "worker", id: input.workerId } : { type: "system", id: input.taskId }, content: input.content, occurredAt: input.occurredAt, metadata: { taskId: input.taskId, ...(input.metadata ?? {}) } } });
   }
 
   ingestDocumentEpisode(input: { access: MemoryAccessContext; scope: MemoryScope; documentId: string; content: string; occurredAt: string; metadata?: Record<string, JsonValue> }): MemoryEpisode {
-    return this.ingestEpisode({ access: input.access, episode: { scope: input.scope, source: { type: "document", sourceId: input.documentId }, actor: { type: "system", id: "document" }, content: input.content, occurredAt: input.occurredAt, trust: input.access.trust === "OWNER" ? "owner" : "guest", metadata: input.metadata } });
+    return this.ingestEpisode({ access: input.access, episode: { scope: input.scope, source: { type: "document", sourceId: input.documentId }, actor: { type: "system", id: "document" }, content: input.content, occurredAt: input.occurredAt, metadata: input.metadata } });
   }
 
   ingestManualEpisode(input: { access: MemoryAccessContext; scope: MemoryScope; sourceId: string; content: string; occurredAt: string; metadata?: Record<string, JsonValue> }): MemoryEpisode {
-    return this.ingestEpisode({ access: input.access, episode: { scope: input.scope, source: { type: "manual", sourceId: input.sourceId }, actor: { type: "user", id: input.access.requesterId }, content: input.content, occurredAt: input.occurredAt, trust: input.access.trust === "OWNER" ? "owner" : "guest", metadata: input.metadata } });
+    return this.ingestEpisode({ access: input.access, episode: { scope: input.scope, source: { type: "manual", sourceId: input.sourceId }, actor: { type: "user", id: input.access.requesterId }, content: input.content, occurredAt: input.occurredAt, metadata: input.metadata } });
   }
 
   ingestSystemEpisode(input: { access: MemoryAccessContext; scope: MemoryScope; sourceId: string; content: string; occurredAt: string; metadata?: Record<string, JsonValue> }): MemoryEpisode {
     if (input.access.requesterId !== "system") throw new Error("MEMORY_SYSTEM_INGEST_DENIED");
-    return this.ingestEpisode({ access: input.access, episode: { scope: input.scope, source: { type: "system_event", sourceId: input.sourceId }, actor: { type: "system" }, content: input.content, occurredAt: input.occurredAt, trust: "system", metadata: input.metadata } });
+    return this.ingestEpisode({ access: input.access, episode: { scope: input.scope, source: { type: "system_event", sourceId: input.sourceId }, actor: { type: "system" }, content: input.content, occurredAt: input.occurredAt, metadata: input.metadata } });
   }
 
   remember(input: { access: MemoryAccessContext; scope: MemoryScope; content: string; provenance?: string[] }): MemoryRecord {
@@ -410,10 +303,10 @@ export class MemoryService {
     const record = this.getMemory(id, access);
     if (!record) return null;
     const sources = (record.provenance ?? []).flatMap((sourceId) => {
-      const episode = this.db.get<{ id: string; scope: MemoryScope; source_json: string; actor_json: string | null; content: string; occurred_at: string; ingested_at: string; trust: MemoryEpisode["trust"]; metadata_json: string | null }>("SELECT id,scope,source_json,actor_json,content,occurred_at,ingested_at,trust,metadata_json FROM memory_episodes WHERE id=?", sourceId);
+      const episode = this.db.get<{ id: string; scope: MemoryScope; source_json: string; actor_json: string | null; content: string; occurred_at: string; ingested_at: string; metadata_json: string | null }>("SELECT id,scope,source_json,actor_json,content,occurred_at,ingested_at,metadata_json FROM memory_episodes WHERE id=?", sourceId);
       if (!episode) return [];
       this.assertScope(access, episode.scope);
-      return [{ id: episode.id, scope: episode.scope, source: JSON.parse(episode.source_json), ...(episode.actor_json ? { actor: JSON.parse(episode.actor_json) } : {}), content: episode.content, occurredAt: episode.occurred_at, ingestedAt: episode.ingested_at, trust: episode.trust, ...(episode.metadata_json ? { metadata: JSON.parse(episode.metadata_json) } : {}) } as MemoryEpisode];
+      return [{ id: episode.id, scope: episode.scope, source: JSON.parse(episode.source_json), ...(episode.actor_json ? { actor: JSON.parse(episode.actor_json) } : {}), content: episode.content, occurredAt: episode.occurred_at, ingestedAt: episode.ingested_at, ...(episode.metadata_json ? { metadata: JSON.parse(episode.metadata_json) } : {}) }];
     });
     return { record, sources };
   }
@@ -487,11 +380,11 @@ export class MemoryService {
   }
 
   exportMemory(access?: MemoryAccessContext): MemoryExport {
-    const context = access ?? { requesterId: "system", trust: "OWNER" as const, allowedScopes: ["owner_private", "global_agent"] as MemoryScope[] };
+    const context = access ?? { requesterId: "system", allowedScopes: [] as MemoryScope[] };
     const scopes = this.authorizedScopes(context);
     if (!scopes.length) return { manifest: { format: "agent-memory", version: 1, exportedAt: nowIso(), counts: { episodes: 0, facts: 0, episodic: 0, explicit: 0, profile: 0 } }, episodes: [], facts: [], episodic: [], explicit: [], profile: [] };
     const placeholders = scopes.map(() => "?").join(",");
-    const episodes = this.db.all<Record<string, unknown>>(`SELECT * FROM memory_episodes WHERE scope IN (${placeholders})`, ...scopes).map((row) => ({ id: row.id as string, scope: row.scope as MemoryScope, source: JSON.parse(row.source_json as string), ...(row.actor_json ? { actor: JSON.parse(row.actor_json as string) } : {}), content: row.content as string, occurredAt: row.occurred_at as string, ingestedAt: row.ingested_at as string, trust: row.trust as MemoryEpisode["trust"], ...(row.metadata_json ? { metadata: JSON.parse(row.metadata_json as string) } : {}) }));
+    const episodes = this.db.all<Record<string, unknown>>(`SELECT * FROM memory_episodes WHERE scope IN (${placeholders})`, ...scopes).map((row) => ({ id: row.id as string, scope: row.scope as MemoryScope, source: JSON.parse(row.source_json as string), ...(row.actor_json ? { actor: JSON.parse(row.actor_json as string) } : {}), content: row.content as string, occurredAt: row.occurred_at as string, ingestedAt: row.ingested_at as string, ...(row.metadata_json ? { metadata: JSON.parse(row.metadata_json as string) } : {}) }));
     const facts = this.db.all<Record<string, unknown>>(`SELECT * FROM memory_facts WHERE scope IN (${placeholders})`, ...scopes).map((row) => ({ id: row.id, scope: row.scope, subject: row.subject, predicate: row.predicate, object: JSON.parse(row.object_json as string), confidence: row.confidence, validity: { ...(row.valid_from ? { validFrom: row.valid_from } : {}), ...(row.valid_to ? { validTo: row.valid_to } : {}) }, status: row.status, provenance: JSON.parse(row.provenance_json as string), createdAt: row.created_at, updatedAt: row.updated_at }));
     const episodic = this.db.all<Record<string, unknown>>(`SELECT * FROM memory_episodic WHERE scope IN (${placeholders})`, ...scopes).map((row) => ({ id: row.id, scope: row.scope, situation: row.situation, ...(row.action ? { action: row.action } : {}), ...(row.outcome ? { outcome: row.outcome } : {}), ...(row.lesson ? { lesson: row.lesson } : {}), provenance: JSON.parse(row.provenance_json as string), ...(row.occurred_at ? { occurredAt: row.occurred_at } : {}), ...(row.importance !== null ? { importance: row.importance } : {}), createdAt: row.created_at, updatedAt: row.updated_at }));
     const explicit = this.db.all<Record<string, unknown>>(`SELECT * FROM memory_explicit WHERE scope IN (${placeholders})`, ...scopes).map((row) => ({ id: row.id, scope: row.scope, content: row.content, provenance: JSON.parse(row.provenance_json as string), createdAt: row.created_at, updatedAt: row.updated_at }));
@@ -541,7 +434,7 @@ export class MemoryService {
     this.db.transaction(() => {
       for (const episode of input.episodes ?? []) {
         if (access) this.assertScope(access, episode.scope);
-        const inserted = this.db.run("INSERT OR IGNORE INTO memory_episodes(id,scope,source_json,actor_json,content,occurred_at,ingested_at,trust,metadata_json) VALUES (?,?,?,?,?,?,?,?,?)", episode.id, episode.scope, JSON.stringify(episode.source), episode.actor ? JSON.stringify(episode.actor) : null, episode.content, episode.occurredAt, episode.ingestedAt, episode.trust, episode.metadata ? JSON.stringify(episode.metadata) : null);
+        const inserted = this.db.run("INSERT OR IGNORE INTO memory_episodes(id,scope,source_json,actor_json,content,occurred_at,ingested_at,metadata_json) VALUES (?,?,?,?,?,?,?,?)", episode.id, episode.scope, JSON.stringify(episode.source), episode.actor ? JSON.stringify(episode.actor) : null, episode.content, episode.occurredAt, episode.ingestedAt, episode.metadata ? JSON.stringify(episode.metadata) : null);
         if (inserted.changes > 0) imported += 1;
         this.db.run("INSERT OR IGNORE INTO memory_inbox(id,episode_id,status,retries,created_at,updated_at) VALUES (?,?,?,?,?,?)", `inbox-${episode.id}`, episode.id, "pending", 0, episode.ingestedAt, nowIso());
       }
@@ -566,51 +459,13 @@ export class MemoryService {
   }
 
   private authorizedScopes(access: MemoryAccessContext): MemoryScope[] {
-    if (!access.requesterId || !["OWNER", "GUEST"].includes(access.trust) || !Array.isArray(access.allowedScopes)) throw new Error("MEMORY_ACCESS_INVALID");
+    if (!access.requesterId || !Array.isArray(access.allowedScopes)) throw new Error("MEMORY_ACCESS_INVALID");
+    if (access.requesterId === "system" && access.conversationId === undefined) {
+      return this.db.all<{ scope: string }>("SELECT scope FROM memory_episodes UNION SELECT scope FROM memory_facts UNION SELECT scope FROM memory_episodic UNION SELECT scope FROM memory_explicit").map((row) => row.scope).filter(isMemoryScope);
+    }
     const principalScope = access.principalId ?? access.requesterId;
-    const canonical: MemoryScope[] = [`user:${principalScope}`, ...(access.conversationId ? [`workspace:${access.conversationId}` as MemoryScope] : []), ...((access.projectIds ?? []).filter((id) => typeof id === "string" && id).map((id) => `project:${id}` as MemoryScope))];
-    if (access.trust === "OWNER") canonical.push("global_agent");
-    if (this.owners.length && access.conversationId) {
-      const conversation = this.db.get<{ kind: "private" | "group"; trust: "OWNER" | "GUEST" }>("SELECT kind,trust FROM conversations WHERE conversation_id=?", access.conversationId);
-      const isOwner = this.owners.some((owner) => access.requesterId === owner.userId);
-      if (conversation?.kind === "private" && conversation.trust === "OWNER" && access.trust === "OWNER" && isOwner) canonical.push("owner_private");
-    }
+    const canonical: MemoryScope[] = [`user:${principalScope}`, ...(access.conversationId ? [`workspace:${access.conversationId}` as MemoryScope] : [])];
     return canonical.filter((scope) => access.allowedScopes.includes(scope));
-  }
-
-  private resolveLegacyEpisodePrincipal(sourceJson: string, actorJson: string | null): string | undefined {
-    let source: Record<string, unknown> = {};
-    let actor: Record<string, unknown> = {};
-    try { source = JSON.parse(sourceJson) as Record<string, unknown>; } catch { /* quarantine below */ }
-    try { actor = actorJson ? JSON.parse(actorJson) as Record<string, unknown> : {}; } catch { /* quarantine below */ }
-    const eventId = typeof source.sourceId === "string" ? source.sourceId : undefined;
-    if (eventId) {
-      const row = this.db.get<{ envelope_json: string }>("SELECT envelope_json FROM ingress_events WHERE event_id=?", eventId);
-      if (row) {
-        try {
-          const envelope = JSON.parse(row.envelope_json) as { source?: { platform?: string; accountId?: string }; trustedIdentity?: { userId?: string; principalId?: string } };
-          if (envelope.source?.platform && envelope.source.accountId && envelope.trustedIdentity?.userId) {
-            const identity = this.db.get<{ principal_id: string }>("SELECT principal_id FROM platform_identities WHERE platform=? AND account_id=? AND user_id=?", envelope.source.platform, envelope.source.accountId, envelope.trustedIdentity.userId);
-            if (identity) return identity.principal_id;
-          }
-          if (envelope.trustedIdentity?.principalId) {
-            const principal = this.db.get<{ principal_id: string }>("SELECT principal_id FROM principals WHERE principal_id=?", envelope.trustedIdentity.principalId);
-            if (principal) return principal.principal_id;
-          }
-        } catch { /* quarantine below */ }
-      }
-    }
-    if (actor.type === "system" && typeof actor.id === "string") {
-      const task = this.db.get<{ principal_id: string | null }>("SELECT principal_id FROM tasks WHERE id=?", actor.id);
-      if (task?.principal_id) return task.principal_id;
-    }
-    const platform = typeof source.platform === "string" ? source.platform : undefined;
-    const userId = typeof actor.id === "string" ? actor.id : undefined;
-    if (platform && userId) {
-      const identities = this.db.all<{ principal_id: string }>("SELECT DISTINCT principal_id FROM platform_identities WHERE platform=? AND user_id=?", platform, userId);
-      if (identities.length === 1) return identities[0]?.principal_id;
-    }
-    return undefined;
   }
 
   private assertScope(access: MemoryAccessContext, scope: MemoryScope): void {
@@ -767,7 +622,7 @@ function retryAt(retries: number): string {
 function validateImportRecords(input: MemoryExport, access: MemoryAccessContext | undefined, assertScope: (scope: MemoryScope) => void): void {
   if (!input || !Array.isArray(input.episodes) || !Array.isArray(input.facts) || !Array.isArray(input.episodic) || !Array.isArray(input.explicit) || !Array.isArray(input.profile)) throw new Error("MEMORY_IMPORT_RECORDS_INVALID");
   for (const episode of input.episodes) {
-    if (!episode || typeof episode !== "object" || typeof episode.id !== "string" || !episode.id || !isMemoryScope(episode.scope) || !episode.source || typeof episode.source !== "object" || typeof episode.source.type !== "string" || typeof episode.content !== "string" || typeof episode.occurredAt !== "string" || typeof episode.ingestedAt !== "string" || !["owner", "guest", "system"].includes(episode.trust)) throw new Error("MEMORY_IMPORT_EPISODE_INVALID");
+    if (!episode || typeof episode !== "object" || typeof episode.id !== "string" || !episode.id || !isMemoryScope(episode.scope) || !episode.source || typeof episode.source !== "object" || typeof episode.source.type !== "string" || typeof episode.content !== "string" || typeof episode.occurredAt !== "string" || typeof episode.ingestedAt !== "string") throw new Error("MEMORY_IMPORT_EPISODE_INVALID");
     if (access) assertScope(episode.scope);
   }
   for (const fact of input.facts) {
@@ -790,5 +645,5 @@ function validateImportRecords(input: MemoryExport, access: MemoryAccessContext 
 }
 
 function isMemoryScope(value: unknown): value is MemoryScope {
-  return typeof value === "string" && /^(global_agent|owner_private|user:[^\s]+|group:[^\s]+|workspace:[^\s]+|project:[^\s]+)$/.test(value);
+  return typeof value === "string" && /^(user|workspace):[^\s]+$/.test(value);
 }

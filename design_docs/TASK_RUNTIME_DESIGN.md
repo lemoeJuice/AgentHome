@@ -4,6 +4,8 @@
 > 上位设计：`AGENT_HOME_DESIGN.md` / `AGENT_HOME_DESIGN.md`  
 > 相关设计：`MAIN_WORKER_ORCHESTRATION_DESIGN.md`、`MEMORY_SYSTEM_DESIGN.md`、`AGENT_HOME_CONTAINER_CONTROL_DESIGN.md`、`EXTERNAL_PLUGIN_COMMAND_DESIGN.md`
 
+> 当前 Task/Worker 使用统一 Principal 执行模型，不包含 Owner/Guest role 或 trust 字段。System Admin 不提升普通 Task 的 UID/GID、Workspace membership 或 capabilities；身份细节见 `PRINCIPAL_WORKSPACE_SYSTEM_ADMIN_DESIGN.md`。
+
 ---
 
 # 1. 目标

@@ -1,4 +1,4 @@
-import { configuredOwners, configuredSystemAdmins, type AppConfig } from "../config.js";
+import { configuredSystemAdmins, type AppConfig } from "../config.js";
 import { newId, nowIso, messageKey, conversationKey } from "../shared/ids.js";
 import type { ChatEvent, ChatPlatformAdapter, ControllerEventEnvelope, ConversationAddress, JsonValue, OutgoingMessage, PlatformMessageRef, SendResult } from "../shared/types.js";
 import type { Logger } from "../shared/logger.js";
@@ -6,12 +6,9 @@ import { GatewayState } from "./state.js";
 import { CommandRegistry, type CommandContext, type CommandResult, AgentActionRegistry } from "./registry.js";
 import { GatewayArtifactService } from "./artifacts.js";
 
-function commandAllowed(permission: string, event: ChatEvent, owners: NonNullable<AppConfig["owners"]>, systemAdmins: NonNullable<AppConfig["owners"]>): boolean {
+function commandAllowed(permission: string, event: ChatEvent, systemAdmins: NonNullable<AppConfig["systemAdmins"]>): boolean {
   if (!permission) return false;
   if (permission === "admin") return systemAdmins.some((admin) => event.sender.platform === admin.platform && event.sender.accountId === admin.accountId && event.sender.userId === admin.userId);
-  if (permission === "owner" || permission.startsWith("owner.")) {
-    return owners.some((owner) => event.sender.platform === owner.platform && event.sender.accountId === owner.accountId && event.sender.userId === owner.userId);
-  }
   return permission === "user" || permission === "public" || permission.startsWith("command.");
 }
 
@@ -83,7 +80,7 @@ export class Router {
       await this.adapter.sendMessage(event.conversation, { text: `未知命令 /${name}。发送 /help 查看可用命令。`, replyTo: event.message.ref });
       return;
     }
-    if (!commandAllowed(route.definition.permission, event, configuredOwners(this.config), configuredSystemAdmins(this.config))) {
+    if (!commandAllowed(route.definition.permission, event, configuredSystemAdmins(this.config))) {
       this.audit("command.execute", "DENY", "COMMAND_PERMISSION_DENIED", name, event.sender.userId, conversationId);
       await this.adapter.sendMessage(event.conversation, { text: "当前身份没有执行此命令的权限。", replyTo: event.message.ref });
       return;
@@ -133,13 +130,13 @@ export class Router {
       "/stop <task-id> — 请求取消指定任务（按任务权限校验）",
       "/new — 新建 Main Session；不会删除长期记忆或任务",
       "/usage — 查看 Pi 命令和 SnowLuma API 端点",
-      "/bind <platform> <accountId> <userId> — 绑定身份（Owner 私聊）",
-      "/unbind <platform> <accountId> <userId> — 解除身份绑定（Owner 私聊）",
+       "/bind <platform> <accountId> <userId> — 绑定身份（System Admin 私聊）",
+       "/unbind <platform> <accountId> <userId> — 解除身份绑定（System Admin 私聊）",
     ];
     const gatewayCommands = this.commands.list().map((definition) => {
       const aliases = definition.aliases?.length ? `（别名：${definition.aliases.map((alias) => `/${alias}`).join("、")}）` : "";
-      const permission = definition.permission === "admin" || definition.permission === "owner" || definition.permission.startsWith("owner.")
-        ? "Owner（私聊或群聊）"
+      const permission = definition.permission === "admin"
+        ? "System Admin（私聊或群聊）"
         : "直接命令";
       if (definition.name === "model") return `/model — 查看当前 provider/model/variant；/model list [provider] — 查看 Pi 提供的模型列表；/model set <provider> <model> — 切换默认模型；/model variant <level> — 切换 thinking variant（${permission}）${aliases}`;
       if (definition.name === "echo") return `/echo <text> — 原样回复文本，用于测试（${permission}）${aliases}`;

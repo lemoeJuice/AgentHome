@@ -1,12 +1,5 @@
 {
   "instanceId": "default",
-  "owners": [
-    {
-      "platform": "qq",
-      "accountId": "default",
-      "userId": "123456"
-    }
-  ],
   "systemAdmins": [
     {
       "platform": "qq",
@@ -81,8 +74,7 @@
     "workerSandboxCommand": "bwrap",
     "piAgentDir": "/state/model/pi/agent"
   },
-  "guest": {
-    "enabled": true,
+  "principalExecution": {
     "maxWorkersPerPrincipal": 1,
     "taskTimeoutMs": 1800000,
     "commandTimeoutMs": 600000,
@@ -103,9 +95,7 @@
   "plugins": {
     "enabled": ["./dist/plugins/echo.js"],
     "allowedActions": [],
-    "allowedPermissions": [],
-    "guestAllowedActions": [],
-    "guestAllowedPermissions": []
+    "allowedPermissions": []
   },
   "logging": {
     "level": "info"
