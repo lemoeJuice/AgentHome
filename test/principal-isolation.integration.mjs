@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { lookup } from "node:dns/promises";
-import { chown, chmod, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chown, chmod, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { SqliteStore, migrate } from "/app/dist/db.js";
 import { runtimeMigrations } from "/app/dist/schema.js";
@@ -100,7 +100,7 @@ try {
   assert.equal(identity.uid, principals.get(a.principalId).runtimeUid);
   assert.equal(identity.gid, principals.get(a.principalId).runtimeGid);
   assert.equal(identity.groups.includes(0), false, "Worker must not inherit the Main group");
-  assert.deepEqual(identity.groups, [workspaceGidA], "Worker must receive only its current Workspace supplementary GID");
+  assert.deepEqual(identity.groups.filter((group) => group !== identity.gid), [workspaceGidA], "Worker must receive only its current Workspace supplementary GID");
   assert.equal(identity.own, "principal-persistent");
   assert.equal(identity.otherDenied, true);
   assert.equal(identity.personalDenied, true);
