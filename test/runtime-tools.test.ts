@@ -114,6 +114,7 @@ test("Worker Pi exposes only Runtime-brokered Principal execution and workspace 
     if (previousToken === undefined) delete process.env.AGENT_HOME_RUNTIME_TOOL_TOKEN; else process.env.AGENT_HOME_RUNTIME_TOOL_TOKEN = previousToken;
   }
   assert.ok(names.includes("worker_exec"));
+  assert.ok(names.includes("report_progress"));
   assert.ok(names.includes("workspace_read"));
   assert.ok(names.includes("workspace_write"));
   assert.ok(names.includes("workspace_edit"));
@@ -158,7 +159,7 @@ test("native SnowLuma stream action results return ArtifactRefs and image conten
   }
 });
 
-test("Worker Gateway actions return through the authenticated Runtime tool socket", async () => {
+test("Worker Gateway actions and progress reports return through the authenticated Runtime tool socket", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-worker-tool-proxy-"));
   const socketPath = join(root, "tools.sock");
   const context = { ...contextBase(), taskId: "task-1", workerId: "worker-1", executionContextId: "task-1:worker-1:principal:owner" };
@@ -173,10 +174,14 @@ test("Worker Gateway actions return through the authenticated Runtime tool socke
   try {
     registerWorkerTools({ registerTool: (definition) => { definitions.set(definition.name, definition); } });
     const invoke = definitions.get("invoke_gateway_action");
+    const reportProgress = definitions.get("report_progress");
     assert.ok(invoke);
+    assert.ok(reportProgress);
     const result = await invoke.execute("tool-call", { name: "allowed_action" }, new AbortController().signal);
-    assert.deepEqual(calls, ["invoke_action"]);
+    const progress = await reportProgress.execute("progress-call", { summary: "verified the follow-up", phase: "verification" }, new AbortController().signal);
+    assert.deepEqual(calls, ["invoke_action", "report_progress"]);
     assert.match(result.content[0]?.text ?? "", /invoke_action/);
+    assert.match(progress.content[0]?.text ?? "", /report_progress/);
   } finally {
     await server.stop();
     await rm(root, { recursive: true, force: true });

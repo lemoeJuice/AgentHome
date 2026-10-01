@@ -573,8 +573,8 @@ export class RuntimeApp {
       case "follow_up_task": {
         const task = this.visibleTask(String(values.taskId ?? ""), context);
         if (!context.message) throw new Error("TOOL_MESSAGE_CONTEXT_REQUIRED");
-        await this.tasks.addFollowUp(task.id, requiredText(values.content, "content"), { conversationId: context.conversationId, message: context.message, requester: context.requester, capabilities: context.capabilities });
-        return { taskId: task.id, status: "FOLLOW_UP_ACCEPTED" };
+        const queued = await this.tasks.addFollowUp(task.id, requiredText(values.content, "content"), { conversationId: context.conversationId, message: context.message, requester: context.requester, capabilities: context.capabilities });
+        return { taskId: task.id, ...queued };
       }
       case "finish_task": {
         const task = this.visibleTask(String(values.taskId ?? ""), context);
@@ -599,6 +599,7 @@ export class RuntimeApp {
         return sent.message as never;
       }
       case "worker_exec":
+      case "report_progress":
       case "workspace_read":
       case "workspace_write":
       case "workspace_edit":
@@ -607,6 +608,10 @@ export class RuntimeApp {
       case "workspace_list":
       case "workspace_stat": {
         const executionContext = await this.resolveWorkerExecutionContext(context, action);
+        if (action === "report_progress") {
+          await this.tasks.reportProgress(context.workerId!, requiredText(values.summary, "summary"), typeof values.phase === "string" ? values.phase : undefined);
+          return { taskId: context.taskId, workerId: context.workerId, status: "PROGRESS_REPORTED" } as never;
+        }
         if (action === "worker_exec") {
           const command = requiredText(values.command, "command");
           const cwd = typeof values.cwd === "string" ? values.cwd : undefined;
