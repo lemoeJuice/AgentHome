@@ -60,6 +60,9 @@ export class TaskService implements ExecutionBackend {
   private readonly config: AppConfig;
   private readonly options: TaskServiceOptions;
   private readonly activeSessions = new Map<string, PiSession>();
+  private readonly activeWorkerTurns = new Set<string>();
+  private readonly mailboxDrains = new Map<string, Promise<void>>();
+  private readonly mailboxDrainRequested = new Set<string>();
   private readonly activePrincipalCommands = new Map<string, Set<ChildProcess>>();
   private readonly projectUsageChecks = new Map<string, NodeJS.Timeout>();
   private readonly log: Logger;
@@ -397,7 +400,7 @@ export class TaskService implements ExecutionBackend {
     }
     this.log.debug("Worker Pi harness started", { taskId: task.id, workerId: worker.id, principalId: worker.principalId, uid: worker.runtimeUid, gid: worker.runtimeGid, workspaceGid: worker.workspaceGid, workspace: projectPath, workspaceId: worker.workspaceId, workspaceAccess: worker.workspaceAccess, capabilities: { projects: worker.capabilities?.projects ?? [] }, executionProfile: describeExecutionProfile(worker), scope: worker.workspaceScopeId ?? worker.workspaceId, artifactRefCount: worker.artifactRefs?.length ?? 0, contextSource: "durable-worker-records", piCwd: dirname(sessionPath), sessionRoot: dirname(sessionPath) });
     try { await this.ensureWorkerBinding(worker.id); }
-    catch (error) { await this.failWorker(worker.id, String(error)); return; }
+    catch (error) { this.activeWorkerTurns.delete(worker.id); this.activeSessions.delete(worker.id); await this.failWorker(worker.id, String(error)); return; }
     if (!this.workerCanStart(worker.id)) return;
     const sandbox: PiSandbox = { sessionRoot: dirname(sessionPath), launcherUid: modelUid, launcherGid: modelGid, ...(workerToolContext ? { toolSocket: workerToolContext.socketPath, toolToken: workerToolContext.token } : {}) };
     const piCwd = dirname(sessionPath);
@@ -423,6 +426,7 @@ export class TaskService implements ExecutionBackend {
       const useWorkerExtension = Boolean(this.options.workerToolExtensionPath);
       session = await this.pi.createSession(sessionPath, { cwd: piCwd, sandbox, ...(useWorkerExtension ? { extensionPath: this.options.workerToolExtensionPath } : {}), mainTools: true });
       if (!this.workerCanStart(worker.id)) { await this.pi.abort(session); return; }
+      this.activeWorkerTurns.add(worker.id);
       this.activeSessions.set(worker.id, session);
       const processIdentity = await this.pi.processInfo?.(session);
       const processId = processIdentity?.pid ?? this.pi.processId?.(session);
@@ -436,9 +440,9 @@ export class TaskService implements ExecutionBackend {
         this.event(worker.taskId, "WORKER_STARTED", worker.id, { sessionId: session.sessionId });
         return true;
       });
-      if (!started) { this.activeSessions.delete(worker.id); await this.pi.abort(session); return; }
+      if (!started) { this.activeWorkerTurns.delete(worker.id); this.activeSessions.delete(worker.id); await this.pi.abort(session); return; }
     }
-    catch (error) { await this.failWorker(worker.id, String(error)); return; }
+    catch (error) { this.activeWorkerTurns.delete(worker.id); this.activeSessions.delete(worker.id); await this.failWorker(worker.id, String(error)); return; }
     const prompt = [
       "You are an Agent Home Worker. Execute the assigned objective in the authorized workspace.",
       `Task ID: ${task.id}`,
@@ -448,6 +452,7 @@ export class TaskService implements ExecutionBackend {
       inboundFiles.length ? `Authorized inbound files (materialized in the workspace):\n${inboundFiles.join("\n")}` : "No inbound files were supplied.",
       imageInputs.length ? `${imageInputs.length} authorized image input(s) are attached to this Pi turn as visual content.` : "No visual image inputs were attached to this Pi turn.",
       "Do not send chat messages or access credentials. Return a concise verified result.",
+      "When a user follow-up arrives, process it as part of this Task. After processing it, call the report_progress tool with a concise verified update for Main; use it for other meaningful progress as well.",
       `Runtime control frames must be separate lines prefixed with ${WORKER_CONTROL_PREFIX.trimEnd()} and contain JSON. Supported types are progress, question, artifact, and finish.`,
       `Use ${WORKER_CONTROL_PREFIX}{"type":"progress","summary":"..."} for meaningful progress; use question with a question field; use artifact with a workspace-relative path; use finish with outcome COMPLETED, PARTIAL, or FAILED and a summary.`,
       "Plain text is only a result summary. It never grants authorization or changes Runtime state.",
@@ -458,11 +463,13 @@ export class TaskService implements ExecutionBackend {
       const outputPromise = this.pi.send(session, prompt, { cwd: piCwd, sandbox, timeoutMs, taskId: task.id, workerId: worker.id, ...(useWorkerExtension ? { extensionPath: this.options.workerToolExtensionPath } : {}), mainTools: true, ...(imageInputs.length ? { images: imageInputs } : {}) });
       const output = await outputPromise;
       await this.handleWorkerOutput(worker.id, output);
-      const afterOutput = this.getWorker(worker.id).status;
-      if (afterOutput === "RUNNING" || afterOutput === "WAITING_USER") await this.replayPendingMailbox(worker.id, session);
+      this.activeWorkerTurns.delete(worker.id);
     } catch (error) {
+      this.activeWorkerTurns.delete(worker.id);
       if (["STOPPING", "CANCELLED", "COMPLETED", "FAILED"].includes(this.getWorker(worker.id).status)) return;
       await this.failWorker(worker.id, String(error));
+    } finally {
+      void this.scheduleMailboxDrain(worker.id);
     }
   }
 
@@ -516,25 +523,16 @@ export class TaskService implements ExecutionBackend {
       return true;
     });
     if (!answered) throw new Error("QUESTION_NOT_OPEN");
-    const session = this.activeSessions.get(question.worker_id);
     try {
-      if (!session) throw new Error("WORKER_SESSION_UNAVAILABLE");
       if (this.cancellationRequested(question.task_id) || this.getWorker(question.worker_id).status === "STOPPING") throw new Error("WORKER_SESSION_UNAVAILABLE");
-      const output = await this.pi.steer(session, `User answer to your blocking question: ${answer}`, { timeoutMs: this.config.runtime.piTimeoutMs });
-      this.db.transaction(() => {
-        this.db.run("UPDATE task_mailbox SET status='DELIVERED',delivered_at=? WHERE id=? AND status IN ('PENDING','DELIVERED')", nowIso(), mailboxId);
-        this.db.run("UPDATE pending_questions SET status='CLOSED',closed_at=? WHERE id=? AND status='ANSWERED'", nowIso(), questionId);
-        this.db.run("UPDATE worker_executions SET status='RUNNING',updated_at=? WHERE id=? AND status='WAITING_USER'", nowIso(), question.worker_id);
-        this.db.run("UPDATE tasks SET status='RUNNING',updated_at=? WHERE id=? AND status='WAITING_USER'", nowIso(), question.task_id);
-      });
-      await this.handleWorkerOutput(question.worker_id, output);
-      this.markMailboxConsumed(mailboxId);
+      this.scheduleMailboxDrain(question.worker_id);
     } catch (error) {
+      this.db.run("UPDATE task_mailbox SET status='PENDING' WHERE id=? AND status='PROCESSING'", mailboxId);
       this.recordException(question.task_id, question.worker_id, "answerQuestion", "WORKER_DELIVERY", String(error));
     }
   }
 
-  async addFollowUp(taskId: string, content: string, source: { conversationId: string; message: PlatformMessageRef; requester?: TaskRequester; capabilities?: CapabilitySet }): Promise<void> {
+  async addFollowUp(taskId: string, content: string, source: { conversationId: string; message: PlatformMessageRef; requester?: TaskRequester; capabilities?: CapabilitySet }): Promise<{ mailboxId: string; status: "FOLLOW_UP_QUEUED" }> {
     const task = this.getTask(taskId);
     if (!task.capabilities.tasks.canFollowUp || this.isTerminalTask(task.status) || this.cancellationRequested(taskId)) throw new Error("TASK_FOLLOW_UP_DENIED");
     if (source.requester && !this.taskOwnedByActor(task, source.requester.principalId)) throw new Error("TASK_FOLLOW_UP_DENIED");
@@ -551,31 +549,42 @@ export class TaskService implements ExecutionBackend {
         this.db.run("INSERT INTO task_mailbox(id,task_id,type,source_conversation_id,source_message_key,content,status,created_at) VALUES (?,?,?,?,?,?,?,?)", mailboxId, taskId, "FOLLOW_UP", source.conversationId, messageKey(source.message), content, "PENDING", timestamp);
         this.event(taskId, "FOLLOW_UP_ADDED", undefined, { mailboxId, delegatedToNewWorker: true });
       });
-      try { await this.dispatchFollowUpAsWorker(mailboxId, task, content, source.capabilities, source.requester); }
-      catch (error) { this.db.run("UPDATE task_mailbox SET status='FAILED' WHERE id=? AND status IN ('PENDING','PROCESSING')", mailboxId); this.recordException(taskId, undefined, "follow_up_dispatch", "FOLLOW_UP_WORKER_CREATE", String(error)); throw error; }
-      return;
+      this.db.run("UPDATE task_mailbox SET status='PROCESSING' WHERE id=? AND status='PENDING'", mailboxId);
+      void this.dispatchFollowUpAsWorker(mailboxId, task, content, source.capabilities, source.requester).catch((error) => this.failMailboxDispatch(mailboxId, taskId, undefined, error));
+      return { mailboxId, status: "FOLLOW_UP_QUEUED" };
     }
     const id = newId("mail");
     this.db.transaction(() => {
       this.db.run("INSERT INTO task_mailbox(id,task_id,type,source_conversation_id,source_message_key,content,status,created_at,worker_id) VALUES (?,?,?,?,?,?,?,?,?)", id, taskId, "FOLLOW_UP", source.conversationId, messageKey(source.message), content, "PENDING", nowIso(), targetWorker?.id ?? null);
       this.event(taskId, "FOLLOW_UP_ADDED", undefined, { mailboxId: id });
     });
-    if (targetWorker) {
-      const session = this.activeSessions.get(targetWorker.id);
-      try {
-        if (!session) throw new Error("WORKER_SESSION_UNAVAILABLE");
-        const output = await this.pi.steer(session, `Additional user instruction: ${content}`, { timeoutMs: this.config.runtime.piTimeoutMs });
-        this.db.run("UPDATE task_mailbox SET status='DELIVERED',delivered_at=? WHERE id=? AND status IN ('PENDING','DELIVERED')", nowIso(), id);
-        await this.handleWorkerOutput(targetWorker.id, output);
-        this.markMailboxConsumed(id);
-      } catch (error) {
-        const currentStatus = this.getWorker(targetWorker.id).status;
-        if (["COMPLETED", "FAILED", "CANCELLED", "INTERRUPTED"].includes(currentStatus)) {
-          try { await this.dispatchFollowUpAsWorker(id, task, content, source.capabilities, source.requester); }
-          catch (dispatchError) { this.db.run("UPDATE task_mailbox SET status='FAILED' WHERE id=? AND status IN ('PENDING','DELIVERED','PROCESSING')", id); this.recordException(taskId, undefined, "follow_up_dispatch", "FOLLOW_UP_WORKER_CREATE", String(dispatchError)); throw dispatchError; }
-        } else this.recordException(taskId, targetWorker.id, "addFollowUp", "WORKER_DELIVERY", String(error));
-      }
-    }
+    if (targetWorker) this.scheduleMailboxDrain(targetWorker.id);
+    return { mailboxId: id, status: "FOLLOW_UP_QUEUED" };
+  }
+
+  private scheduleMailboxDrain(workerId: string): Promise<void> {
+    if (this.activeWorkerTurns.has(workerId)) return Promise.resolve();
+    const existing = this.mailboxDrains.get(workerId);
+    if (existing) { this.mailboxDrainRequested.add(workerId); return existing; }
+    const drain = Promise.resolve().then(() => this.replayPendingMailbox(workerId)).catch((error) => {
+      const worker = this.getWorker(workerId);
+      this.recordException(worker.taskId, workerId, "mailbox_delivery", "WORKER_DELIVERY", String(error));
+    }).finally(() => {
+      if (this.mailboxDrains.get(workerId) === drain) this.mailboxDrains.delete(workerId);
+      const requested = this.mailboxDrainRequested.delete(workerId);
+      if (requested && !this.activeWorkerTurns.has(workerId) && this.hasPendingMailbox(workerId)) void this.scheduleMailboxDrain(workerId);
+    });
+    this.mailboxDrains.set(workerId, drain);
+    return drain;
+  }
+
+  private hasPendingMailbox(workerId: string): boolean {
+    return Boolean(this.db.get("SELECT 1 FROM task_mailbox WHERE worker_id=? AND status IN ('PENDING','DELIVERED') LIMIT 1", workerId));
+  }
+
+  private failMailboxDispatch(mailboxId: string, taskId: string, workerId: string | undefined, error: unknown): void {
+    this.db.run("UPDATE task_mailbox SET status='FAILED' WHERE id=? AND status IN ('PENDING','PROCESSING','DELIVERED')", mailboxId);
+    this.recordException(taskId, workerId, "follow_up_dispatch", "FOLLOW_UP_WORKER_CREATE", String(error));
   }
 
   async requestCancel(taskId: string, actor?: CapabilitySet, actorPrincipalId?: string, internalReason?: string): Promise<void> {
@@ -690,10 +699,12 @@ export class TaskService implements ExecutionBackend {
     });
     if (!finished) return;
     this.activeSessions.delete(workerId);
+    this.activeWorkerTurns.delete(workerId);
     await this.revokeWorkerBinding(workerId);
     const task = this.getTask(worker.taskId);
     await this.emit({ type: "TASK_RESULT", taskId: task.id, workerId, payload: { ...finalResult } });
     void this.schedulePendingWorkers(task.id);
+    void this.scheduleMailboxDrain(workerId);
   }
 
   workerControl(workerId: string): WorkerControl {
@@ -776,10 +787,12 @@ export class TaskService implements ExecutionBackend {
     });
     if (!failed) return;
     this.activeSessions.delete(workerId);
+    this.activeWorkerTurns.delete(workerId);
     await this.revokeWorkerBinding(workerId);
     this.recordException(worker.taskId, workerId, "worker", failure.errorCode, failure.summary, false);
     await this.emit({ type: "TASK_RESULT", taskId: worker.taskId, workerId, payload: { outcome: "FAILED", errorCode: failure.errorCode, summary: failure.summary } });
     void this.schedulePendingWorkers(worker.taskId);
+    void this.scheduleMailboxDrain(workerId);
   }
 
   private async stopWorkerExecution(worker: { id: string; process_mode?: string; runtime_uid?: number | null; harness_session_id: string | null; harness_session_path: string | null; process_id: number | null; process_group_id: number | null; pid_start_time: string | null }): Promise<boolean> {
@@ -798,6 +811,9 @@ export class TaskService implements ExecutionBackend {
   }
 
   async recover(): Promise<void> {
+    // A PROCESSING mailbox item belongs to an in-flight RPC that may have been
+    // interrupted by Runtime shutdown. Retry it from its durable content.
+    this.db.run("UPDATE task_mailbox SET status='PENDING' WHERE status='PROCESSING'");
     await this.terminateOrphanedPrincipalCommands();
     const active = this.db.all<{
       id: string; task_id: string; workspace_id: string | null; harness_session_id: string | null; harness_session_path: string | null;
@@ -843,7 +859,7 @@ export class TaskService implements ExecutionBackend {
           try {
             if (await this.restoreRecoveredSession(worker.id, worker.task_id, worker.workspace_id, "WAITING_USER", session)) {
               this.db.run("UPDATE tasks SET status='WAITING_USER',updated_at=? WHERE id=?", nowIso(), worker.task_id);
-              await this.replayPendingMailbox(worker.id, session);
+              void this.scheduleMailboxDrain(worker.id);
               continue;
             }
           } catch (error) {
@@ -883,7 +899,7 @@ export class TaskService implements ExecutionBackend {
         try {
           if (await this.restoreRecoveredSession(worker.id, worker.task_id, worker.workspace_id, "RUNNING", session)) {
             this.db.run("UPDATE tasks SET status='RUNNING',updated_at=? WHERE id=?", nowIso(), worker.task_id);
-            await this.replayPendingMailbox(worker.id, session);
+            void this.scheduleMailboxDrain(worker.id);
             continue;
           }
         } catch (error) {
@@ -1081,22 +1097,47 @@ export class TaskService implements ExecutionBackend {
     }
   }
 
-  private async replayPendingMailbox(workerId: string, session: PiSession): Promise<void> {
-    const rows = this.db.all<{ id: string; task_id: string; content: string | null; question_id: string | null }>("SELECT id,task_id,content,question_id FROM task_mailbox WHERE worker_id=? AND status IN ('PENDING','DELIVERED') ORDER BY created_at,id", workerId);
-    for (const row of rows) {
+  private async replayPendingMailbox(workerId: string): Promise<void> {
+    while (!this.activeWorkerTurns.has(workerId)) {
+      const row = this.db.get<{ id: string; task_id: string; content: string | null; question_id: string | null }>("SELECT id,task_id,content,question_id FROM task_mailbox WHERE worker_id=? AND status IN ('PENDING','DELIVERED') ORDER BY created_at,id LIMIT 1", workerId);
+      if (!row) return;
+      const task = this.getTask(row.task_id);
+      if (this.isTerminalTask(task.status) || this.cancellationRequested(task.id)) {
+        this.db.run("UPDATE task_mailbox SET status='FAILED' WHERE id=? AND status IN ('PENDING','DELIVERED')", row.id);
+        this.recordException(task.id, workerId, "mailbox_delivery", "TASK_FOLLOW_UP_DENIED", "Task is no longer active");
+        continue;
+      }
+      const worker = this.getWorker(workerId);
+      if (["COMPLETED", "FAILED", "CANCELLED", "INTERRUPTED"].includes(worker.status)) {
+        const claim = this.db.run("UPDATE task_mailbox SET status='PROCESSING' WHERE id=? AND status IN ('PENDING','DELIVERED')", row.id);
+        if (!claim.changes) continue;
+        try { await this.dispatchFollowUpAsWorker(row.id, task, row.content ?? "Continue the authorized Task."); }
+        catch (error) { this.failMailboxDispatch(row.id, task.id, workerId, error); }
+        continue;
+      }
+      const session = this.activeSessions.get(workerId);
+      if (!session || !["STARTING", "RUNNING", "WAITING_USER"].includes(worker.status)) return;
+      const claim = this.db.run("UPDATE task_mailbox SET status='PROCESSING' WHERE id=? AND status IN ('PENDING','DELIVERED')", row.id);
+      if (!claim.changes) continue;
       try {
-        const output = await this.pi.steer(session, `Durable pending Worker mailbox item: ${row.content ?? ""}`, { timeoutMs: this.config.runtime.piTimeoutMs });
+        this.activeWorkerTurns.add(workerId);
+        const prefix = row.question_id ? "User answer to your blocking question" : "Additional user instruction";
+        const output = await this.pi.steer(session, `${prefix}: ${row.content ?? ""}\nAfter processing this message, call report_progress with a concise verified update for Main.`, { timeoutMs: this.config.runtime.piTimeoutMs });
         const timestamp = nowIso();
         this.db.transaction(() => {
-          this.db.run("UPDATE task_mailbox SET status='DELIVERED',delivered_at=? WHERE id=? AND status IN ('PENDING','DELIVERED')", timestamp, row.id);
+          this.db.run("UPDATE task_mailbox SET status='DELIVERED',delivered_at=? WHERE id=? AND status='PROCESSING'", timestamp, row.id);
           if (row.question_id) this.db.run("UPDATE pending_questions SET status='CLOSED',closed_at=? WHERE id=? AND status='ANSWERED'", timestamp, row.question_id);
-          this.db.run("UPDATE worker_executions SET status='RUNNING',updated_at=? WHERE id=?", timestamp, workerId);
-          this.db.run("UPDATE tasks SET status='RUNNING',updated_at=? WHERE id=?", timestamp, row.task_id);
+          this.db.run("UPDATE worker_executions SET status='RUNNING',updated_at=? WHERE id=? AND status='WAITING_USER'", timestamp, workerId);
+          this.db.run("UPDATE tasks SET status='RUNNING',updated_at=? WHERE id=? AND status='WAITING_USER'", timestamp, row.task_id);
         });
         await this.handleWorkerOutput(workerId, output);
         this.markMailboxConsumed(row.id);
+        this.activeWorkerTurns.delete(workerId);
       } catch (error) {
-        this.recordException(row.task_id, workerId, "recovery_mailbox", "WORKER_DELIVERY", String(error));
+        this.activeWorkerTurns.delete(workerId);
+        this.db.run("UPDATE task_mailbox SET status='PENDING' WHERE id=? AND status='PROCESSING'", row.id);
+        this.recordException(row.task_id, workerId, "mailbox_delivery", "WORKER_DELIVERY", String(error));
+        return;
       }
     }
   }

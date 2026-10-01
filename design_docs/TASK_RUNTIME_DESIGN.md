@@ -49,9 +49,9 @@ Task Runtime 不负责：
 4. **Pi Session 只是某次 Agent execution 的 Harness binding，不是 durable Task identity。**
 5. **一个 Task 可以有 0..N 个 WorkerExecution。**
 6. **一个 Task 可以有 0..N 个 child Task。**
-7. **用户追加要求必须先持久化，再 steer Worker。**
+7. **用户追加要求必须先持久化，再由后台调度 Worker；Main 不等待 Worker turn 完成。**
 8. **Worker question 必须先持久化，再向当前 Chat Platform 发问。**
-9. **用户回答必须先持久化，再恢复/steer Worker。**
+9. **用户回答必须先持久化，再由后台恢复/steer Worker；Ingress 不等待 Worker turn 完成。**
 10. **Task cancellation 只有在确认相关 execution 已停止后才能进入 `CANCELLED`。**
 11. **不把运行时错误分类无限扩张成 Task status。**
 12. **异常、invariant violation、无法安全判断的情况记录为结构化 Runtime Event/Exception，并上抛 Main。**
@@ -445,6 +445,7 @@ interface TaskMailboxItem {
 
   status:
     | "PENDING"
+    | "PROCESSING"
     | "DELIVERED"
     | "CONSUMED";
 
@@ -497,16 +498,22 @@ resolve Task
 ↓
 persist FOLLOW_UP
 ↓ COMMIT
-select target Worker / Main orchestration
+return accepted to Main immediately
 ↓
-steer
+Runtime mailbox scheduler selects/starts Worker
+↓
+steer after current Worker turn settles
 ↓
 mark delivered/consumed
+↓
+Worker report_progress tool → durable TASK_PROGRESS → Main queue
 ```
 
 必须：
 
 > 先持久化，再调用 Harness。
+
+Main 的 `follow_up_task` 工具只负责授权、持久化和返回 mailbox ID；不得等待 Pi `steer()` 的 Worker turn Promise。Runtime 在后台串行投递 mailbox。Worker 可通过受 Runtime token 认证的 `report_progress` 工具报告已核实进展；该工具只产生结构化 Task Event，不直接调用 Main Pi 或向用户发消息。Runtime 重启时将遗留 `PROCESSING` mailbox 恢复为 `PENDING` 并重新调度。
 
 如果：
 
@@ -1404,6 +1411,8 @@ publishArtifact()
 finishWorker()
 failWorker()
 ```
+
+`report_progress` 是 Worker Pi Extension 暴露给模型的受认证工具；Runtime 负责持久化 `WORKER_PROGRESS` / `TASK_PROGRESS` 并排入 Main event queue。追加消息及用户回答都先进入 durable mailbox，Main/Ingress 只确认已接收，不同步等待 Worker 完成。
 
 Worker 不直接：
 

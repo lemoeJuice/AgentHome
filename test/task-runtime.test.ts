@@ -94,6 +94,20 @@ class DelayedCreatePi extends TestPi {
   releaseCreate(): void { this.resolveCreate(); }
 }
 
+class DeferredSteerPi extends TestPi {
+  private releaseSteer!: () => void;
+  private resolveSteerStarted!: () => void;
+  readonly steerStarted = new Promise<void>((resolve) => { this.resolveSteerStarted = resolve; });
+  private readonly steerGate = new Promise<void>((resolve) => { this.releaseSteer = resolve; });
+  async steer(_session: PiSession, prompt: string): Promise<string> {
+    this.steers.push(prompt);
+    this.resolveSteerStarted();
+    await this.steerGate;
+    return `${WORKER_CONTROL_PREFIX}{"type":"progress","summary":"follow-up processed"}`;
+  }
+  release(): void { this.releaseSteer(); }
+}
+
 const logger = { child: () => logger, info() {}, warn() {}, error() {}, debug() {} } as unknown as Logger;
 type TestTaskServiceOptions = Omit<TaskServiceOptions, "principals"> & { principals?: PrincipalService };
 
@@ -199,17 +213,43 @@ test("question and answer are durable before worker steer", async () => {
   const question = db.get<{ id: string; status: string }>("SELECT id,status FROM pending_questions WHERE worker_id=?", worker.id);
   assert.equal(question?.status, "OPEN");
   await tasks.answerQuestion(question!.id, "staging", { conversationId: "c", message: { platform: "qq", accountId: "a", platformConversationId: "u", threadId: null, messageId: "m1" } });
+  for (let index = 0; index < 100 && db.get<{ status: string }>("SELECT status FROM task_mailbox WHERE question_id=?", question!.id)?.status !== "CONSUMED"; index += 1) await new Promise((resolve) => setTimeout(resolve, 5));
   const stored = db.get<{ status: string; answer: string }>("SELECT status,answer FROM pending_questions WHERE id=?", question!.id);
   assert.equal(stored?.status, "CLOSED");
   assert.equal(stored?.answer, "staging");
   assert.equal(db.get<{ status: string }>("SELECT status FROM task_mailbox WHERE question_id=?", question!.id)?.status, "CONSUMED");
-  assert.deepEqual(pi.steers, ["User answer to your blocking question: staging"]);
+  assert.equal(pi.steers.length, 1);
+  assert.match(pi.steers[0] ?? "", /^User answer to your blocking question: staging/);
   assert.ok(events.includes("TASK_QUESTION"));
   await tasks.requestCancel(task.id);
   assert.equal(tasks.getTask(task.id).status, "CANCELLED");
   assert.equal(tasks.getWorker(worker.id).status, "CANCELLED");
   assert.equal(pi.aborts.length, 1);
   db.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+});
+
+test("follow-up returns after durable enqueue while Worker is still processing", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-home-follow-up-queued-"));
+  const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
+  const pi = new DeferredSteerPi();
+  const config = { runtime: { maxWorkers: 2, maxArtifactBytes: 100000, piCommand: "pi", piTimeoutMs: 1000 } } as AppConfig;
+  const tasks = new TaskService(db, pi, new ArtifactService(db, root), config, { workerRoot: root }, logger);
+  const caps = { memory: { allowedScopes: ["workspace:c"] }, projects: [{ projectId: "*", access: "WRITE" as const }], qq: { readConversations: ["c"], sendConversations: ["c"] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: ["agent-home"], publishTaskIds: ["*"], allowedDestinations: ["c"] }, tasks: { canCreate: true, visibleTaskIds: [], canCancel: true, canFollowUp: true } };
+  const task = tasks.createTask({ title: "queued follow-up", goal: "process update", requester: { platform: "qq", accountId: "a", userId: "u" }, trust: "OWNER", originConversationId: "c", notificationConversationId: "c", parentCapabilities: caps });
+  try {
+    const worker = await tasks.createWorker({ taskId: task.id, objective: "wait for instruction", workspaceId: "project", workspaceAccess: "READ", actor: caps });
+    for (let index = 0; index < 100 && tasks.getWorker(worker.id).status !== "WAITING_USER"; index += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(tasks.getWorker(worker.id).status, "WAITING_USER");
+    const queued = await tasks.addFollowUp(task.id, "check the additional condition", { conversationId: "c", message: { platform: "qq", accountId: "a", platformConversationId: "group", threadId: null, messageId: "queued-follow-up" }, requester: task.requester, capabilities: caps });
+    assert.equal(queued.status, "FOLLOW_UP_QUEUED");
+    for (let index = 0; index < 100 && pi.steers.length === 0; index += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(pi.steers.length, 1, JSON.stringify({ worker: tasks.getWorker(worker.id), mailbox: db.get("SELECT status,worker_id FROM task_mailbox WHERE id=?", queued.mailboxId) }));
+    assert.equal(db.get<{ status: string }>("SELECT status FROM task_mailbox WHERE id=?", queued.mailboxId)?.status, "PROCESSING");
+    pi.release();
+    for (let index = 0; index < 100 && db.get<{ status: string }>("SELECT status FROM task_mailbox WHERE id=?", queued.mailboxId)?.status !== "CONSUMED"; index += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(db.get<{ status: string }>("SELECT status FROM task_mailbox WHERE id=?", queued.mailboxId)?.status, "CONSUMED", JSON.stringify({ mailbox: db.get("SELECT status,worker_id FROM task_mailbox WHERE id=?", queued.mailboxId), exceptions: db.all("SELECT operation,category,summary FROM runtime_exceptions WHERE task_id=?", task.id), events: db.all("SELECT type,payload_json FROM task_events WHERE task_id=? ORDER BY created_at", task.id) }));
+    assert.ok(pi.steers[0]?.includes("check the additional condition"));
+  } finally { pi.release(); db.close(); await rm(root, { recursive: true, force: true }); }
 });
 
 test("backup interruption closes stale Worker questions", async () => {
@@ -354,7 +394,9 @@ test("follow-up after the last Worker completed starts a new Worker instead of o
     const first = await tasks.createWorker({ taskId: task.id, objective: "inspect source", actor: caps, actorPrincipalId: task.requester.principalId });
     for (let index = 0; index < 100 && tasks.getWorker(first.id).status !== "COMPLETED"; index += 1) await new Promise((resolve) => setTimeout(resolve, 5));
     assert.equal(tasks.getWorker(first.id).status, "COMPLETED");
-    await tasks.addFollowUp(task.id, "write the requested output artifact", { conversationId: "c", message: { platform: "qq", accountId: "a", platformConversationId: "group", threadId: null, messageId: "follow-up" }, requester: task.requester, capabilities: caps });
+    const queued = await tasks.addFollowUp(task.id, "write the requested output artifact", { conversationId: "c", message: { platform: "qq", accountId: "a", platformConversationId: "group", threadId: null, messageId: "follow-up" }, requester: task.requester, capabilities: caps });
+    assert.equal(queued.status, "FOLLOW_UP_QUEUED");
+    for (let index = 0; index < 100 && !db.get("SELECT 1 FROM worker_executions WHERE task_id=? AND id<>?", task.id, first.id); index += 1) await new Promise((resolve) => setTimeout(resolve, 5));
     const next = db.get<{ id: string; status: string; objective: string }>("SELECT id,status,objective FROM worker_executions WHERE task_id=? AND id<>? ORDER BY updated_at DESC LIMIT 1", task.id, first.id);
     assert.ok(next);
     assert.match(next.objective, /write the requested output artifact/);
@@ -644,6 +686,7 @@ test("recovery resumes a question session and replays its pending mailbox", asyn
   db.run("INSERT INTO pending_questions(id,task_id,worker_id,question,status,answer,created_at,answered_at) VALUES (?,?,?,?,?,?,?,?)", "question-mail", "task-mail", "worker-mail", "Which environment?", "ANSWERED", "staging", timestamp, timestamp);
   db.run("INSERT INTO task_mailbox(id,task_id,type,source_conversation_id,source_message_key,content,status,created_at,worker_id,question_id) VALUES (?,?,?,?,?,?,?,?,?,?)", "mail-1", "task-mail", "FOLLOW_UP", "c", "message", "staging", "PENDING", timestamp, "worker-mail", "question-mail");
   await tasks.recover();
+  for (let index = 0; index < 100 && db.get<{ status: string }>("SELECT status FROM task_mailbox WHERE id='mail-1'")?.status !== "CONSUMED"; index += 1) await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(pi.resumed, 1);
   assert.equal(pi.resumeOptions?.sandbox?.sessionRoot, join(root, "model", "sessions", "workers", "worker-mail"));
   assert.equal("workspaceRoot" in (pi.resumeOptions?.sandbox ?? {}), false);
