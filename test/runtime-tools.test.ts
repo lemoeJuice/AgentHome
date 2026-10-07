@@ -61,6 +61,7 @@ test("Main Pi exposes only service tools and prompt text cannot add a shell acti
   assert.equal(names.includes("bash"), false);
   assert.equal(names.includes("read_file"), false);
   assert.ok(names.includes("read_artifact"));
+  assert.ok(names.includes("send_artifact"));
   assert.ok(names.includes("finish_task"));
   assert.ok(names.includes("list_snowluma_actions"));
   assert.ok(names.includes("get_snowluma_action"));

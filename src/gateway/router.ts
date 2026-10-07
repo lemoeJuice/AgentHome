@@ -256,7 +256,11 @@ export class Router {
       trustedIdentity: { userId: event.sender.userId },
       conversation: { conversationId: conversationKeyValue, address: event.conversation },
       message: { ref: event.message.ref, replyTo: event.message.replyTo },
-      payload: { text: messageSummary(event), ...(extra ?? {}) } as never,
+      payload: {
+        text: messageSummary(event),
+        attachments: event.message.attachments.map(({ type, id, filename, mime, size }) => ({ type, ...(id ? { id } : {}), ...(filename ? { filename } : {}), ...(mime ? { mime } : {}), ...(size !== undefined ? { size } : {}) })),
+        ...(extra ?? {}),
+      } as never,
     };
   }
 }
