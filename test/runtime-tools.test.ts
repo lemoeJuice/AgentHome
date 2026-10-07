@@ -115,6 +115,7 @@ test("Worker Pi exposes only Runtime-brokered Principal execution and workspace 
     if (previousToken === undefined) delete process.env.AGENT_HOME_RUNTIME_TOOL_TOKEN; else process.env.AGENT_HOME_RUNTIME_TOOL_TOKEN = previousToken;
   }
   assert.ok(names.includes("worker_exec"));
+  assert.ok(names.includes("publish_artifact"));
   assert.ok(names.includes("report_progress"));
   assert.ok(names.includes("workspace_read"));
   assert.ok(names.includes("workspace_write"));

@@ -49,6 +49,19 @@ class StructuredPi extends TestPi {
   }
 }
 
+class DeferredFinishPi extends TestPi {
+  private releaseFinish!: () => void;
+  private started!: () => void;
+  readonly sendStarted = new Promise<void>((resolve) => { this.started = resolve; });
+  private readonly finishGate = new Promise<void>((resolve) => { this.releaseFinish = resolve; });
+  async send(): Promise<string> {
+    this.started();
+    await this.finishGate;
+    return `${WORKER_CONTROL_PREFIX}{"type":"finish","outcome":"COMPLETED","summary":"deliverable created"}`;
+  }
+  release(): void { this.releaseFinish(); }
+}
+
 class ImageCapturingPi extends TestPi {
   images: PiImageContent[] = [];
   async send(_session: PiSession, _prompt: string, options?: { images?: PiImageContent[] }): Promise<string> {
@@ -480,6 +493,34 @@ test("WorkerControl persists progress, publishes artifacts, and explicitly finis
   await tasks.finishTask(task.id, { outcome: "COMPLETED", summary: "confirmed" });
   assert.equal(tasks.getTask(task.id).status, "COMPLETED");
   db.close(); await rm(root, { recursive: true, force: true });
+});
+
+test("explicitly published Worker artifacts are included when the finish frame omits their refs", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-home-worker-published-artifact-"));
+  const db = new SqliteStore(":memory:"); migrate(db, runtimeMigrations);
+  const pi = new DeferredFinishPi();
+  const artifacts = new ArtifactService(db, root);
+  const config = { runtime: { maxWorkers: 1, maxArtifactBytes: 100000, piCommand: "pi", piTimeoutMs: 1000 } } as AppConfig;
+  const tasks = new TaskService(db, pi, artifacts, config, { workerRoot: root }, logger);
+  const caps = { memory: { allowedScopes: ["global_agent"] }, projects: [{ projectId: "*", access: "WRITE" as const }], qq: { readConversations: ["publish-conversation"], sendConversations: ["publish-conversation"] }, plugins: { allowedActions: [] }, artifacts: { readableArtifactAuthorities: ["agent-home"], publishTaskIds: ["*"], allowedDestinations: ["publish-conversation"] }, tasks: { canCreate: true, visibleTaskIds: [], canCancel: true, canFollowUp: true } };
+  const task = tasks.createTask({ title: "publish", goal: "publish", requester: { platform: "qq", accountId: "a", userId: "u" }, originConversationId: "publish-conversation", notificationConversationId: "publish-conversation", parentCapabilities: caps });
+  try {
+    const worker = await tasks.createWorker({ taskId: task.id, objective: "create and publish a deliverable", workspaceId: "publish-project", actor: caps });
+    await pi.sendStarted;
+    const workspace = taskTestWorkspacePath(root, "publish-conversation", "publish-project");
+    await mkdir(workspace, { recursive: true });
+    await writeFile(join(workspace, "deliverable.docx"), "verified document");
+    const published = await tasks.workerControl(worker.id).publishArtifact({ path: "deliverable.docx" });
+    pi.release();
+    for (let index = 0; index < 100 && tasks.getWorker(worker.id).status !== "COMPLETED"; index += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+    const result = db.get<{ payload_json: string }>("SELECT payload_json FROM task_events WHERE task_id=? AND type='TASK_RESULT' ORDER BY created_at DESC LIMIT 1", task.id);
+    assert.deepEqual((JSON.parse(result!.payload_json) as { artifacts: string[] }).artifacts, [published.artifactId]);
+    assert.equal(artifacts.get({ authority: "agent-home", artifactId: published.artifactId }).ownerTaskId, task.id);
+  } finally {
+    pi.release();
+    db.close();
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("authorized image Artifact is injected into Pi visual context and adjacent prose does not corrupt control frames", async () => {

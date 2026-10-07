@@ -664,6 +664,12 @@ export class RuntimeApp {
         if (action === "workspace_list") return await this.tasks.listDirectory(executionContext, path) as never;
         return await this.tasks.statPath(executionContext, path) as never;
       }
+      case "publish_artifact": {
+        if (!context.workerId) throw new Error("WORKER_CONTEXT_REQUIRED");
+        await this.resolveWorkerExecutionContext(context, action);
+        const published = await this.tasks.workerControl(context.workerId).publishArtifact({ path: requiredText(values.path, "path") });
+        return { ref: { authority: "agent-home", artifactId: published.artifactId }, filename: published.filename, size: published.size } as never;
+      }
       case "list_snowluma_actions":
         return await this.snowlumaMcp.listActions(typeof values.category === "string" ? values.category : undefined) as never;
       case "search_snowluma_actions":

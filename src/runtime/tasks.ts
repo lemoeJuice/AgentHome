@@ -451,7 +451,7 @@ export class TaskService implements ExecutionBackend {
       `Execution Principal ${worker.principalId}; workspace ${worker.workspaceId}. Use worker_exec and worker workspace tools for every file/process operation; the model process has no workspace mount.`,
       inboundFiles.length ? `Authorized inbound files (materialized in the workspace):\n${inboundFiles.join("\n")}` : "No inbound files were supplied.",
       imageInputs.length ? `${imageInputs.length} authorized image input(s) are attached to this Pi turn as visual content.` : "No visual image inputs were attached to this Pi turn.",
-      "Do not send chat messages or access credentials. Return a concise verified result.",
+      "Do not send chat messages or access credentials. Return a concise verified result. When the objective produces a file the user expects to receive (such as DOCX, PDF, image, or archive), verify it and call publish_artifact with its workspace-relative path before finishing. A file left in the workspace is not yet a sendable Artifact; Runtime includes explicitly published files in the Worker result.",
       "When a user follow-up arrives, process it as part of this Task. After processing it, call the report_progress tool with a concise verified update for Main; use it for other meaningful progress as well.",
       `Runtime control frames must be separate lines prefixed with ${WORKER_CONTROL_PREFIX.trimEnd()} and contain JSON. Supported types are progress, question, artifact, and finish.`,
       `Use ${WORKER_CONTROL_PREFIX}{"type":"progress","summary":"..."} for meaningful progress; use question with a question field; use artifact with a workspace-relative path; use finish with outcome COMPLETED, PARTIAL, or FAILED and a summary.`,
@@ -671,8 +671,11 @@ export class TaskService implements ExecutionBackend {
     let finalResult = storedResult ? parseWorkerFinishResult(storedResult) : undefined;
     if (!finalResult) {
       finalResult = result;
-      this.db.run("UPDATE worker_executions SET finish_result_json=?,updated_at=? WHERE id=? AND status IN ('STARTING','RUNNING','WAITING_USER')", JSON.stringify(finalResult), nowIso(), workerId);
     }
+    const publishedByWorker = this.db.all<{ id: string }>("SELECT id FROM artifacts WHERE owner_task_id=? AND producer_worker_id=? AND status IN ('AVAILABLE','PUBLISHED') ORDER BY created_at,id", worker.taskId, workerId).map((row) => row.id);
+    const artifactIds = this.validateWorkerArtifacts(worker.taskId, [...new Set([...(finalResult.artifacts ?? []), ...publishedByWorker])]);
+    finalResult = { ...finalResult, ...(artifactIds.length ? { artifacts: artifactIds } : {}) };
+    this.db.run("UPDATE worker_executions SET finish_result_json=?,updated_at=? WHERE id=? AND status IN ('STARTING','RUNNING','WAITING_USER')", JSON.stringify(finalResult), nowIso(), workerId);
     if (!(await this.terminatePrincipalCommands(workerId))) {
       this.recordException(worker.taskId, workerId, "principal_process_cleanup", "PROCESS_STATE_UNKNOWN", "Principal process cleanup could not be confirmed");
       return;
