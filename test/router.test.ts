@@ -28,7 +28,7 @@ class Adapter implements ChatPlatformAdapter {
   async isReplyToBot(ref: import("../src/shared/types.js").PlatformMessageRef): Promise<boolean> { return this.botMessageIds.has(ref.messageId); }
 }
 
-test("Controller ingress carries safe attachment references without remote URLs", async () => {
+test("Controller ingress contains only the summary and trusted message references", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-router-summary-"));
   const state = new GatewayState(join(root, "gateway.sqlite")); const adapter = new Adapter(); let delivered: unknown;
   const router = new Router(config, adapter, state, new CommandRegistry(), new AgentActionRegistry(), { deliver: async (event) => { delivered = event; } }, logger);
@@ -36,8 +36,8 @@ test("Controller ingress carries safe attachment references without remote URLs"
   incoming.message.attachments = [{ type: "image", id: "image-id", url: "https://platform.invalid/image" }];
   await router.handle(incoming);
   const envelope = delivered as { payload: Record<string, unknown>; message: { ref: unknown; replyTo: unknown } };
-  assert.deepEqual(envelope.payload, { text: "@bot inspect [图片]", attachments: [{ type: "image", id: "image-id" }] });
-  assert.equal(JSON.stringify(envelope).includes("image-id"), true);
+  assert.deepEqual(envelope.payload, { text: "@bot inspect [图片]" });
+  assert.equal(JSON.stringify(envelope).includes("image-id"), false);
   assert.equal(JSON.stringify(envelope).includes("platform.invalid"), false);
   assert.deepEqual(envelope.message.ref, incoming.message.ref);
   assert.equal(envelope.message.replyTo, null);

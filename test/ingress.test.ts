@@ -97,15 +97,14 @@ test("main turns are durable and serialized per conversation", async () => {
   const config = { instanceId: "main-queue", owner: { platform: "qq", accountId: "a", userId: "owner" }, paths: { gatewayState: join(root, "gateway.sqlite"), pluginData: join(root, "plugins"), backupDir: join(root, "backups"), stateRoot: root, runtimeSocket: join(root, "run.sock") }, snowluma: { accountId: "a", endpoint: "ws://127.0.0.1:1", apiEndpoint: "http://127.0.0.1:1", accessTokenEnv: "NO_TOKEN", reverseWebSocketPath: "/ws", reconnectMs: 10, requestTimeoutMs: 10 }, chat: { global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, conversationOverrides: {} }, runtime: { maxInFlight: 2, maxWorkers: 1, maxArtifactBytes: 100000, piCommand: "missing-pi", piTimeoutMs: 100 }, plugins: { enabled: [] }, logging: { level: "error" } } as AppConfig;
   const runtime = new RuntimeApp(runtimeTestConfig(config), logger);
   const prompts: string[] = [];
-  const piImages: unknown[][] = [];
   const sentTexts: string[] = [];
   let retryablePromptAttempts = 0;
   let activeTurns = 0;
   let maxActiveTurns = 0;
-  const internals = runtime as unknown as { pi: { createSession: (path: string) => Promise<{ sessionId: string; sessionPath: string }>; send: (session: { sessionId: string; sessionPath: string }, prompt: string, options?: { images?: unknown[] }) => Promise<string>; stop: () => Promise<void> }; qq: { sendMessage: (target: unknown, message: { text: string }) => Promise<unknown>; fetchAttachment: (attachment: { id?: string }) => Promise<{ filename: string; mime: string; stream: AsyncIterable<Uint8Array> }> }; mainToolContexts: Map<string, { conversationId: string; requesterId: string; requester: { platform: string; accountId: string; userId: string; principalId?: string }; capabilities: CapabilitySet }>; processMainTurnJob: (job: { kind: "TASK_EVENT"; taskId: string; eventType: string; payload: Record<string, unknown> }) => Promise<void> };
-  internals.pi = { createSession: async (path) => ({ sessionId: `main-session-${path}`, sessionPath: path }), send: async (_session, prompt, options) => { prompts.push(prompt); piImages.push(options?.images ?? []); activeTurns += 1; maxActiveTurns = Math.max(maxActiveTurns, activeTurns); await new Promise((resolve) => setTimeout(resolve, 10)); activeTurns -= 1; if (prompt.includes("retryable message") && retryablePromptAttempts++ === 0) throw new Error("fetch failed"); if (prompt.includes("tool already called")) throw new PiTurnError("fetch failed", true); return `response-${prompts.length}`; }, stop: async () => {} };
-  internals.qq = { sendMessage: async (_target, message) => { sentTexts.push(message.text); return { message: { platform: "qq", accountId: "a", platformConversationId: "owner", threadId: null, messageId: `out-${prompts.length}` }, accepted: true, echoedText: message.text }; }, fetchAttachment: async (attachment) => ({ filename: `${attachment.id}.jpg`, mime: "image/jpeg", stream: (async function* () { yield new Uint8Array([0xff, 0xd8, 0xff, 0xd9]); })() }) };
-  const event = (eventId: string, text: string, group = false, attachments: Array<{ type: string; id: string }> = []) => ({ protocolVersion: 1 as const, eventId, instanceId: "main-queue", type: "chat.message" as const, occurredAt: new Date().toISOString(), source: { platform: "qq", accountId: "a", adapter: "test" }, trustedIdentity: { userId: group ? "guest" : "owner" }, conversation: { conversationId: "external", address: { platform: "qq", accountId: "a", kind: group ? "group" as const : "private" as const, platformConversationId: group ? "group-1" : "owner", threadId: null } }, message: { ref: { platform: "qq", accountId: "a", platformConversationId: group ? "group-1" : "owner", threadId: null, messageId: eventId }, replyTo: null }, payload: { text, attachments } });
+  const internals = runtime as unknown as { pi: { createSession: (path: string) => Promise<{ sessionId: string; sessionPath: string }>; send: (session: { sessionId: string; sessionPath: string }, prompt: string) => Promise<string>; stop: () => Promise<void> }; qq: { sendMessage: (target: unknown, message: { text: string }) => Promise<unknown> }; mainToolContexts: Map<string, { conversationId: string; requesterId: string; requester: { platform: string; accountId: string; userId: string; principalId?: string }; capabilities: CapabilitySet }>; processMainTurnJob: (job: { kind: "TASK_EVENT"; taskId: string; eventType: string; payload: Record<string, unknown> }) => Promise<void> };
+  internals.pi = { createSession: async (path) => ({ sessionId: `main-session-${path}`, sessionPath: path }), send: async (_session, prompt) => { prompts.push(prompt); activeTurns += 1; maxActiveTurns = Math.max(maxActiveTurns, activeTurns); await new Promise((resolve) => setTimeout(resolve, 10)); activeTurns -= 1; if (prompt.includes("retryable message") && retryablePromptAttempts++ === 0) throw new Error("fetch failed"); if (prompt.includes("tool already called")) throw new PiTurnError("fetch failed", true); return `response-${prompts.length}`; }, stop: async () => {} };
+  internals.qq = { sendMessage: async (_target, message) => { sentTexts.push(message.text); return { message: { platform: "qq", accountId: "a", platformConversationId: "owner", threadId: null, messageId: `out-${prompts.length}` }, accepted: true, echoedText: message.text }; } };
+  const event = (eventId: string, text: string, group = false) => ({ protocolVersion: 1 as const, eventId, instanceId: "main-queue", type: "chat.message" as const, occurredAt: new Date().toISOString(), source: { platform: "qq", accountId: "a", adapter: "test" }, trustedIdentity: { userId: group ? "guest" : "owner" }, conversation: { conversationId: "external", address: { platform: "qq", accountId: "a", kind: group ? "group" as const : "private" as const, platformConversationId: group ? "group-1" : "owner", threadId: null } }, message: { ref: { platform: "qq", accountId: "a", platformConversationId: group ? "group-1" : "owner", threadId: null, messageId: eventId }, replyTo: null }, payload: { text } });
   try {
     await runtime.start();
     await runtime.receive(event("main-1", "first message"));
@@ -116,6 +115,7 @@ test("main turns are durable and serialized per conversation", async () => {
     assert.equal(prompts.filter((prompt) => prompt.includes("second message")).length, 1);
     assert.ok(prompts.findIndex((prompt) => prompt.includes("first message")) < prompts.findIndex((prompt) => prompt.includes("second message")));
     assert.match(prompts[0] ?? "", /The trigger summary is the user-message content for this turn/);
+    assert.match(prompts[0] ?? "", /call get_current_message.*get_attachment/);
     assert.doesNotMatch(prompts[0] ?? "", /Always call get_current_message/);
     assert.match(prompts[0] ?? "", /currentMessageId/);
     assert.ok(maxActiveTurns >= 2);
@@ -133,13 +133,6 @@ test("main turns are durable and serialized per conversation", async () => {
     assert.match(prompts.at(-1) ?? "", new RegExp(task.id.slice(-8)));
     assert.ok((prompts.at(-1) ?? "").includes(JSON.stringify(output.ref)));
     assert.match(prompts.at(-1) ?? "", /send_artifact/);
-    await runtime.receive(event("main-image", "请看看这张图片", false, [{ type: "image", id: "image-upload" }]));
-    for (let index = 0; index < 100 && runtime.db.get<{ status: string }>("SELECT status FROM main_turn_queue WHERE job_json LIKE '%main-image%'")?.status !== "DONE"; index += 1) await new Promise((resolve) => setTimeout(resolve, 5));
-    const inboundArtifact = runtime.db.get<{ id: string }>("SELECT id FROM artifacts WHERE source_event_id='main-image'");
-    assert.ok(inboundArtifact);
-    assert.ok((prompts.at(-1) ?? "").includes(JSON.stringify({ authority: "agent-home", artifactId: inboundArtifact.id })));
-    assert.match(prompts.at(-1) ?? "", /1 authorized image input\(s\) are attached/);
-    assert.deepEqual(piImages.at(-1), [{ type: "image", data: Buffer.from([0xff, 0xd8, 0xff, 0xd9]).toString("base64"), mimeType: "image/jpeg" }]);
     await runtime.receive(event("main-retry", "retryable message"));
     for (let index = 0; index < 500 && runtime.db.get<{ status: string }>("SELECT status FROM main_turn_queue WHERE job_json LIKE '%retryable message%' ORDER BY created_at DESC LIMIT 1")?.status !== "DONE"; index += 1) await new Promise((resolve) => setTimeout(resolve, 5));
     const retried = runtime.db.get<{ status: string; attempts: number }>("SELECT status,attempts FROM main_turn_queue WHERE job_json LIKE '%retryable message%' ORDER BY created_at DESC LIMIT 1");
@@ -192,7 +185,11 @@ test("Main uses native SnowLuma actions and on-demand stream downloads become Ar
   const internals = runtime as unknown as {
     getOrCreateConversation: (value: ConversationAddress) => { id: string; address: ConversationAddress };
     handleMainTool: (action: string, input: unknown, context: unknown) => Promise<unknown>;
-    qq: { readNativeStreamDownload: (value: unknown) => Promise<{ filename: string; mime?: string; size?: number; stream: AsyncIterable<Uint8Array> }> };
+    qq: {
+      readNativeStreamDownload: (value: unknown) => Promise<{ filename: string; mime?: string; size?: number; stream: AsyncIterable<Uint8Array> }>;
+      getMessage: (ref: PlatformMessageRef, kind: string, authorization: unknown) => Promise<unknown>;
+      fetchAttachment: (attachment: { id?: string }, authorization: unknown) => Promise<{ filename: string; mime?: string; size?: number; stream: AsyncIterable<Uint8Array> }>;
+    };
     snowlumaMcp: {
       listActions: (category?: string) => Promise<unknown>;
       searchActions: (query: string) => Promise<unknown>;
@@ -205,8 +202,22 @@ test("Main uses native SnowLuma actions and on-demand stream downloads become Ar
   const conversation = internals.getOrCreateConversation(address);
   internals.getOrCreateConversation(otherAddress);
   const imageBytes = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+  const currentAttachment = { type: "image" as const, id: "current-image", filename: "current.jpg", mime: "image/jpeg" };
+  let fetchedAttachmentCount = 0;
   internals.qq = {
     readNativeStreamDownload: async () => ({ filename: "image.jpg", size: imageBytes.byteLength, stream: (async function* () { yield imageBytes; })() }),
+    getMessage: async (messageRef, kind, authorization) => {
+      assert.deepEqual(messageRef, ref);
+      assert.equal(kind, "group");
+      assert.ok(authorization);
+      return { message: { ref, text: "please inspect", attachments: [currentAttachment] } };
+    },
+    fetchAttachment: async (attachment, authorization) => {
+      assert.deepEqual(attachment, currentAttachment);
+      assert.ok(authorization);
+      fetchedAttachmentCount += 1;
+      return { filename: currentAttachment.filename, mime: currentAttachment.mime, size: imageBytes.byteLength, stream: (async function* () { yield imageBytes; })() };
+    },
   };
   const snowlumaCalls: Array<{ tool: string; action?: string; params?: Record<string, unknown> }> = [];
   internals.snowlumaMcp = {
@@ -241,7 +252,20 @@ test("Main uses native SnowLuma actions and on-demand stream downloads become Ar
     await assert.rejects(() => internals.handleMainTool("invoke_snowluma_action", { action: "send_private_msg", params: { user_id: 1234 } }, { ...context, requesterId: "ordinary", requester: { platform: "qq", accountId: "a", userId: "ordinary", principalId: "principal:ordinary" }, capabilities: ordinaryCaps }), /SYSTEM_ADMIN_REQUIRED/);
     assert.equal(snowlumaCalls.filter((call) => call.tool === "invoke_action").length, 2);
     assert.equal(runtime.db.get<{ count: number }>("SELECT count(*) AS count FROM authorization_audit_events WHERE operation='snowluma.invoke_action' AND decision='DENY'")?.count, 2);
-    await assert.rejects(() => internals.handleMainTool("get_current_message", {}, context), /TOOL_NOT_FOUND/);
+    assert.deepEqual(await internals.handleMainTool("get_current_message", {}, context), {
+      ref,
+      text: "please inspect",
+      attachments: [{ type: "image", id: "current-image", filename: "current.jpg", mime: "image/jpeg" }],
+      trust: "untrusted-platform-content",
+    });
+    await assert.rejects(() => internals.handleMainTool("get_attachment", { attachmentId: "foreign-image" }, context), /ATTACHMENT_NOT_IN_CURRENT_MESSAGE/);
+    const currentImage = await internals.handleMainTool("get_attachment", { attachmentId: "current-image" }, context) as { ref: { authority: string; artifactId: string }; imageInput: { data: string; mimeType: string } };
+    assert.equal(currentImage.ref.authority, "agent-home");
+    assert.equal(currentImage.imageInput.data, imageBytes.toString("base64"));
+    assert.equal(currentImage.imageInput.mimeType, "image/jpeg");
+    assert.equal(fetchedAttachmentCount, 1);
+    const ordinaryContext = { ...context, requesterId: "ordinary", requester: { platform: "qq", accountId: "a", userId: "ordinary", principalId: "principal:ordinary" }, capabilities: deriveCapabilities({ platform: "qq", accountId: "a", userId: "ordinary", principalId: "principal:ordinary", conversationId: conversation.id }, address, conversation.id) };
+    assert.equal((await internals.handleMainTool("get_current_message", {}, ordinaryContext) as { text: string }).text, "please inspect");
     await assert.rejects(() => internals.handleMainTool("read_artifact", { ref: artifact.ref }, { ...context, conversationId: "other-conversation" }), /ARTIFACT_CONVERSATION_READ_DENIED/);
     assert.ok(snowlumaCalls.some((call) => call.tool === "invoke_action" && call.action === "download_file_image_stream"));
   } finally {
