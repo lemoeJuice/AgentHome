@@ -1,5 +1,6 @@
 node_modules/
 dist/
+/plugins/
 /config.json
 .agent-home/
 AGENT.md

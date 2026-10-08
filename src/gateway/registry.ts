@@ -4,9 +4,8 @@ export interface CommandContext {
   invocationId: string;
   requester: { platform: string; accountId: string; userId: string; principalId?: string };
   conversation: { conversationId: string; kind: "private" | "group"; platformConversationId: string; threadId: JsonValue };
-  message: { messageId: string; replyTo: JsonValue };
-  args: string[];
-  rawArgs: string;
+  message: { messageId: string; replyTo: JsonValue; text: string };
+  signal: AbortSignal;
   pluginState: PluginStateHandle;
 }
 
@@ -25,6 +24,8 @@ export interface PluginStateHandle {
 export interface PluginContext {
   readonly pluginId: string;
   readonly state: PluginStateHandle;
+  readonly signal: AbortSignal;
+  onDispose(cleanup: () => void | Promise<void>): void;
   registerCommand(definition: CommandDefinition, handler: CommandHandler): void;
   registerAgentAction(definition: AgentActionDefinition, handler: AgentActionHandler): void;
 }
@@ -39,6 +40,8 @@ export interface CommandDefinition {
 
 export type CommandHandler = (context: CommandContext) => Promise<CommandResult>;
 
+export interface PluginLifecycleHandle { stop(): Promise<void> }
+
 export interface AgentActionDefinition {
   name: string;
   description: string;
@@ -51,6 +54,7 @@ export interface AgentActionContext {
   invocationId: string;
   caller: "MAIN" | "WORKER";
   requesterId: string;
+  signal?: AbortSignal;
   taskId?: string;
   workerId?: string;
 }
@@ -59,6 +63,7 @@ export type AgentActionHandler = (input: JsonValue, context: AgentActionContext)
 
 export class CommandRegistry {
   private readonly commands = new Map<string, { definition: CommandDefinition; handler: CommandHandler; pluginState?: PluginStateHandle }>();
+  private readonly pluginLifecycles = new Set<PluginLifecycleHandle>();
 
   register(definition: CommandDefinition, handler: CommandHandler, pluginState?: PluginStateHandle): void {
     const names = [definition.name, ...(definition.aliases ?? [])];
@@ -66,6 +71,24 @@ export class CommandRegistry {
       if (this.commands.has(name)) throw new Error(`COMMAND_COLLISION:${name}`);
       this.commands.set(name, { definition, handler, ...(pluginState ? { pluginState } : {}) });
     }
+  }
+
+  assertCanMerge(other: CommandRegistry): void {
+    for (const name of other.commands.keys()) if (this.commands.has(name)) throw new Error(`COMMAND_COLLISION:${name}`);
+  }
+
+  merge(other: CommandRegistry): void {
+    this.assertCanMerge(other);
+    for (const [name, route] of other.commands) this.commands.set(name, route);
+    for (const lifecycle of other.pluginLifecycles) this.pluginLifecycles.add(lifecycle);
+  }
+
+  registerPluginLifecycle(lifecycle: PluginLifecycleHandle): void { this.pluginLifecycles.add(lifecycle); }
+  async stopPlugins(): Promise<void> { await Promise.allSettled([...this.pluginLifecycles].map((lifecycle) => lifecycle.stop())); }
+  async removePlugins(): Promise<void> {
+    await this.stopPlugins();
+    for (const [name, route] of this.commands) if (route.definition.kind === "PLUGIN") this.commands.delete(name);
+    this.pluginLifecycles.clear();
   }
 
   resolve(name: string): { definition: CommandDefinition; handler: CommandHandler; pluginState?: PluginStateHandle } | undefined { return this.commands.get(name); }
@@ -80,6 +103,16 @@ export class AgentActionRegistry {
     this.actions.set(definition.name, { definition, handler });
   }
 
+  assertCanMerge(other: AgentActionRegistry): void {
+    for (const name of other.actions.keys()) if (this.actions.has(name)) throw new Error(`ACTION_COLLISION:${name}`);
+  }
+
+  merge(other: AgentActionRegistry): void {
+    this.assertCanMerge(other);
+    for (const [name, action] of other.actions) this.actions.set(name, action);
+  }
+
   list(): AgentActionDefinition[] { return [...this.actions.values()].map((item) => item.definition); }
+  removePlugins(): void { this.actions.clear(); }
   get(name: string): { definition: AgentActionDefinition; handler: AgentActionHandler } | undefined { return this.actions.get(name); }
 }

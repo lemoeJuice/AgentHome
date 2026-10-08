@@ -1,4 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
+import { chmod, mkdir, unlink } from "node:fs/promises";
+import { dirname } from "node:path";
+import { createServer, type Server, type Socket } from "node:net";
 import type { AppConfig } from "../config.js";
 import { Logger } from "../shared/logger.js";
 import { QQChatPlatformAdapter } from "../qq/adapter.js";
@@ -22,10 +25,14 @@ export class GatewayApp {
   private readonly artifacts: GatewayArtifactService;
   private readonly log: Logger;
   private artifactMaintenance: NodeJS.Timeout | undefined;
+  private controlServer: Server | undefined;
+  private readonly controlSocketPath: string;
+  private reloadInProgress: Promise<{ loaded: string[]; failed: Array<{ pluginId: string; error: string }> }> | undefined;
 
   private readonly config: AppConfig;
   constructor(config: AppConfig, logger: Logger) {
     this.config = config;
+    this.controlSocketPath = `${config.paths.gatewayState}.control.sock`;
     this.log = logger.child("gateway");
     this.state = new GatewayState(config.paths.gatewayState);
     this.adapter = new QQChatPlatformAdapter(config, this.log);
@@ -49,6 +56,7 @@ export class GatewayApp {
     // Agent Home container starts, so Gateway MCP must be listening first.
     await this.mcp.start();
     await this.controller.start();
+    await this.startControlSocket();
     this.artifactMaintenance = setInterval(() => { void Promise.all([this.artifacts.cleanupExpired(), Promise.resolve(this.state.cleanupOperationalState())]).catch((error) => this.log.warn("Gateway maintenance failed", { error: String(error) })); }, 60_000).unref();
     await this.router.replayPendingOutbound();
     await this.adapter.start((event) => this.router.handle(event));
@@ -56,7 +64,60 @@ export class GatewayApp {
   }
 
   async stop(): Promise<void> {
-    await this.adapter.stop(); await this.mcp.stop(); if (this.artifactMaintenance) clearInterval(this.artifactMaintenance); await this.artifacts.stop(); await this.controller.stop(); this.state.close();
+    await new Promise<void>((resolve) => this.controlServer?.close(() => resolve()) ?? resolve());
+    try { await unlink(this.controlSocketPath); } catch { /* already absent */ }
+    await this.adapter.stop();
+    await this.commands.stopPlugins();
+    await this.mcp.stop();
+    if (this.artifactMaintenance) clearInterval(this.artifactMaintenance);
+    await this.artifacts.stop(); await this.controller.stop(); this.state.close();
+  }
+
+  private async reloadPlugins(): Promise<{ loaded: string[]; failed: Array<{ pluginId: string; error: string }> }> {
+    if (this.reloadInProgress) return this.reloadInProgress;
+    this.reloadInProgress = (async () => {
+      await this.commands.removePlugins();
+      this.actions.removePlugins();
+      const report = await loadPlugins(this.config, this.commands, this.actions, this.log);
+      return { loaded: report.loaded, failed: report.failed.map(({ pluginId, error }) => ({ pluginId, error })) };
+    })();
+    try { return await this.reloadInProgress; } finally { this.reloadInProgress = undefined; }
+  }
+
+  private async startControlSocket(): Promise<void> {
+    await mkdir(dirname(this.controlSocketPath), { recursive: true });
+    try { await unlink(this.controlSocketPath); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    this.controlServer = createServer((socket) => this.handleControlSocket(socket));
+    await new Promise<void>((resolve, reject) => {
+      this.controlServer?.once("error", reject);
+      this.controlServer?.listen(this.controlSocketPath, resolve);
+    });
+    await chmod(this.controlSocketPath, 0o600);
+    this.log.info("Gateway control socket ready", { socket: this.controlSocketPath });
+  }
+
+  private handleControlSocket(socket: Socket): void {
+    socket.setEncoding("utf8");
+    let buffer = "";
+    let handled = false;
+    socket.on("data", (chunk) => {
+      if (handled) return;
+      buffer += chunk;
+      if (buffer.length > 16_384) { socket.end(`${JSON.stringify({ status: "failed", error: "REQUEST_TOO_LARGE" })}\n`); return; }
+      const index = buffer.indexOf("\n");
+      if (index < 0) return;
+      const request = buffer.slice(0, index);
+      buffer = "";
+      handled = true;
+      void (async () => {
+        try {
+          const value = JSON.parse(request) as { type?: unknown };
+          if (value.type !== "reload_plugins") { socket.end(`${JSON.stringify({ status: "failed", error: "UNKNOWN_CONTROL_REQUEST" })}\n`); return; }
+          const result = await this.reloadPlugins();
+          socket.end(`${JSON.stringify({ status: "ready", ...result })}\n`);
+        } catch (error) { socket.end(`${JSON.stringify({ status: "failed", error: String(error) })}\n`); }
+      })();
+    });
   }
 
   private get router(): Router {

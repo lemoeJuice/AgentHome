@@ -80,7 +80,7 @@
     "commandTimeoutMs": 600000,
     "cpuSeconds": 600,
     "memoryBytes": 17179869184,
-    "pids": 128,
+    "pids": 512,
     "maxFileBytes": 536870912,
     "workspaceQuotaBytes": 2147483648,
     "cacheQuotaBytes": 1073741824,

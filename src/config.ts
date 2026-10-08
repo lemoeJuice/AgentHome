@@ -81,7 +81,7 @@ const defaults: AppConfig = {
   },
   agent: { persona: "" },
   runtime: { maxInFlight: 16, maxWorkers: 2, maxWorkersTotal: 8, maxWorkersPerProject: 2, maxWorkersPerRequester: 4, maxTasks: 32, maxTasksPerRequester: 8, maxTasksPerPrincipal: 8, maxArtifactBytes: 50 * 1024 * 1024, piCommand: "pi", piTimeoutMs: 60 * 60 * 1000, workerSandboxCommand: "bwrap", piAgentDir: "/state/model/pi/agent" },
-  principalExecution: { maxWorkersPerPrincipal: 1, taskTimeoutMs: 30 * 60 * 1000, commandTimeoutMs: 10 * 60 * 1000, cpuSeconds: 600, memoryBytes: 16 * 1024 * 1024 * 1024, pids: 128, maxFileBytes: 512 * 1024 * 1024, workspaceQuotaBytes: 2 * 1024 * 1024 * 1024, cacheQuotaBytes: 1024 * 1024 * 1024, artifactQuotaBytes: 512 * 1024 * 1024 },
+  principalExecution: { maxWorkersPerPrincipal: 1, taskTimeoutMs: 30 * 60 * 1000, commandTimeoutMs: 10 * 60 * 1000, cpuSeconds: 600, memoryBytes: 16 * 1024 * 1024 * 1024, pids: 512, maxFileBytes: 512 * 1024 * 1024, workspaceQuotaBytes: 2 * 1024 * 1024 * 1024, cacheQuotaBytes: 1024 * 1024 * 1024, artifactQuotaBytes: 512 * 1024 * 1024 },
   memory: { rawEpisodeDays: 30, keepExplicitForever: true, keepProvenanceForActiveFacts: true, maxPromptBytes: 24 * 1024 },
   plugins: { enabled: [], allowedActions: [], allowedPermissions: [] },
   logging: { level: "info" },

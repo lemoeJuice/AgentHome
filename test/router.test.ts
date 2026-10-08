@@ -49,11 +49,26 @@ function event(text: string, kind: "private" | "group" = "private", mentionsBot:
   return { platform: "qq", accountId, sender: { platform: "qq", accountId, userId: "u" }, conversation, message: { ref: { ...conversation, messageId: `in-${Date.now()}-${Math.random()}` }, text, replyTo: null, mentionsBot, attachments: [] }, timestamp: new Date().toISOString() };
 }
 
+test("unregistered slash command is silently ignored", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-home-router-unknown-command-"));
+  const state = new GatewayState(join(root, "gateway.sqlite"));
+  const adapter = new Adapter();
+  const controllerEvents: unknown[] = [];
+  const router = new Router(config, adapter, state, new CommandRegistry(), new AgentActionRegistry(), { deliver: async (incoming) => { controllerEvents.push(incoming); } }, logger);
+
+  await router.handle(event("/not-registered some arguments"));
+
+  assert.equal(adapter.sent.length, 0);
+  assert.equal(controllerEvents.length, 0);
+  assert.equal(state.store.get<{ count: number }>("SELECT count(*) AS count FROM command_invocations")?.count, 0);
+  state.close(); await rm(root, { recursive: true, force: true });
+});
+
 test("direct plugin command bypasses Controller and Main", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-router-"));
   const state = new GatewayState(join(root, "gateway.sqlite"));
   const adapter = new Adapter(); const controllerEvents: unknown[] = [];
-  const commands = new CommandRegistry(); commands.register({ name: "echo", permission: "command.echo", kind: "PLUGIN" }, async (ctx) => ({ text: ctx.args.join(" "), context: { type: "echo", summary: "ok" } }));
+  const commands = new CommandRegistry(); commands.register({ name: "echo", permission: "command.echo", kind: "PLUGIN" }, async (ctx) => ({ text: ctx.message.text.replace(/^\/echo\s*/, ""), context: { type: "echo", summary: "ok" } }));
   const router = new Router(config, adapter, state, commands, new AgentActionRegistry(), { deliver: async (event) => { controllerEvents.push(event); } }, logger);
   await router.handle(event("/echo hello"));
   assert.equal(adapter.sent[0]?.text, "hello"); assert.equal(controllerEvents.length, 0);
@@ -175,7 +190,7 @@ test("wake policy namespaces the same conversation ID by account", async () => {
 test("direct command outbound intent replays after delivery failure", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-home-router-replay-"));
   const state = new GatewayState(join(root, "gateway.sqlite")); const adapter = new Adapter(); adapter.fail = true;
-  const commands = new CommandRegistry(); commands.register({ name: "echo", permission: "command.echo", kind: "PLUGIN" }, async (ctx) => ({ text: ctx.args.join(" ") }));
+  const commands = new CommandRegistry(); commands.register({ name: "echo", permission: "command.echo", kind: "PLUGIN" }, async (ctx) => ({ text: ctx.message.text.replace(/^\/echo\s*/, "") }));
   const router = new Router(config, adapter, state, commands, new AgentActionRegistry(), { deliver: async () => {} }, logger);
   await router.handle(event("/echo retry"));
   assert.equal(state.store.get<{ status: string }>("SELECT status FROM command_invocations LIMIT 1")?.status, "COMPLETED");

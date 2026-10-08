@@ -54,7 +54,7 @@ export class Router {
     const command = this.parseCommand(text, event.message.mentionsBot === true);
     if (command) {
       if (!this.commandWakes(event)) return;
-      await this.handleCommand(event, conversationId, command.name, command.args);
+      await this.handleCommand(event, conversationId, command.name, command.text);
       return;
     }
     if (event.conversation.kind === "group" && !(await this.naturalWakes(event))) return;
@@ -66,20 +66,18 @@ export class Router {
     for (const intent of intents) await this.deliverIntent(intent.id);
   }
 
-  private async handleCommand(event: ChatEvent, conversationId: string, name: string, args: string[]): Promise<void> {
+  private async handleCommand(event: ChatEvent, conversationId: string, name: string, commandText: string): Promise<void> {
     if (name === "help") {
       await this.sendHelp(event);
       return;
     }
     if (coreCommands.has(name)) {
+      const args = commandText.replace(/^\/\S+\s*/, "").trim().split(/\s+/).filter(Boolean);
       await this.controller.deliver(this.toEnvelope(event, conversationId, { type: "control_command", command: name, args }));
       return;
     }
     const route = this.commands.resolve(name);
-    if (!route) {
-      await this.adapter.sendMessage(event.conversation, { text: `未知命令 /${name}。发送 /help 查看可用命令。`, replyTo: event.message.ref });
-      return;
-    }
+    if (!route) return;
     if (!commandAllowed(route.definition.permission, event, configuredSystemAdmins(this.config))) {
       this.audit("command.execute", "DENY", "COMMAND_PERMISSION_DENIED", name, event.sender.userId, conversationId);
       await this.adapter.sendMessage(event.conversation, { text: "当前身份没有执行此命令的权限。", replyTo: event.message.ref });
@@ -97,17 +95,11 @@ export class Router {
         invocationId,
         requester: event.sender,
         conversation: { conversationId, kind: event.conversation.kind, platformConversationId: event.conversation.platformConversationId, threadId: event.conversation.threadId as JsonValue },
-        message: { messageId: event.message.ref.messageId, replyTo: (event.message.replyTo ?? null) as JsonValue },
-        args,
-        rawArgs: args.join(" "),
+        message: { messageId: event.message.ref.messageId, replyTo: (event.message.replyTo ?? null) as JsonValue, text: event.message.text ?? "" },
+        signal: new AbortController().signal,
         pluginState: route.pluginState ?? { root: "", readJson: async () => null, writeJson: async () => undefined },
       };
-      let timeout: NodeJS.Timeout | undefined;
-      try {
-        result = await Promise.race([route.handler(context), new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error("PLUGIN_TIMEOUT")), 30000); })]);
-      } finally {
-        if (timeout) clearTimeout(timeout);
-      }
+      result = await route.handler(context);
        result = await this.admitArtifacts(result, route.pluginState?.root ?? "", event, conversationId, invocationId, pluginId);
       this.state.store.transaction(() => {
         this.state.store.run("UPDATE command_invocations SET status='COMPLETED',result_json=?,context_summary=?,updated_at=? WHERE id=?", JSON.stringify(result), result.context?.summary ?? null, nowIso(), invocationId);
@@ -223,12 +215,12 @@ export class Router {
     return { ...base, ...accountOverride, ...override };
   }
 
-  private parseCommand(text: string, mentionsBot: boolean): { name: string; args: string[] } | null {
+  private parseCommand(text: string, mentionsBot: boolean): { name: string; text: string } | null {
     const commandText = mentionsBot ? text.trim().replace(/^@\S+\s+(?=\/)/, "") : text.trim();
     if (!commandText.startsWith("/")) return null;
-    const parts = commandText.slice(1).trim().split(/\s+/).filter(Boolean);
-    if (!parts[0]) return null;
-    return { name: parts[0].toLowerCase(), args: parts.slice(1) };
+    const match = /^\/([^\s]+)(?:\s|$)/.exec(commandText);
+    if (!match?.[1]) return null;
+    return { name: match[1].toLowerCase(), text: commandText };
   }
 
   private lookupBinding(ref: PlatformMessageRef): { invocationId: string; command: string; pluginId: string; contextSummary: string; resultRef?: string } | undefined {

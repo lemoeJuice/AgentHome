@@ -17,7 +17,8 @@ Recommended reading order:
 8. `AGENT_HOME_CONTAINER_CONTROL_DESIGN.md`
 9. `MAIN_WORKER_ORCHESTRATION_DESIGN.md`
 10. `EXTERNAL_PLUGIN_COMMAND_DESIGN.md`
-11. `ARTIFACT_FILE_DESIGN.md`
+11. `PLUGIN_DEVELOPMENT.md`
+12. `ARTIFACT_FILE_DESIGN.md`
 
 `PRINCIPAL_WORKSPACE_SYSTEM_ADMIN_DESIGN.md` and `UID_GID_MEMORY_DESIGN.md`
 are the current identity/workspace/memory baselines. The database and runtime

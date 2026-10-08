@@ -53,7 +53,8 @@ export function createPiModelCommand(config: AppConfig, logger: Logger, runner?:
   }
 
   return async (context: CommandContext): Promise<CommandResult> => {
-    const [subcommand, providerArg, ...modelParts] = context.args;
+    const args = context.message.text.trim().replace(/^@\S+\s+(?=\/)/, "").replace(/^\/\S+\s*/, "").trim().split(/\s+/).filter(Boolean);
+    const [subcommand, providerArg, ...modelParts] = args;
     try {
       if (!subcommand || subcommand === "status") {
         const selection = await readSelection();

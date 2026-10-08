@@ -14,7 +14,7 @@ const modelList = [
 ].join("\n");
 
 function context(args: string[], kind: "private" | "group" = "private"): CommandContext {
-  return { invocationId: "cmd-test", requester: { platform: "qq", accountId: "default", userId: "owner" }, conversation: { conversationId: "conv", kind, platformConversationId: "user", threadId: null }, message: { messageId: "m1", replyTo: null }, args, rawArgs: args.join(" "), pluginState: { root: "", readJson: async () => null, writeJson: async () => undefined } };
+  return { invocationId: "cmd-test", requester: { platform: "qq", accountId: "default", userId: "owner" }, conversation: { conversationId: "conv", kind, platformConversationId: "user", threadId: null }, message: { messageId: "m1", replyTo: null, text: `/model ${args.join(" ")}` }, pluginState: { root: "", readJson: async () => null, writeJson: async () => undefined } };
 }
 
 test("Pi model command reads Pi's current settings and CLI model catalog", async () => {

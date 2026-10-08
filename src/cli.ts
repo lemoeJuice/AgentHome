@@ -14,6 +14,8 @@ import { spawn } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 import { resolveWebSocketEndpoint } from "./qq/onebot.js";
 import { createProxyRelay } from "./proxy-relay.js";
+import { createConnection } from "node:net";
+import { createInterface } from "node:readline";
 
 async function main(): Promise<void> {
   const command = process.argv[2] ?? "help";
@@ -26,7 +28,7 @@ async function main(): Promise<void> {
     await waitForSignal(() => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())));
     return;
   }
-  if (command === "help") { process.stdout.write("agent-home gateway|runtime|control stream|control ping|control backup-prepare|control backup-finish|control set-pi-model <provider> <model>|control set-pi-thinking-level <level>|bootstrap|doctor|status\n"); return; }
+  if (command === "help") { process.stdout.write("agent-home gateway|runtime|control stream|control ping|control reload-plugins|control backup-prepare|control backup-finish|control set-pi-model <provider> <model>|control set-pi-thinking-level <level>|bootstrap|doctor|status\n"); return; }
   let config: Awaited<ReturnType<typeof loadConfig>>;
   try { config = await loadConfig(); } catch (error) {
     if (command === "doctor" || command === "status") { await doctorUnavailable(String(error)); return; }
@@ -38,6 +40,7 @@ async function main(): Promise<void> {
     const subcommand = process.argv[3] ?? "stream";
     if (subcommand === "stream") await runControlStream(config.paths.runtimeSocket);
     else if (subcommand === "ping") await runControlPing(config.paths.runtimeSocket);
+    else if (subcommand === "reload-plugins") await runGatewayControlRequest(`${config.paths.gatewayState}.control.sock`, { type: "reload_plugins" });
     else if (subcommand === "backup-prepare") await runControlRequest(config.paths.runtimeSocket, { type: "backup_prepare" });
     else if (subcommand === "backup-finish") await runControlRequest(config.paths.runtimeSocket, { type: "backup_finish" });
     else if (subcommand === "set-pi-model") {
@@ -59,6 +62,24 @@ async function main(): Promise<void> {
   throw new Error(`UNKNOWN_COMMAND:${command}`);
 }
 
+async function runGatewayControlRequest(socketPath: string, request: Record<string, unknown>): Promise<void> {
+  const socket = createConnection(socketPath);
+  const lines = createInterface({ input: socket });
+  await new Promise<void>((resolve, reject) => {
+    socket.once("connect", () => socket.write(`${JSON.stringify(request)}\n`));
+    lines.once("line", (line) => {
+      socket.end();
+      try {
+        const response = JSON.parse(line) as { status?: string; [key: string]: unknown };
+        process.stdout.write(`${JSON.stringify(response)}\n`);
+        if (response.status !== "ready") reject(new Error("GATEWAY_CONTROL_REQUEST_FAILED"));
+        else resolve();
+      } catch (error) { reject(error); }
+    });
+    socket.once("error", reject);
+  });
+}
+
 async function doctorUnavailable(configurationError: string): Promise<void> {
   const checks: Record<string, { status: string; detail?: string }> = { config: { status: "missing_configuration", detail: configurationError } };
   try { const { execFileSync } = await import("node:child_process"); checks.podman = { status: "healthy", detail: execFileSync(process.env.PODMAN_COMMAND ?? "podman", ["--version"], { encoding: "utf8" }).trim() }; } catch (error) { checks.podman = { status: "missing_dependency", detail: String(error) }; }
@@ -76,8 +97,11 @@ async function doctor(config: Awaited<ReturnType<typeof loadConfig>>, logger: Lo
     const gatewayState = new GatewayState(config.paths.gatewayState);
     checks.gatewayState = { status: "healthy", detail: `schema ${String(gatewayState.store.get<{ version: number }>("SELECT max(version) AS version FROM schema_migrations")?.version ?? 0)}` };
     const commands = new CommandRegistry(); const actions = new AgentActionRegistry();
-    await loadPlugins(config, commands, actions, logger);
-    checks.plugins = { status: "healthy", detail: `${commands.list().length} commands, ${actions.list().length} actions` };
+    const pluginReport = await loadPlugins(config, commands, actions, logger);
+    checks.plugins = {
+      status: pluginReport.failed.length ? "degraded" : "healthy",
+      detail: `${pluginReport.loaded.length} loaded, ${pluginReport.failed.length} failed; ${commands.list().length} commands, ${actions.list().length} actions${pluginReport.failed.length ? `; failed: ${pluginReport.failed.map((plugin) => plugin.pluginId).join(", ")}` : ""}`,
+    };
     const controller = new PodmanController(config, gatewayState, logger);
     const status = await controller.health();
     containerRunning = status.container;
@@ -150,7 +174,7 @@ async function loadConfigForState(): Promise<Awaited<ReturnType<typeof loadConfi
     try {
       const value = JSON.parse(await readFile(bootstrap, "utf8")) as Partial<Awaited<ReturnType<typeof loadConfig>>>;
       await mkdir(dirname(bootstrap), { recursive: true });
-        return { ...(value as Awaited<ReturnType<typeof loadConfig>>), paths: { gatewayState: "./.agent-home/runtime-state/gateway.sqlite", pluginData: "./.agent-home/runtime-state/plugin-data", backupDir: "./backups", stateRoot, runtimeSocket: "/run/agent-home/control.sock" }, snowluma: { ...(value.snowluma as Awaited<ReturnType<typeof loadConfig>>["snowluma"]), accountId: "default", reverseWebSocketPath: (value.snowluma as Awaited<ReturnType<typeof loadConfig>>["snowluma"]).reverseWebSocketPath ?? "/onebot/v11/ws", reconnectMs: 2000, requestTimeoutMs: 15000 }, chat: { global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, conversationOverrides: {} }, agent: { persona: typeof value.agent?.persona === "string" ? value.agent.persona : "" }, runtime: { maxInFlight: 16, maxWorkers: 2, maxWorkersTotal: 8, maxWorkersPerProject: 2, maxWorkersPerRequester: 4, maxTasks: 32, maxTasksPerRequester: 8, maxTasksPerPrincipal: 8, maxArtifactBytes: 52428800, piCommand: process.env.PI_COMMAND ?? "pi", piTimeoutMs: 3600000, workerSandboxCommand: process.env.AGENT_HOME_WORKER_SANDBOX ?? "bwrap", piAgentDir: `${stateRoot}/model/pi/agent` }, principalExecution: { maxWorkersPerPrincipal: 1, taskTimeoutMs: 1800000, commandTimeoutMs: 600000, cpuSeconds: 600, memoryBytes: 17179869184, pids: 128, maxFileBytes: 536870912, workspaceQuotaBytes: 2147483648, cacheQuotaBytes: 1073741824, artifactQuotaBytes: 536870912 }, plugins: { enabled: [] }, logging: { level: "info" } };
+        return { ...(value as Awaited<ReturnType<typeof loadConfig>>), paths: { gatewayState: "./.agent-home/runtime-state/gateway.sqlite", pluginData: "./.agent-home/runtime-state/plugin-data", backupDir: "./backups", stateRoot, runtimeSocket: "/run/agent-home/control.sock" }, snowluma: { ...(value.snowluma as Awaited<ReturnType<typeof loadConfig>>["snowluma"]), accountId: "default", reverseWebSocketPath: (value.snowluma as Awaited<ReturnType<typeof loadConfig>>["snowluma"]).reverseWebSocketPath ?? "/onebot/v11/ws", reconnectMs: 2000, requestTimeoutMs: 15000 }, chat: { global: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, qq: { commandRequireMention: false, naturalLanguageMode: "explicit_wake" }, conversationOverrides: {} }, agent: { persona: typeof value.agent?.persona === "string" ? value.agent.persona : "" }, runtime: { maxInFlight: 16, maxWorkers: 2, maxWorkersTotal: 8, maxWorkersPerProject: 2, maxWorkersPerRequester: 4, maxTasks: 32, maxTasksPerRequester: 8, maxTasksPerPrincipal: 8, maxArtifactBytes: 52428800, piCommand: process.env.PI_COMMAND ?? "pi", piTimeoutMs: 3600000, workerSandboxCommand: process.env.AGENT_HOME_WORKER_SANDBOX ?? "bwrap", piAgentDir: `${stateRoot}/model/pi/agent` }, principalExecution: { maxWorkersPerPrincipal: 1, taskTimeoutMs: 1800000, commandTimeoutMs: 600000, cpuSeconds: 600, memoryBytes: 17179869184, pids: 512, maxFileBytes: 536870912, workspaceQuotaBytes: 2147483648, cacheQuotaBytes: 1073741824, artifactQuotaBytes: 536870912 }, plugins: { enabled: [] }, logging: { level: "info" } };
     } catch { throw error; }
   }
 }
