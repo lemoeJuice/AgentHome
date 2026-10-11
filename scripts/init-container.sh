@@ -17,7 +17,9 @@ initialized=false
 
 command -v "$PODMAN" >/dev/null || { printf '%s\n' "missing dependency: $PODMAN" >&2; exit 2; }
 "$PODMAN" volume inspect "$VOLUME" >/dev/null 2>&1 || "$PODMAN" volume create "$VOLUME" >/dev/null
-"$PODMAN" network inspect "$NETWORK" >/dev/null 2>&1 || "$PODMAN" network create "$NETWORK" >/dev/null
+if [[ "$NETWORK" != pasta ]]; then
+  "$PODMAN" network inspect "$NETWORK" >/dev/null 2>&1 || "$PODMAN" network create "$NETWORK" >/dev/null
+fi
 
 if "$PODMAN" container exists "$CONTAINER" && [[ "$("$PODMAN" container inspect -f '{{.Image}}' "$CONTAINER")" != "$("$PODMAN" image inspect -f '{{.Id}}' "$IMAGE")" ]]; then
   printf 'replacing existing Agent Home container with updated image %s (state volume is retained)\n' "$IMAGE"
@@ -49,7 +51,7 @@ if "$PODMAN" container exists "$CONTAINER"; then
   mounts="$("$PODMAN" container inspect -f '{{json .Mounts}}' "$CONTAINER")"
   [[ "$mounts" != *"/var/run/podman.sock"* && "$mounts" != *"/run/podman/podman.sock"* && "$mounts" != *"/var/run/docker.sock"* ]] || { printf '%s\n' 'Agent Home container exposes a host container socket' >&2; exit 2; }
   networks="$("$PODMAN" container inspect -f '{{json .NetworkSettings.Networks}}' "$CONTAINER")"
-  EXPECTED_VOLUME="$VOLUME" EXPECTED_NETWORK="$NETWORK" MOUNTS_JSON="$mounts" NETWORKS_JSON="$networks" node --input-type=module -e 'const mounts=JSON.parse(process.env.MOUNTS_JSON);const networks=Object.keys(JSON.parse(process.env.NETWORKS_JSON));if(mounts.length!==1||(mounts[0].Name!==process.env.EXPECTED_VOLUME&&mounts[0].Source!==process.env.EXPECTED_VOLUME))process.exit(1);if(networks.length!==1||networks[0]!==process.env.EXPECTED_NETWORK)process.exit(1);' || { printf '%s\n' 'existing Agent Home container has mismatched volume or network topology' >&2; exit 2; }
+  EXPECTED_VOLUME="$VOLUME" EXPECTED_NETWORK="$NETWORK" NETWORK_MODE="$network_mode" MOUNTS_JSON="$mounts" NETWORKS_JSON="$networks" node --input-type=module -e 'const mounts=JSON.parse(process.env.MOUNTS_JSON);const networks=Object.keys(JSON.parse(process.env.NETWORKS_JSON)||{});if(mounts.length!==1||(mounts[0].Name!==process.env.EXPECTED_VOLUME&&mounts[0].Source!==process.env.EXPECTED_VOLUME))process.exit(1);if(process.env.EXPECTED_NETWORK==="pasta"){if(process.env.NETWORK_MODE!=="pasta"||networks.length!==0)process.exit(1);}else if(networks.length!==1||networks[0]!==process.env.EXPECTED_NETWORK)process.exit(1);' || { printf '%s\n' 'existing Agent Home container has mismatched volume or network topology' >&2; exit 2; }
 fi
 
 if "$PODMAN" container exists "$CONTAINER"; then
@@ -91,7 +93,7 @@ if [[ -n "$BOOTSTRAP_FILE" ]]; then
   printf '%s' "$payload" | "$PODMAN" exec -i "$CONTAINER" agent-home bootstrap --stdin
   initialized=true
 elif [[ -r "$CONFIG_PATH" ]]; then
-  payload="$(CONFIG_PATH="$CONFIG_PATH" SNOWLUMA_AGENT_ENDPOINT="${SNOWLUMA_AGENT_ENDPOINT:-ws://snowluma:3001}" SNOWLUMA_AGENT_API_ENDPOINT="${SNOWLUMA_AGENT_API_ENDPOINT:-http://snowluma:3000}" node "$ROOT_DIR/scripts/bootstrap-payload.mjs")"
+  payload="$(CONFIG_PATH="$CONFIG_PATH" SNOWLUMA_AGENT_ENDPOINT="${SNOWLUMA_AGENT_ENDPOINT:-ws://host.containers.internal:${SNOWLUMA_WS_PORT:-3001}}" SNOWLUMA_AGENT_API_ENDPOINT="${SNOWLUMA_AGENT_API_ENDPOINT:-http://host.containers.internal:${SNOWLUMA_HTTP_PORT:-3000}}" node "$ROOT_DIR/scripts/bootstrap-payload.mjs")"
   printf '%s' "$payload" | "$PODMAN" exec -i "$CONTAINER" agent-home bootstrap --stdin
   initialized=true
 else

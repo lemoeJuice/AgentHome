@@ -17,7 +17,7 @@ test("Controller uses a durable outbox and reconnects the exec stream", async ()
   await writeFile(podman, `#!/usr/bin/env bash
 set -euo pipefail
 if [[ "\${1:-}" == inspect ]]; then
-  if [[ "$*" == *"{{json .}}"* ]]; then printf '%s\\n' '{"HostConfig":{"Privileged":false,"Init":true,"PidMode":"","NetworkMode":"bridge","CapAdd":["CAP_NET_ADMIN"],"Binds":["volume:/state:Z,U"]},"Mounts":[{"Type":"volume","Name":"volume","Source":"volume","Destination":"/state"}],"NetworkSettings":{"Networks":{"agent-home-net":{}}}}'
+  if [[ "$*" == *"{{json .}}"* ]]; then printf '%s\\n' '{"HostConfig":{"Privileged":false,"Init":true,"PidMode":"","NetworkMode":"pasta","CapAdd":["CAP_NET_ADMIN"],"Binds":["volume:/state:Z,U"]},"Mounts":[{"Type":"volume","Name":"volume","Source":"volume","Destination":"/state"}],"NetworkSettings":{"Networks":null}}'
   else printf 'true\\n'; fi
   exit 0
 fi
@@ -61,7 +61,7 @@ test("Controller rejects unsafe topology on an existing container", async () => 
   await writeFile(podman, `#!/usr/bin/env bash
 set -euo pipefail
 if [[ "\${1:-}" == inspect ]]; then
-  if [[ "$*" == *"{{json .}}"* ]]; then printf '%s\\n' '{"HostConfig":{"Privileged":true,"PidMode":"","NetworkMode":"bridge"},"Mounts":[],"NetworkSettings":{"Networks":{"agent-home-net":{}}}}'
+  if [[ "$*" == *"{{json .}}"* ]]; then printf '%s\\n' '{"HostConfig":{"Privileged":true,"PidMode":"","NetworkMode":"pasta"},"Mounts":[],"NetworkSettings":{"Networks":null}}'
   else printf 'true\\n'; fi
   exit 0
 fi
@@ -81,7 +81,7 @@ test("Controller requires Podman's child-reaping init process", async () => {
   await writeFile(podman, `#!/usr/bin/env bash
 set -euo pipefail
 if [[ "\${1:-}" == inspect ]]; then
-  if [[ "$*" == *"{{json .}}"* ]]; then printf '%s\\n' '{"HostConfig":{"Privileged":false,"Init":false,"PidMode":"","NetworkMode":"bridge","CapAdd":["NET_ADMIN"]},"Mounts":[{"Type":"volume","Name":"volume","Source":"volume","Destination":"/state"}],"NetworkSettings":{"Networks":{"agent-home-net":{}}}}'
+  if [[ "$*" == *"{{json .}}"* ]]; then printf '%s\\n' '{"HostConfig":{"Privileged":false,"Init":false,"PidMode":"","NetworkMode":"pasta","CapAdd":["NET_ADMIN"]},"Mounts":[{"Type":"volume","Name":"volume","Source":"volume","Destination":"/state"}],"NetworkSettings":{"Networks":null}}'
   else printf 'true\\n'; fi
   exit 0
 fi
@@ -101,7 +101,7 @@ test("Controller rejects an existing container with the wrong state volume or ne
   await writeFile(podman, `#!/usr/bin/env bash
 set -euo pipefail
 if [[ "\${1:-}" == inspect ]]; then
-  if [[ "$*" == *"{{json .}}"* ]]; then printf '%s\\n' '{"HostConfig":{"Privileged":false,"Init":true,"PidMode":"","NetworkMode":"bridge","CapAdd":["NET_ADMIN"]},"Mounts":[{"Type":"volume","Name":"wrong-volume","Source":"wrong-volume","Destination":"/state"}],"NetworkSettings":{"Networks":{"wrong-network":{}}}}'
+  if [[ "$*" == *"{{json .}}"* ]]; then printf '%s\\n' '{"HostConfig":{"Privileged":false,"Init":true,"PidMode":"","NetworkMode":"pasta","CapAdd":["NET_ADMIN"]},"Mounts":[{"Type":"volume","Name":"wrong-volume","Source":"wrong-volume","Destination":"/state"}],"NetworkSettings":{"Networks":{"wrong-network":{}}}}'
   else printf 'true\\n'; fi
   exit 0
 fi

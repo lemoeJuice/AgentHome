@@ -25,7 +25,7 @@ if ! "$PODMAN" pull --policy newer "$BASE_IMAGE"; then
 fi
 BASE_IMAGE_ID="$("$PODMAN" image inspect -f '{{.Id}}' "$BASE_IMAGE")"
 
-if ! "$PODMAN" network inspect "$NETWORK" >/dev/null 2>&1; then
+if [[ "$NETWORK" != pasta ]] && ! "$PODMAN" network inspect "$NETWORK" >/dev/null 2>&1; then
   "$PODMAN" network create "$NETWORK" >/dev/null
 fi
 if ! "$PODMAN" volume inspect "$VOLUME" >/dev/null 2>&1; then

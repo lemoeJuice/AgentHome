@@ -63,7 +63,7 @@ Use `scripts/deploy.sh` for a new deployment or to check/reconcile an existing o
 
 After setup and the optional QQ login prompt, `scripts/deploy.sh` enters foreground mode and continues streaming Gateway, Agent Home, and Proxy Relay logs to the terminal. Logs are persisted under `.agent-home/runtime-state/` (`deploy.log`, `run.log`, and per-service logs). Press `Ctrl+C` or run `scripts/stop.sh` from another terminal to stop Gateway, the Agent Home container, and Proxy Relay. SnowLuma intentionally remains running. Use `scripts/run.sh` to reattach to an existing deployment without rerunning setup.
 
-The common chat model always namespaces platform, account, conversation, thread, and message IDs. `null` means a supported field has no value; `NOT_IMPLEMENTED` is a structured unsupported-field sentinel. SnowLuma is deployed as a separate container on `agent-home-net` using its official Docker framework defaults and persistent QQ volumes.
+The common chat model always namespaces platform, account, conversation, thread, and message IDs. `null` means a supported field has no value; `NOT_IMPLEMENTED` is a structured unsupported-field sentinel. SnowLuma is deployed as a separate container using its official Docker framework defaults and persistent QQ volumes. Rootless Podman uses its built-in `pasta` network mode by default, so it does not need a Linux bridge network; the published OneBot ports are reached via `host.containers.internal`. Set `AGENT_HOME_NETWORK` only when using a named Podman network.
 
 ## Runtime Boundaries
 

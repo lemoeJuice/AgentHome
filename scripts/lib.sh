@@ -25,7 +25,7 @@ export PODMAN_COMMAND
 AGENT_HOME_IMAGE="${AGENT_HOME_IMAGE:-agent-home:latest}"
 AGENT_HOME_BASE_IMAGE="${AGENT_HOME_BASE_IMAGE:-node:22-bookworm-slim}"
 AGENT_HOME_VOLUME="${AGENT_HOME_VOLUME:-agent-home-default-state}"
-AGENT_HOME_NETWORK="${AGENT_HOME_NETWORK:-agent-home-net}"
+AGENT_HOME_NETWORK="${AGENT_HOME_NETWORK:-pasta}"
 AGENT_HOME_CONTAINER="${AGENT_HOME_CONTAINER:-agent-home-default}"
 export AGENT_HOME_IMAGE AGENT_HOME_BASE_IMAGE AGENT_HOME_VOLUME AGENT_HOME_NETWORK AGENT_HOME_CONTAINER
 export AGENT_HOME_HOST_SECRET_ROOT="${AGENT_HOME_HOST_SECRET_ROOT:-$ROOT_DIR/.agent-home}"
@@ -124,7 +124,9 @@ agent_home_proxy_relay_settings() {
 AGENT_HOME_PROXY_BYPASS="localhost,127.0.0.1,::1,host.containers.internal,$SNOWLUMA_CONTAINER,$AGENT_HOME_CONTAINER"
 export AGENT_HOME_PROXY_BYPASS
 
-for topology_name in "$AGENT_HOME_VOLUME" "$AGENT_HOME_NETWORK" "$AGENT_HOME_CONTAINER"; do
+topology_names=("$AGENT_HOME_VOLUME" "$AGENT_HOME_CONTAINER")
+if [[ "$AGENT_HOME_NETWORK" != pasta ]]; then topology_names+=("$AGENT_HOME_NETWORK"); fi
+for topology_name in "${topology_names[@]}"; do
   if [[ ! "$topology_name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$ ]]; then
     printf '%s\n' "unsafe Podman topology name: $topology_name" >&2
     return 2 2>/dev/null || exit 2

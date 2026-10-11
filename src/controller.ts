@@ -54,7 +54,7 @@ export class PodmanController implements AgentEventController {
     this.containerName = options.containerName ?? process.env.AGENT_HOME_CONTAINER ?? `agent-home-${config.instanceId}`;
     this.image = options.image ?? process.env.AGENT_HOME_IMAGE ?? "agent-home:latest";
     this.volume = options.volume ?? process.env.AGENT_HOME_VOLUME ?? `agent-home-${config.instanceId}-state`;
-    this.network = process.env.AGENT_HOME_NETWORK ?? "agent-home-net";
+    this.network = process.env.AGENT_HOME_NETWORK ?? "pasta";
     this.controlToken = process.env.AGENT_HOME_CONTROL_TOKEN ?? (() => { try { return readFileSync(".agent-home/control-token", "utf8").trim() || undefined; } catch { return undefined; } })();
     this.podman = options.podmanCommand ?? process.env.PODMAN_COMMAND ?? "podman";
     this.modelProxyUrl = options.modelProxyUrl ?? config.network?.modelProxyUrl;
@@ -230,7 +230,7 @@ export class PodmanController implements AgentEventController {
         // A failed inspect is commonly a missing container. Creation below provides the actionable error otherwise.
       }
     }
-    await execFileAsync(this.podman, ["network", "exists", this.network]).catch(async () => { await execFileAsync(this.podman, ["network", "create", this.network]); });
+    if (this.network !== "pasta") await execFileAsync(this.podman, ["network", "exists", this.network]).catch(async () => { await execFileAsync(this.podman, ["network", "create", this.network]); });
     await execFileAsync(this.podman, ["volume", "exists", this.volume]).catch(async () => { await execFileAsync(this.podman, ["volume", "create", this.volume]); });
     const proxyArgs = Object.entries(proxyEnvironment(this.modelProxyUrl, `localhost,127.0.0.1,::1,host.containers.internal,snowluma,${this.containerName}`)).flatMap(([name, value]) => ["--env", `${name}=${value}`]);
     await execFileAsync(this.podman, ["run", "-d", "--init", "--name", this.containerName, "--cap-add", "NET_ADMIN", "--env", `AGENT_HOME_MODEL_PROXY_URL=${this.modelProxyUrl ?? ""}`, ...(this.modelProxyUrl ? proxyArgs : []), "--volume", `${this.volume}:/state:Z,U`, "--network", this.network, this.image, "supervise"]);
@@ -255,7 +255,10 @@ export class PodmanController implements AgentEventController {
     if (unsafeBinds || mounts.length !== 1 || mounts[0]?.Type !== "volume" || mounts[0]?.Destination !== "/state") throw new Error("CONTAINER_MOUNT_TOPOLOGY_FORBIDDEN");
     if (mounts[0]?.Name !== this.volume && mounts[0]?.Source !== this.volume) throw new Error("CONTAINER_STATE_VOLUME_MISMATCH");
     const networkNames = Object.keys(inspected.NetworkSettings?.Networks ?? {});
-    if (networkNames.length !== 1 || networkNames[0] !== this.network) throw new Error("CONTAINER_NETWORK_TOPOLOGY_FORBIDDEN");
+    const networkMatches = this.network === "pasta"
+      ? hostConfig.NetworkMode === "pasta" && networkNames.length === 0
+      : networkNames.length === 1 && networkNames[0] === this.network;
+    if (!networkMatches) throw new Error("CONTAINER_NETWORK_TOPOLOGY_FORBIDDEN");
     const hasEntries = (value: Record<string, unknown> | null | undefined): boolean => Boolean(value && Object.keys(value).length > 0);
     if (hasEntries(hostConfig.PortBindings) || hasEntries(inspected.NetworkSettings?.Ports)) throw new Error("CONTAINER_PUBLISHED_PORT_FORBIDDEN");
     for (const mount of mounts) {
